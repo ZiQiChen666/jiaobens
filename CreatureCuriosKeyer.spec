@@ -14,6 +14,7 @@ a = Analysis(
         'stable_boss',
         'route_editor',
         'map_labels',
+        'paths',
         'keyboard._winkeyboard',
         'keyboard._winmouse',
         'keyboard._generic',

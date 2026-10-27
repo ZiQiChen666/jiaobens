@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sys
 import time
 from typing import Optional
@@ -26,12 +27,14 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -53,6 +56,8 @@ APP_FOLDER = os.path.join(
 )
 MAPS_PATH = os.path.join(APP_FOLDER, "maps.json")
 TRAVEL_LOG_PATH = os.path.join(APP_FOLDER, "map_travel.log")
+PATHS_PATH = os.path.join(APP_FOLDER, "paths.json")
+PATH_LOG_PATH = os.path.join(APP_FOLDER, "path_run.log")
 
 TARGET_KINDS = {
     "farm": "打怪点",
@@ -105,6 +110,120 @@ def save_maps(maps: list[dict]) -> bool:
         except Exception:
             pass
         return False
+
+
+def load_paths() -> list[dict]:
+    try:
+        with open(PATHS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        paths = data.get("paths", [])
+        if isinstance(paths, list):
+            return [p for p in paths if isinstance(p, dict)]
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return []
+
+
+def save_paths(paths: list[dict]) -> bool:
+    os.makedirs(os.path.dirname(PATHS_PATH), exist_ok=True)
+    tmp = PATHS_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"paths": paths}, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, PATHS_PATH)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _compact(text: str) -> str:
+    return "".join(
+        ch for ch in str(text or "") if ch.isalnum() or "一" <= ch <= "鿿"
+    )
+
+
+def ocr_top_right_map(hwnd: int) -> tuple[str, list[str]]:
+    """OCR 右上角小字（地图名/区域名）。"""
+    app = _app()
+    if app is None:
+        return "", []
+    try:
+        from PIL import Image
+        import numpy as np
+    except Exception:
+        return "", []
+    cap, _err = app.capture_client_bgra(hwnd)
+    if cap is None:
+        return "", []
+    w, h, data = cap
+    arr = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 4))
+    rgb = arr[:, :, [2, 1, 0]].copy()
+    image = Image.fromarray(rgb, "RGB")
+    # 右上角圆圈区域：按 1366x768 实测约在 x 0.78~1.0, y 0.12~0.35
+    x0 = int(w * 0.78)
+    y0 = int(h * 0.12)
+    x1 = w
+    y1 = int(h * 0.38)
+    crop = image.crop((x0, y0, x1, y1))
+    crop = crop.resize((crop.width * 3, crop.height * 3), Image.Resampling.LANCZOS)
+    engine = app._get_ocr_engine()
+    with app._OCR_LOCK:
+        result, _elapse = engine(np.array(crop)[:, :, ::-1])
+    texts = [str(it[1]).strip() for it in (result or []) if len(it) >= 3]
+    return " ".join(texts), texts
+
+
+def match_map_profile(profiles: list[dict], texts: list[str]) -> Optional[dict]:
+    blob = _compact(" ".join(texts))
+    if not blob:
+        return None
+    best = None
+    best_score = 0.0
+    for profile in profiles:
+        name = str(profile.get("name", ""))
+        parts = [p for p in re.split(r"[|｜/、,，\s]+", name) if len(_compact(p)) >= 2]
+        for part in parts:
+            key = _compact(part)
+            if key and key in blob:
+                return profile
+        full = _compact(name)
+        if full and full in blob:
+            return profile
+        # 简单相似度兜底
+        from difflib import SequenceMatcher
+        for part in parts:
+            key = _compact(part)
+            ratio = SequenceMatcher(None, key, blob).ratio()
+            if ratio > best_score:
+                best_score = ratio
+                best = profile
+    if best is not None and best_score >= 0.55:
+        return best
+    return None
+
+
+def find_target(profile: dict, target_name: str) -> Optional[dict]:
+    wanted = _compact(target_name)
+    for target in profile.get("targets", []):
+        if not isinstance(target, dict):
+            continue
+        if _compact(target.get("name", "")) == wanted:
+            return target
+    for target in profile.get("targets", []):
+        if not isinstance(target, dict):
+            continue
+        if wanted and wanted in _compact(target.get("name", "")):
+            return target
+    return None
 
 
 def _valid_rect(rect) -> Optional[tuple[float, float, float, float]]:

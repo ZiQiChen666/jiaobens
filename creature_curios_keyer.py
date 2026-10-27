@@ -2749,6 +2749,7 @@ class MainWindow(QMainWindow):
         self._one_key_stable = False
         self._route_editor = None
         self._map_runner = None
+        self._path_runner = None
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(self._make_icon())
@@ -2764,6 +2765,7 @@ class MainWindow(QMainWindow):
         self._refresh_point_labels()
         self._refresh_threshold_labels()
         self._refresh_map_profiles()
+        self._refresh_paths()
         self._popup = NoticePopup()
         self._setup_tray()
         self._install_hotkey()
@@ -3439,6 +3441,35 @@ class MainWindow(QMainWindow):
         self.combo_map_profile.currentIndexChanged.connect(self._refresh_map_targets)
         root.addWidget(box_map)
 
+        # ---- 路径执行 ----
+        box_path = QGroupBox("6 · 路径执行（地图标注）")
+        pg2 = QGridLayout(box_path)
+        pg2.setHorizontalSpacing(8)
+        pg2.setVerticalSpacing(8)
+        pg2.setColumnStretch(1, 1)
+        pg2.addWidget(QLabel("路径"), 0, 0)
+        self.combo_path = QComboBox()
+        self.combo_path.setMinimumWidth(300)
+        pg2.addWidget(self.combo_path, 0, 1, 1, 2)
+        self.btn_path_edit = QPushButton("编辑路径")
+        self.btn_path_edit.clicked.connect(self._open_path_editor)
+        pg2.addWidget(self.btn_path_edit, 0, 3)
+        self.btn_path_run = QPushButton("执行路径")
+        self.btn_path_run.clicked.connect(self._toggle_path_run)
+        pg2.addWidget(self.btn_path_run, 1, 0, 1, 2)
+        self.lbl_path_state = QLabel("未运行")
+        self.lbl_path_state.setObjectName("muted")
+        self.lbl_path_state.setWordWrap(True)
+        pg2.addWidget(self.lbl_path_state, 1, 2, 1, 2)
+        path_note = QLabel(
+            "路径 = 地图 + 已标注入口 + 等待。执行时先 OCR 右上角小字识别当前地图，"
+            "再打开地图点击已标注入口；地图只按一次 Esc，检测到“退出游戏”才补一次 Esc。"
+        )
+        path_note.setObjectName("muted")
+        path_note.setWordWrap(True)
+        pg2.addWidget(path_note, 2, 0, 1, 4)
+        root.addWidget(box_path)
+
         root.addStretch(1)
 
         scroll = QScrollArea()
@@ -3606,9 +3637,10 @@ class MainWindow(QMainWindow):
             or self._stable_runner is not None
             or self._route_editor is not None
             or self._map_runner is not None
+            or self._path_runner is not None
         ):
             self._notify(
-                "当前正在回放/一键打BOSS/路线编辑/地图测试",
+                "当前正在回放/一键打BOSS/路线编辑/地图测试/路径执行",
                 "请先停止当前的回放、稳定测试或一键打BOSS，再启动基础挂机。",
             )
             return
@@ -3722,6 +3754,9 @@ class MainWindow(QMainWindow):
             return
         if self._map_runner is not None:
             self._stop_map_runner()
+            return
+        if self._path_runner is not None:
+            self._stop_path_runner()
             return
         if self._stopping:
             return
@@ -4078,6 +4113,167 @@ class MainWindow(QMainWindow):
         self.combo_map_profile.setEnabled(not busy and not map_running)
         self.combo_map_target.setEnabled(not busy and not map_running)
         self.spin_map_travel_wait.setEnabled(not busy and not map_running)
+
+    # ------------------------------------------------------------ 路径执行
+    def _refresh_paths(self) -> None:
+        if not hasattr(self, "combo_path"):
+            return
+        try:
+            from paths import load_paths
+
+            paths = load_paths()
+        except Exception:
+            paths = []
+        current = self.combo_path.currentData()
+        current_name = str(current.get("name", "")) if isinstance(current, dict) else ""
+        self.combo_path.blockSignals(True)
+        self.combo_path.clear()
+        for path in paths:
+            self.combo_path.addItem(str(path.get("name", "未命名")), path)
+        self.combo_path.blockSignals(False)
+        if current_name:
+            idx = next(
+                (
+                    i
+                    for i in range(self.combo_path.count())
+                    if str((self.combo_path.itemData(i) or {}).get("name", ""))
+                    == current_name
+                ),
+                -1,
+            )
+            if idx >= 0:
+                self.combo_path.setCurrentIndex(idx)
+        self._update_path_controls_state()
+
+    def _update_path_controls_state(self) -> None:
+        if not hasattr(self, "btn_path_run"):
+            return
+        running = self._path_runner is not None
+        busy = self._macro_busy()
+        has_path = isinstance(self.combo_path.currentData(), dict)
+        target_ok = (
+            self.target_hwnd is not None and self._window_alive(self.target_hwnd)
+        )
+        self.btn_path_run.setText("停止路径" if running else "执行路径")
+        self.btn_path_run.setEnabled(running or (has_path and target_ok and not busy))
+        self.btn_path_edit.setEnabled(target_ok and not busy and not running)
+        self.combo_path.setEnabled(not busy and not running)
+
+    def _open_path_editor(self) -> None:
+        if self._macro_busy():
+            self._notify("当前正忙", "请先停止其它自动化。")
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
+            return
+        try:
+            from paths import PathEditorDialog
+        except Exception as exc:
+            self._notify("路径编辑器不可用", f"加载失败：{exc}")
+            return
+        dialog = PathEditorDialog(parent=self)
+        dialog.exec()
+        self._refresh_paths()
+        self._set_status("路径列表已刷新。", "ok")
+
+    def _toggle_path_run(self) -> None:
+        if self._path_runner is not None:
+            self._stop_path_runner()
+            return
+        self._start_path_run()
+
+    def _start_path_run(self) -> None:
+        if self._quitting or self._path_runner is not None:
+            return
+        if self._macro_busy() or self._worker is not None:
+            self._notify("当前正忙", "请先停止其它自动化。")
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
+            return
+        path = self.combo_path.currentData()
+        if not isinstance(path, dict):
+            self._notify("没有路径", "请先点“编辑路径”创建一条路径。")
+            return
+        try:
+            from map_labels import load_maps
+            from paths import PathRunner
+        except Exception as exc:
+            self._notify("路径执行不可用", f"加载失败：{exc}")
+            return
+        profiles = load_maps()
+        if not profiles:
+            self._notify("没有地图标注", "请先在“地图标注寻路”里人工标注地图。")
+            return
+        runner = PathRunner(
+            self.target_hwnd,
+            path,
+            profiles,
+            map_key=self._macro_cfg.get("map_key", "m"),
+            close_key=self._macro_cfg.get("close_map_key", "esc"),
+            parent=self,
+        )
+        runner.status.connect(self._on_path_status)
+        runner.done.connect(self._on_path_done)
+        runner.failed.connect(self._on_path_failed)
+        self._path_runner = runner
+        self.lbl_path_state.setText("路径执行：准备中…")
+        self._set_status("路径执行开始。", "warn")
+        self._update_macro_button_states()
+        self._update_path_controls_state()
+        runner.start()
+
+    def _on_path_status(self, text: str, level: str) -> None:
+        if hasattr(self, "lbl_path_state"):
+            self.lbl_path_state.setText(text)
+        self._set_status(text, level)
+
+    def _on_path_done(self) -> None:
+        runner = self.sender()
+        if runner is self._path_runner:
+            self._path_runner = None
+            if isinstance(runner, QThread):
+                runner.wait(500)
+                runner.deleteLater()
+        self.lbl_path_state.setText("路径执行完成")
+        self._set_status("路径执行完成。", "ok")
+        self._update_macro_button_states()
+        self._update_path_controls_state()
+
+    def _on_path_failed(self, message: str) -> None:
+        runner = self.sender()
+        if runner is self._path_runner:
+            self._path_runner = None
+            if isinstance(runner, QThread):
+                runner.wait(500)
+                runner.deleteLater()
+        stopped = str(message).strip() == "已停止。"
+        self.lbl_path_state.setText("已停止" if stopped else "路径执行失败")
+        self._set_status(
+            "路径执行已停止。" if stopped else f"路径执行失败：{message}",
+            "warn" if stopped else "error",
+        )
+        if not stopped:
+            try:
+                self._popup.show_message("路径执行失败", message, seconds=15)
+            except Exception:
+                pass
+        self._update_macro_button_states()
+        self._update_path_controls_state()
+
+    def _stop_path_runner(self) -> None:
+        runner = self._path_runner
+        self._path_runner = None
+        if runner is not None:
+            runner.stop()
+            if not runner.wait(4000):
+                runner.terminate()
+                runner.wait(500)
+            runner.deleteLater()
+        self.lbl_path_state.setText("已停止")
+        self._set_status("路径执行已停止。", "warn")
+        self._update_macro_button_states()
+        self._update_path_controls_state()
 
     def _open_map_learner(self) -> None:
         if self._macro_busy():
@@ -4555,6 +4751,7 @@ class MainWindow(QMainWindow):
             or self._stable_runner is not None
             or self._route_editor is not None
             or self._map_runner is not None
+            or self._path_runner is not None
         )
 
     def _save_macro_settings(self) -> None:
@@ -4688,11 +4885,14 @@ class MainWindow(QMainWindow):
         point_busy = self._point_capture is not None or self._point_kind is not None
         stable_running = self._stable_runner is not None
         map_running = self._map_runner is not None
+        path_running = self._path_runner is not None
         stable_test = stable_running and not one_key
         target_ok = (
             self.target_hwnd is not None and self._window_alive(self.target_hwnd)
         )
-        other_busy = playing or one_key or point_busy or stable_running or map_running
+        other_busy = (
+            playing or one_key or point_busy or stable_running or map_running or path_running
+        )
 
         for step in MACRO_STEPS:
             events = (
@@ -4726,7 +4926,11 @@ class MainWindow(QMainWindow):
                 btn_rerec.setEnabled(not recording and not other_busy and target_ok)
 
         self.btn_one_key.setEnabled(
-            not recording and not point_busy and not stable_test and not map_running
+            not recording
+            and not point_busy
+            and not stable_test
+            and not map_running
+            and not path_running
         )
         self.chk_farm_potion.setEnabled(
             not one_key and not recording and not playing and not stable_test
@@ -4744,6 +4948,7 @@ class MainWindow(QMainWindow):
                     and not point_busy
                     and not playing
                     and not map_running
+                    and not path_running
                     and target_ok
                     and boss_point_ok
                 )
@@ -4790,6 +4995,7 @@ class MainWindow(QMainWindow):
             allow_return and self._macro_cfg["points"].get("boss") is not None
         )
         self._update_map_controls_state()
+        self._update_path_controls_state()
         self._update_bind_button_state()
 
     def _set_one_key_ui_running(self, running: bool) -> None:
@@ -4825,8 +5031,9 @@ class MainWindow(QMainWindow):
             or self._stable_runner is not None
             or self._route_editor is not None
             or self._map_runner is not None
+            or self._path_runner is not None
         ):
-            self._notify("正在回放/路线编辑", "请先结束当前回放/稳定测试/路线编辑/地图测试。")
+            self._notify("正在回放/路线编辑", "请先结束当前回放/稳定测试/路线编辑/地图测试/路径执行。")
             return
         if self._point_capture is not None or self._point_kind is not None:
             self._notify("正在设置点位", "请等待点位设置结束，再录制流程。")
@@ -5025,6 +5232,12 @@ class MainWindow(QMainWindow):
             return
         if self._map_runner is not None:
             self._notify("正在地图测试", "请先停止地图测试。")
+            return
+        if self._path_runner is not None:
+            self._notify("正在执行路径", "请先停止路径执行。")
+            return
+        if self._path_runner is not None:
+            self._notify("正在执行路径", "请先停止路径执行。")
             return
         if self._map_runner is not None:
             self._notify("正在地图测试", "请先停止地图测试。")
@@ -5366,8 +5579,9 @@ class MainWindow(QMainWindow):
             or self._stable_test_running
             or self._route_editor is not None
             or self._map_runner is not None
+            or self._path_runner is not None
         ):
-            self._notify("当前正忙", "请先停止稳定模式测试/路线编辑/地图测试。")
+            self._notify("当前正忙", "请先停止稳定模式测试/路线编辑/地图测试/路径执行。")
             return
         if self._point_capture is not None or self._point_kind is not None:
             self._notify("当前正忙", "请等待点位设置结束。")
@@ -6131,6 +6345,7 @@ class MainWindow(QMainWindow):
         has_selection = self.combo_windows.currentData() is not None
         self.btn_bind.setEnabled((not running) and has_selection)
         self._update_map_controls_state()
+        self._update_path_controls_state()
 
     def _update_toggle_action(self) -> None:
         if self._act_toggle is None:
@@ -6153,6 +6368,9 @@ class MainWindow(QMainWindow):
             self._act_toggle.setEnabled(True)
         elif self._map_runner is not None:
             self._act_toggle.setText("停止地图测试")
+            self._act_toggle.setEnabled(True)
+        elif self._path_runner is not None:
+            self._act_toggle.setText("停止路径执行")
             self._act_toggle.setEnabled(True)
         elif self._worker is not None:
             self._act_toggle.setText("停止发送")
@@ -6347,6 +6565,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self._stop_map_runner()
+        except Exception:
+            pass
+        try:
+            self._stop_path_runner()
         except Exception:
             pass
         self._stable_test_running = False
