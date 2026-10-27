@@ -3394,7 +3394,7 @@ class MainWindow(QMainWindow):
         root.addWidget(box_stable)
 
         # ---- 地图标注寻路（OCR） ----
-        box_map = QGroupBox("5 · 地图标注寻路（中文 OCR）")
+        box_map = QGroupBox("5 · 地图标注寻路（人工坐标）")
         mg = QGridLayout(box_map)
         mg.setHorizontalSpacing(8)
         mg.setVerticalSpacing(8)
@@ -3415,9 +3415,9 @@ class MainWindow(QMainWindow):
         self.spin_map_travel_wait.setFixedWidth(100)
         self.spin_map_travel_wait.setToolTip("点击地图标注并关闭地图后，等待自动寻路的时间")
         mg.addWidget(self.spin_map_travel_wait, 1, 1)
-        self.btn_map_learn = QPushButton("学习当前地图标注")
+        self.btn_map_learn = QPushButton("标注 / 编辑地图（人工）")
         self.btn_map_learn.setToolTip(
-            "先打开游戏地图，再点这里截图 + OCR，选择地图上的中文标注作为打怪/BOSS目标"
+            "先打开游戏地图，再点这里截图；人工标定地图范围并点选打怪/BOSS坐标，可载入旧地图修改"
         )
         self.btn_map_learn.clicked.connect(self._open_map_learner)
         mg.addWidget(self.btn_map_learn, 1, 2)
@@ -3429,8 +3429,9 @@ class MainWindow(QMainWindow):
         self.lbl_map_state.setObjectName("muted")
         mg.addWidget(self.lbl_map_state, 1, 4, 1, 2)
         map_note = QLabel(
-            "流程：打开地图 → 点“学习当前地图标注” → 选中地图上的中文标注 → 添加为打怪点/BOSS点。"
-            "运行时重新 OCR 找同一个中文标注，不依赖固定像素；地图拖动/缩放也能跟随。"
+            "流程：打开地图 → 点“标注/编辑地图（人工）” → 标定地图零点/范围 → "
+            "手动点选打怪点/BOSS点 → 保存。可载入已保存地图修改后重新保存。"
+            "运行时不依赖 OCR，直接用窗口坐标 + 地图内坐标点击。"
         )
         map_note.setObjectName("muted")
         map_note.setWordWrap(True)
