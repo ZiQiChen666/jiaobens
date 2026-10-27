@@ -131,6 +131,7 @@ class MapLabelCanvas(QWidget):
 
     item_selected = Signal(int)
     offset_calibrated = Signal(float, float)
+    actual_marked = Signal(float, float)
 
     def __init__(self, image: QImage, parent=None) -> None:
         super().__init__(parent)
@@ -140,6 +141,7 @@ class MapLabelCanvas(QWidget):
         self.selected_index = -1
         self.targets: list[dict] = []
         self.calibrating_target = -1
+        self.mark_actual = False
         self._apply_size()
 
     def _apply_size(self) -> None:
@@ -186,6 +188,10 @@ class MapLabelCanvas(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         nx, ny = self._to_norm(event.position().toPoint())
+        if self.mark_actual:
+            self.mark_actual = False
+            self.actual_marked.emit(nx, ny)
+            return
         if 0 <= self.calibrating_target < len(self.targets):
             target = self.targets[self.calibrating_target]
             target["offset_x"] = nx - float(target.get("nx", 0.5))
@@ -251,7 +257,11 @@ class MapLabelCanvas(QWidget):
                 max(14, y - 6),
                 f"{target.get('name', '')} [{TARGET_KINDS.get(str(target.get('kind')), '')}]",
             )
-        if 0 <= self.calibrating_target < len(self.targets):
+        if self.mark_actual:
+            painter.setPen(QPen(QColor("#ff3b30"), 2))
+            painter.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+            painter.drawText(20, 30, "请点击真正的入口位置（会自动关联最近的中文标注）")
+        elif 0 <= self.calibrating_target < len(self.targets):
             painter.setPen(QPen(QColor("#ffd60a"), 2))
             painter.setFont(QFont("Microsoft YaHei", 11, QFont.Weight.Bold))
             painter.drawText(20, 30, "请在截图上点击真正的入口位置…")
@@ -343,9 +353,14 @@ class MapLabelDialog(QDialog):
         self.btn_auto_labels.setToolTip(
             "自动把地图区域识别到的中文标注加入候选列表，你再删掉不需要的"
         )
+        self.btn_mark_actual = QPushButton("点选实际入口")
+        self.btn_mark_actual.setToolTip(
+            "先选目标类型，再点这里，然后在截图上点真正入口；程序会自动关联最近的中文标注并保存偏移"
+        )
         self.btn_set_farm = QPushButton("选中→打怪点")
         self.btn_set_boss = QPushButton("选中→BOSS点")
         quick_row.addWidget(self.btn_auto_labels)
+        quick_row.addWidget(self.btn_mark_actual)
         quick_row.addWidget(self.btn_set_farm)
         quick_row.addWidget(self.btn_set_boss)
         target_form.addRow("快捷", quick_row)
@@ -388,6 +403,8 @@ class MapLabelDialog(QDialog):
         self.list_targets.currentRowChanged.connect(self._on_target_row)
         self.btn_add_target.clicked.connect(self.add_target)
         self.btn_auto_labels.clicked.connect(self.auto_annotate_all)
+        self.btn_mark_actual.clicked.connect(self.start_mark_actual)
+        self.canvas.actual_marked.connect(self._on_actual_marked)
         self.btn_set_farm.clicked.connect(lambda: self.set_selected_kind("farm"))
         self.btn_set_boss.clicked.connect(lambda: self.set_selected_kind("boss"))
         self.btn_calibrate.clicked.connect(self.start_calibrate)
@@ -557,6 +574,68 @@ class MapLabelDialog(QDialog):
             f"自动标注完成：新增 {added} 个候选；在右侧目标列表里选出打怪点/BOSS点即可"
         )
 
+    def start_mark_actual(self) -> None:
+        if self.image is None:
+            QMessageBox.information(self, "没有地图", "先截图 + OCR。")
+            return
+        self.canvas.mark_actual = True
+        self.canvas.update()
+        self.status.setText(
+            "请在左侧截图上点击真正的入口；会自动找最近的中文标注并保存偏移"
+        )
+
+    def _on_actual_marked(self, nx: float, ny: float) -> None:
+        # 找最近的中文标注作为锚点
+        best = None
+        best_dist = 1e9
+        for item in self.items:
+            if not self._looks_like_map_label(item):
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            dx = float(item.get("nx", 0.5)) - nx
+            dy = float(item.get("ny", 0.5)) - ny
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best = item
+        kind = str(self.combo_target_kind.currentData() or "farm")
+        if best is not None and best_dist <= 0.32:
+            text = str(best.get("text", "")).strip()
+            target = {
+                "name": self.edit_target_name.text().strip() or text,
+                "kind": kind,
+                "text": text,
+                "nx": float(best.get("nx", 0.5)),
+                "ny": float(best.get("ny", 0.5)),
+                "offset_x": nx - float(best.get("nx", 0.5)),
+                "offset_y": ny - float(best.get("ny", 0.5)),
+            }
+            note = f"已关联标注「{text}」，偏移 ({target['offset_x']*100:.1f}%, {target['offset_y']*100:.1f}%)"
+        else:
+            target = {
+                "name": self.edit_target_name.text().strip() or f"入口 {len(self.targets)+1}",
+                "kind": kind,
+                "text": "",
+                "nx": nx,
+                "ny": ny,
+                "offset_x": 0.0,
+                "offset_y": 0.0,
+            }
+            note = "附近没有可关联的中文标注，已保存为固定坐标"
+        # 同名同类型更新
+        for idx, old in enumerate(self.targets):
+            if old.get("name") == target["name"] and old.get("kind") == target["kind"]:
+                self.targets[idx] = target
+                break
+        else:
+            self.targets.append(target)
+        self.canvas.set_targets(self.targets)
+        self._refresh_target_list()
+        self.list_targets.setCurrentRow(len(self.targets) - 1)
+        self.status.setText(f"已添加{TARGET_KINDS.get(kind, kind)}：{target['name']}；{note}")
+
     def set_selected_kind(self, kind: str) -> None:
         row = self.list_targets.currentRow()
         if 0 <= row < len(self.targets):
@@ -629,9 +708,10 @@ class MapLabelDialog(QDialog):
         self.list_targets.blockSignals(True)
         self.list_targets.clear()
         for target in self.targets:
+            anchor = str(target.get("text", "")).strip() or "固定坐标"
             self.list_targets.addItem(
                 f"{target.get('name', '')}  [{TARGET_KINDS.get(str(target.get('kind')), '')}]  "
-                f"锚点：{target.get('text', '')}"
+                f"锚点：{anchor}"
             )
         self.list_targets.blockSignals(False)
 
@@ -829,6 +909,28 @@ class MapTravelRunner(QThread):
             self._tap_key(self.map_key)
             if not self._sleep(1.2):
                 raise RuntimeError("已停止。")
+            target_text = str(self.target.get("text", "")).strip()
+            if not target_text:
+                # 没有文字锚点：直接使用学习时记录的实际窗口坐标
+                nx = float(self.target.get("nx", 0.5)) + float(
+                    self.target.get("offset_x", 0.0)
+                )
+                ny = float(self.target.get("ny", 0.5)) + float(
+                    self.target.get("offset_y", 0.0)
+                )
+                self.log(
+                    f"目标没有文字锚点，使用固定窗口坐标 "
+                    f"{nx*100:.1f}%, {ny*100:.1f}%"
+                )
+                self._click_norm(nx, ny)
+                if not self._sleep(0.5):
+                    raise RuntimeError("已停止。")
+                self._tap_key(self.close_key)
+                self.log(f"已关闭地图，等待自动寻路 {self.travel_wait:.0f} 秒…")
+                if not self._sleep(self.travel_wait):
+                    raise RuntimeError("已停止。")
+                self.done.emit()
+                return
             match = None
             self._fail_reason = ""
             for attempt in range(self.retries):
