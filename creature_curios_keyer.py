@@ -499,6 +499,53 @@ _OCR_LOCK = threading.Lock()
 _OCR_ENGINE = None
 
 
+def _get_ocr_engine():
+    global _OCR_ENGINE
+    with _OCR_LOCK:
+        if _OCR_ENGINE is None:
+            from rapidocr_onnxruntime import RapidOCR
+
+            _OCR_ENGINE = RapidOCR()
+        return _OCR_ENGINE
+
+
+def ocr_screen_items(data: bytes, w: int, h: int) -> list[dict]:
+    """OCR 整个游戏客户区，返回文字和归一化坐标。"""
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception as exc:
+        raise RuntimeError(f"缺少 OCR 依赖：{type(exc).__name__}: {exc}")
+    arr = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 4))
+    rgb = arr[:, :, [2, 1, 0]].copy()
+    image = Image.fromarray(rgb, "RGB")
+    engine = _get_ocr_engine()
+    with _OCR_LOCK:
+        result, _elapse = engine(np.array(image)[:, :, ::-1])
+    items: list[dict] = []
+    for item in (result or []):
+        if len(item) < 3:
+            continue
+        box, text, score = item[0], item[1], item[2]
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        items.append(
+            {
+                "text": str(text).strip(),
+                "score": float(score),
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+                "nx": (x0 + x1) / 2.0 / max(1, w),
+                "ny": (y0 + y1) / 2.0 / max(1, h),
+            }
+        )
+    return items
+
+
 def ocr_fatigue_from_bgra(
     data: bytes, w: int, h: int, roi: tuple[int, int, int, int],
 ) -> tuple[Optional[int], Optional[int], str]:
@@ -542,13 +589,9 @@ def ocr_fatigue_from_bgra(
         # RapidOCR/OpenCV 使用 BGR
         ocr_input = np.array(crop)[:, :, ::-1]
 
-        global _OCR_ENGINE
+        engine = _get_ocr_engine()
         with _OCR_LOCK:
-            if _OCR_ENGINE is None:
-                from rapidocr_onnxruntime import RapidOCR
-
-                _OCR_ENGINE = RapidOCR()
-            result, _elapse = _OCR_ENGINE(ocr_input)
+            result, _elapse = engine(ocr_input)
 
         texts = [str(item[1]) for item in (result or []) if len(item) >= 3]
         joined = " ".join(texts)
@@ -2705,6 +2748,7 @@ class MainWindow(QMainWindow):
         self._stable_test_running = False
         self._one_key_stable = False
         self._route_editor = None
+        self._map_runner = None
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(self._make_icon())
@@ -2719,6 +2763,7 @@ class MainWindow(QMainWindow):
         self._refresh_macro_labels()
         self._refresh_point_labels()
         self._refresh_threshold_labels()
+        self._refresh_map_profiles()
         self._popup = NoticePopup()
         self._setup_tray()
         self._install_hotkey()
@@ -3348,6 +3393,51 @@ class MainWindow(QMainWindow):
         sg.addWidget(stable_note, 6, 0, 1, 6)
         root.addWidget(box_stable)
 
+        # ---- 地图标注寻路（OCR） ----
+        box_map = QGroupBox("5 · 地图标注寻路（中文 OCR）")
+        mg = QGridLayout(box_map)
+        mg.setHorizontalSpacing(8)
+        mg.setVerticalSpacing(8)
+        mg.setColumnStretch(1, 1)
+        mg.addWidget(QLabel("地图"), 0, 0)
+        self.combo_map_profile = QComboBox()
+        self.combo_map_profile.setMinimumWidth(260)
+        mg.addWidget(self.combo_map_profile, 0, 1, 1, 2)
+        mg.addWidget(QLabel("目标"), 0, 3)
+        self.combo_map_target = QComboBox()
+        self.combo_map_target.setMinimumWidth(220)
+        mg.addWidget(self.combo_map_target, 0, 4, 1, 2)
+        mg.addWidget(QLabel("寻路等待"), 1, 0)
+        self.spin_map_travel_wait = QSpinBox()
+        self.spin_map_travel_wait.setRange(3, 180)
+        self.spin_map_travel_wait.setValue(20)
+        self.spin_map_travel_wait.setSuffix(" 秒")
+        self.spin_map_travel_wait.setFixedWidth(100)
+        self.spin_map_travel_wait.setToolTip("点击地图标注并关闭地图后，等待自动寻路的时间")
+        mg.addWidget(self.spin_map_travel_wait, 1, 1)
+        self.btn_map_learn = QPushButton("学习当前地图标注")
+        self.btn_map_learn.setToolTip(
+            "先打开游戏地图，再点这里截图 + OCR，选择地图上的中文标注作为打怪/BOSS目标"
+        )
+        self.btn_map_learn.clicked.connect(self._open_map_learner)
+        mg.addWidget(self.btn_map_learn, 1, 2)
+        self.btn_map_test = QPushButton("测试前往目标")
+        self.btn_map_test.setToolTip("按 M 打开地图 → OCR 找目标文字 → 点击 → Esc → 等待自动寻路")
+        self.btn_map_test.clicked.connect(self._toggle_map_test)
+        mg.addWidget(self.btn_map_test, 1, 3)
+        self.lbl_map_state = QLabel("未运行")
+        self.lbl_map_state.setObjectName("muted")
+        mg.addWidget(self.lbl_map_state, 1, 4, 1, 2)
+        map_note = QLabel(
+            "流程：打开地图 → 点“学习当前地图标注” → 选中地图上的中文标注 → 添加为打怪点/BOSS点。"
+            "运行时重新 OCR 找同一个中文标注，不依赖固定像素；地图拖动/缩放也能跟随。"
+        )
+        map_note.setObjectName("muted")
+        map_note.setWordWrap(True)
+        mg.addWidget(map_note, 2, 0, 1, 6)
+        self.combo_map_profile.currentIndexChanged.connect(self._refresh_map_targets)
+        root.addWidget(box_map)
+
         root.addStretch(1)
 
         scroll = QScrollArea()
@@ -3514,9 +3604,10 @@ class MainWindow(QMainWindow):
             or self._single_player is not None
             or self._stable_runner is not None
             or self._route_editor is not None
+            or self._map_runner is not None
         ):
             self._notify(
-                "当前正在回放/一键打BOSS/路线编辑",
+                "当前正在回放/一键打BOSS/路线编辑/地图测试",
                 "请先停止当前的回放、稳定测试或一键打BOSS，再启动基础挂机。",
             )
             return
@@ -3627,6 +3718,9 @@ class MainWindow(QMainWindow):
             return
         if self._stable_runner is not None and not self._one_key_running:
             self._toggle_stable_test()
+            return
+        if self._map_runner is not None:
+            self._stop_map_runner()
             return
         if self._stopping:
             return
@@ -3909,6 +4003,197 @@ class MainWindow(QMainWindow):
             else f"{name}位置已生效（配置写入失败，本次运行有效）。",
             "ok" if saved else "warn",
         )
+
+    # ------------------------------------------------------------ 地图标注寻路
+    def _refresh_map_profiles(self) -> None:
+        if not hasattr(self, "combo_map_profile"):
+            return
+        try:
+            from map_labels import load_maps
+
+            profiles = load_maps()
+        except Exception:
+            profiles = []
+        current = self.combo_map_profile.currentData()
+        current_name = str(current.get("name", "")) if isinstance(current, dict) else ""
+        self.combo_map_profile.blockSignals(True)
+        self.combo_map_profile.clear()
+        for profile in profiles:
+            self.combo_map_profile.addItem(
+                str(profile.get("name", "未命名")), profile
+            )
+        self.combo_map_profile.blockSignals(False)
+        if current_name:
+            idx = next(
+                (
+                    i
+                    for i in range(self.combo_map_profile.count())
+                    if str(
+                        (self.combo_map_profile.itemData(i) or {}).get("name", "")
+                    )
+                    == current_name
+                ),
+                -1,
+            )
+            if idx >= 0:
+                self.combo_map_profile.setCurrentIndex(idx)
+        self._refresh_map_targets()
+
+    def _refresh_map_targets(self, *_args) -> None:
+        if not hasattr(self, "combo_map_target"):
+            return
+        profile = self.combo_map_profile.currentData()
+        self.combo_map_target.blockSignals(True)
+        self.combo_map_target.clear()
+        if isinstance(profile, dict):
+            for target in profile.get("targets", []):
+                if not isinstance(target, dict):
+                    continue
+                kind = {"farm": "打怪点", "boss": "BOSS点", "other": "其他"}.get(
+                    str(target.get("kind", "")), "其他"
+                )
+                self.combo_map_target.addItem(
+                    f"{target.get('name', '')} [{kind}]", target
+                )
+        self.combo_map_target.blockSignals(False)
+        self._update_map_controls_state()
+
+    def _update_map_controls_state(self) -> None:
+        if not hasattr(self, "btn_map_test"):
+            return
+        map_running = self._map_runner is not None
+        busy = self._macro_busy()
+        usable = bool(self.combo_map_profile.currentData()) and bool(
+            self.combo_map_target.currentData()
+        )
+        target_ok = (
+            self.target_hwnd is not None and self._window_alive(self.target_hwnd)
+        )
+        self.btn_map_test.setText("停止地图测试" if map_running else "测试前往目标")
+        self.btn_map_test.setEnabled(
+            map_running or (usable and target_ok and not busy)
+        )
+        self.btn_map_learn.setEnabled(target_ok and not busy and not map_running)
+        self.combo_map_profile.setEnabled(not busy and not map_running)
+        self.combo_map_target.setEnabled(not busy and not map_running)
+        self.spin_map_travel_wait.setEnabled(not busy and not map_running)
+
+    def _open_map_learner(self) -> None:
+        if self._macro_busy():
+            self._notify("当前正忙", "请先停止录制/回放/一键打BOSS/稳定测试/地图测试。")
+            return
+        if self._worker is not None or self._test_monitor is not None:
+            self._notify("当前正忙", "请先停止基础挂机/疲劳测试。")
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
+            return
+        try:
+            from map_labels import MapLabelDialog
+        except Exception as exc:
+            self._notify("地图标注不可用", f"加载失败：{exc}")
+            return
+        dialog = MapLabelDialog(self.target_hwnd, parent=self)
+        dialog.exec()
+        self._refresh_map_profiles()
+        if getattr(dialog, "saved", False):
+            self._set_status("地图标注已保存，可以测试前往目标。", "ok")
+
+    def _toggle_map_test(self) -> None:
+        if self._map_runner is not None:
+            self._stop_map_runner()
+            return
+        self._start_map_test()
+
+    def _start_map_test(self) -> None:
+        if self._quitting or self._map_runner is not None:
+            return
+        if self._macro_busy() or self._worker is not None:
+            self._notify("当前正忙", "请先停止其它自动化。")
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
+            return
+        profile = self.combo_map_profile.currentData()
+        target = self.combo_map_target.currentData()
+        if not isinstance(profile, dict) or not isinstance(target, dict):
+            self._notify("没有地图目标", "请先学习地图标注，并选择目标。")
+            return
+        try:
+            from map_labels import MapTravelRunner
+        except Exception as exc:
+            self._notify("地图寻路不可用", f"加载失败：{exc}")
+            return
+        runner = MapTravelRunner(
+            self.target_hwnd,
+            profile,
+            target,
+            map_key=self._macro_cfg.get("map_key", "m"),
+            close_key=self._macro_cfg.get("close_map_key", "esc"),
+            travel_wait=float(self.spin_map_travel_wait.value()),
+            parent=self,
+        )
+        runner.status.connect(self._on_map_status)
+        runner.done.connect(self._on_map_done)
+        runner.failed.connect(self._on_map_failed)
+        self._map_runner = runner
+        self.lbl_map_state.setText("地图测试：准备中…")
+        self._set_status("地图寻路测试开始：按地图键 → OCR 找标注 → 点击 → 关闭地图。", "warn")
+        self._update_macro_button_states()
+        self._update_map_controls_state()
+        runner.start()
+
+    def _on_map_status(self, text: str, level: str) -> None:
+        if hasattr(self, "lbl_map_state"):
+            self.lbl_map_state.setText(text)
+        self._set_status(text, level)
+
+    def _on_map_done(self) -> None:
+        runner = self.sender()
+        if runner is self._map_runner:
+            self._map_runner = None
+            if isinstance(runner, QThread):
+                runner.wait(500)
+                runner.deleteLater()
+        self.lbl_map_state.setText("地图测试完成，已等待自动寻路")
+        self._set_status("地图测试完成。", "ok")
+        self._update_macro_button_states()
+        self._update_map_controls_state()
+
+    def _on_map_failed(self, message: str) -> None:
+        runner = self.sender()
+        if runner is self._map_runner:
+            self._map_runner = None
+            if isinstance(runner, QThread):
+                runner.wait(500)
+                runner.deleteLater()
+        stopped = str(message).strip() == "已停止。"
+        self.lbl_map_state.setText("已停止" if stopped else "地图测试失败")
+        self._set_status(
+            "地图测试已停止。" if stopped else f"地图测试失败：{message}",
+            "warn" if stopped else "error",
+        )
+        if not stopped:
+            try:
+                self._popup.show_message("地图寻路失败", message, seconds=15)
+            except Exception:
+                pass
+        self._update_macro_button_states()
+        self._update_map_controls_state()
+
+    def _stop_map_runner(self) -> None:
+        runner = self._map_runner
+        self._map_runner = None
+        if runner is not None:
+            runner.stop()
+            if not runner.wait(4000):
+                runner.terminate()
+                runner.wait(500)
+            runner.deleteLater()
+        self.lbl_map_state.setText("已停止")
+        self._set_status("地图测试已停止。", "warn")
+        self._update_macro_button_states()
+        self._update_map_controls_state()
 
     def _open_route_editor(self) -> None:
         if self._quitting:
@@ -4268,6 +4553,7 @@ class MainWindow(QMainWindow):
             or self._record_return_player is not None
             or self._stable_runner is not None
             or self._route_editor is not None
+            or self._map_runner is not None
         )
 
     def _save_macro_settings(self) -> None:
@@ -4400,11 +4686,12 @@ class MainWindow(QMainWindow):
         one_key = self._one_key_running
         point_busy = self._point_capture is not None or self._point_kind is not None
         stable_running = self._stable_runner is not None
+        map_running = self._map_runner is not None
         stable_test = stable_running and not one_key
         target_ok = (
             self.target_hwnd is not None and self._window_alive(self.target_hwnd)
         )
-        other_busy = playing or one_key or point_busy or stable_running
+        other_busy = playing or one_key or point_busy or stable_running or map_running
 
         for step in MACRO_STEPS:
             events = (
@@ -4437,7 +4724,9 @@ class MainWindow(QMainWindow):
                 )
                 btn_rerec.setEnabled(not recording and not other_busy and target_ok)
 
-        self.btn_one_key.setEnabled(not recording and not point_busy and not stable_test)
+        self.btn_one_key.setEnabled(
+            not recording and not point_busy and not stable_test and not map_running
+        )
         self.chk_farm_potion.setEnabled(
             not one_key and not recording and not playing and not stable_test
         )
@@ -4453,6 +4742,7 @@ class MainWindow(QMainWindow):
                     and not one_key
                     and not point_busy
                     and not playing
+                    and not map_running
                     and target_ok
                     and boss_point_ok
                 )
@@ -4498,6 +4788,7 @@ class MainWindow(QMainWindow):
         self.btn_return_boss.setEnabled(
             allow_return and self._macro_cfg["points"].get("boss") is not None
         )
+        self._update_map_controls_state()
         self._update_bind_button_state()
 
     def _set_one_key_ui_running(self, running: bool) -> None:
@@ -4532,8 +4823,9 @@ class MainWindow(QMainWindow):
             or self._test_monitor is not None
             or self._stable_runner is not None
             or self._route_editor is not None
+            or self._map_runner is not None
         ):
-            self._notify("正在回放/路线编辑", "请先结束当前回放/稳定测试/路线编辑。")
+            self._notify("正在回放/路线编辑", "请先结束当前回放/稳定测试/路线编辑/地图测试。")
             return
         if self._point_capture is not None or self._point_kind is not None:
             self._notify("正在设置点位", "请等待点位设置结束，再录制流程。")
@@ -4729,6 +5021,12 @@ class MainWindow(QMainWindow):
             return
         if self._route_editor is not None:
             self._notify("正在路线编辑", "请先关闭路线编辑器。")
+            return
+        if self._map_runner is not None:
+            self._notify("正在地图测试", "请先停止地图测试。")
+            return
+        if self._map_runner is not None:
+            self._notify("正在地图测试", "请先停止地图测试。")
             return
         if self._worker is not None:
             self._notify("基础挂机运行中", "请先停止基础挂机。")
@@ -5066,8 +5364,9 @@ class MainWindow(QMainWindow):
             self._stable_runner is not None
             or self._stable_test_running
             or self._route_editor is not None
+            or self._map_runner is not None
         ):
-            self._notify("当前正忙", "请先停止稳定模式测试/路线编辑。")
+            self._notify("当前正忙", "请先停止稳定模式测试/路线编辑/地图测试。")
             return
         if self._point_capture is not None or self._point_kind is not None:
             self._notify("当前正忙", "请等待点位设置结束。")
@@ -5830,6 +6129,7 @@ class MainWindow(QMainWindow):
         running = self._worker is not None or self._macro_busy()
         has_selection = self.combo_windows.currentData() is not None
         self.btn_bind.setEnabled((not running) and has_selection)
+        self._update_map_controls_state()
 
     def _update_toggle_action(self) -> None:
         if self._act_toggle is None:
@@ -5849,6 +6149,9 @@ class MainWindow(QMainWindow):
             self._act_toggle.setEnabled(True)
         elif self._stable_runner is not None:
             self._act_toggle.setText("停止稳定测试")
+            self._act_toggle.setEnabled(True)
+        elif self._map_runner is not None:
+            self._act_toggle.setText("停止地图测试")
             self._act_toggle.setEnabled(True)
         elif self._worker is not None:
             self._act_toggle.setText("停止发送")
@@ -6039,6 +6342,10 @@ class MainWindow(QMainWindow):
 
         try:
             self._stop_stable_runner()
+        except Exception:
+            pass
+        try:
+            self._stop_map_runner()
         except Exception:
             pass
         self._stable_test_running = False

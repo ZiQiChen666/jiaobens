@@ -13,6 +13,7 @@ a = Analysis(
     hiddenimports=[
         'stable_boss',
         'route_editor',
+        'map_labels',
         'keyboard._winkeyboard',
         'keyboard._winmouse',
         'keyboard._generic',
