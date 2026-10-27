@@ -2704,6 +2704,7 @@ class MainWindow(QMainWindow):
         self._stable_runner = None
         self._stable_test_running = False
         self._one_key_stable = False
+        self._route_editor = None
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(self._make_icon())
@@ -3132,6 +3133,14 @@ class MainWindow(QMainWindow):
         point_hint.setObjectName("muted")
         point_hint.setWordWrap(True)
         pg.addWidget(point_hint, 3, 2, 1, 2)
+        self.btn_route_editor = QPushButton("录制 / 管理打怪路线（窗口相对坐标）")
+        self.btn_route_editor.setMinimumHeight(32)
+        self.btn_route_editor.setToolTip(
+            "在同一个 exe 里打开路线编辑器：记录地图入口、路径点、等待和说明。"
+            "所有坐标以游戏窗口客户区左上角为基准。"
+        )
+        self.btn_route_editor.clicked.connect(self._open_route_editor)
+        pg.addWidget(self.btn_route_editor, 4, 0, 1, 4)
         root.addWidget(box_points)
 
         # ---- 录制 ----
@@ -3500,9 +3509,14 @@ class MainWindow(QMainWindow):
     def _start_sending(self) -> None:
         if self._worker is not None or self._quitting:
             return
-        if self._one_key_running or self._single_player is not None or self._stable_runner is not None:
+        if (
+            self._one_key_running
+            or self._single_player is not None
+            or self._stable_runner is not None
+            or self._route_editor is not None
+        ):
             self._notify(
-                "当前正在回放/一键打BOSS",
+                "当前正在回放/一键打BOSS/路线编辑",
                 "请先停止当前的回放、稳定测试或一键打BOSS，再启动基础挂机。",
             )
             return
@@ -3896,6 +3910,40 @@ class MainWindow(QMainWindow):
             "ok" if saved else "warn",
         )
 
+    def _open_route_editor(self) -> None:
+        if self._quitting:
+            return
+        if self._macro_busy():
+            self._notify("当前正忙", "请先停止录制/回放/一键打BOSS/稳定测试。")
+            return
+        if self._worker is not None or self._test_monitor is not None:
+            self._notify("当前正忙", "请先停止基础挂机/疲劳测试。")
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
+            return
+        if self._route_editor is not None:
+            self._route_editor.show()
+            self._route_editor.raise_()
+            self._route_editor.activateWindow()
+            return
+        try:
+            from route_editor import RouteEditor
+        except Exception as exc:
+            self._notify("路线编辑器不可用", f"加载失败：{exc}")
+            return
+        editor = RouteEditor(game_hwnd=self.target_hwnd, parent=self)
+        editor.destroyed.connect(self._on_route_editor_destroyed)
+        self._route_editor = editor
+        editor.show()
+        editor.raise_()
+        editor.activateWindow()
+        self._update_macro_button_states()
+
+    def _on_route_editor_destroyed(self, *_args) -> None:
+        self._route_editor = None
+        self._update_macro_button_states()
+
     def _select_fatigue_region(self) -> None:
         if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
             self._notify(
@@ -4219,6 +4267,7 @@ class MainWindow(QMainWindow):
             or self._point_kind is not None
             or self._record_return_player is not None
             or self._stable_runner is not None
+            or self._route_editor is not None
         )
 
     def _save_macro_settings(self) -> None:
@@ -4422,6 +4471,8 @@ class MainWindow(QMainWindow):
                 self.btn_set_exit_click,
             ):
                 widget.setEnabled(stable_controls_enabled)
+        if hasattr(self, "btn_route_editor"):
+            self.btn_route_editor.setEnabled(not self._macro_busy())
         if hasattr(self, "spin_fatigue_threshold_boss"):
             self.spin_fatigue_threshold_boss.setEnabled(not self._macro_busy())
         self.btn_set_farm.setEnabled(not self._macro_busy())
@@ -4476,8 +4527,13 @@ class MainWindow(QMainWindow):
         if self._worker is not None:
             self._notify("基础挂机运行中", "请先停止基础挂机，再录制流程。")
             return
-        if self._single_player is not None or self._test_monitor is not None or self._stable_runner is not None:
-            self._notify("正在回放", "请等待当前回放/稳定测试结束，再录制流程。")
+        if (
+            self._single_player is not None
+            or self._test_monitor is not None
+            or self._stable_runner is not None
+            or self._route_editor is not None
+        ):
+            self._notify("正在回放/路线编辑", "请先结束当前回放/稳定测试/路线编辑。")
             return
         if self._point_capture is not None or self._point_kind is not None:
             self._notify("正在设置点位", "请等待点位设置结束，再录制流程。")
@@ -4670,6 +4726,9 @@ class MainWindow(QMainWindow):
             return
         if self._stable_runner is not None:
             self._notify("正在稳定模式测试", "请先停止稳定模式测试。")
+            return
+        if self._route_editor is not None:
+            self._notify("正在路线编辑", "请先关闭路线编辑器。")
             return
         if self._worker is not None:
             self._notify("基础挂机运行中", "请先停止基础挂机。")
@@ -5003,8 +5062,12 @@ class MainWindow(QMainWindow):
         if self._single_player is not None or self._recording_step is not None:
             self._notify("当前正忙", "请先停止回放/录制。")
             return
-        if self._stable_runner is not None or self._stable_test_running:
-            self._notify("当前正忙", "请先停止稳定模式测试。")
+        if (
+            self._stable_runner is not None
+            or self._stable_test_running
+            or self._route_editor is not None
+        ):
+            self._notify("当前正忙", "请先停止稳定模式测试/路线编辑。")
             return
         if self._point_capture is not None or self._point_kind is not None:
             self._notify("当前正忙", "请等待点位设置结束。")
@@ -5253,6 +5316,9 @@ class MainWindow(QMainWindow):
 
     def _start_stable_test(self) -> None:
         if self._quitting or self._one_key_running or self._stable_runner is not None:
+            return
+        if self._route_editor is not None:
+            self._notify("正在路线编辑", "请先关闭路线编辑器。")
             return
         if self._worker is not None:
             self._notify("基础挂机运行中", "请先停止基础挂机，再测试稳定模式。")
@@ -5977,6 +6043,14 @@ class MainWindow(QMainWindow):
             pass
         self._stable_test_running = False
         self._one_key_stable = False
+
+        route_editor = self._route_editor
+        self._route_editor = None
+        if route_editor is not None:
+            try:
+                route_editor.close()
+            except Exception:
+                pass
 
         for player_attr in (
             "_single_player",

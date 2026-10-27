@@ -12,6 +12,7 @@ a = Analysis(
     datas=rapidocr_datas,
     hiddenimports=[
         'stable_boss',
+        'route_editor',
         'keyboard._winkeyboard',
         'keyboard._winmouse',
         'keyboard._generic',
