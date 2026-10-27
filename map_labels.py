@@ -133,6 +133,7 @@ class MapLabelCanvas(QWidget):
     item_selected = Signal(int)
     offset_calibrated = Signal(float, float)
     actual_marked = Signal(float, float)
+    map_corner_marked = Signal(float, float)
 
     def __init__(self, image: QImage, parent=None) -> None:
         super().__init__(parent)
@@ -143,6 +144,8 @@ class MapLabelCanvas(QWidget):
         self.targets: list[dict] = []
         self.calibrating_target = -1
         self.mark_actual = False
+        self.map_corner_mode = False
+        self.map_rect: Optional[tuple[float, float, float, float]] = None
         self._apply_size()
 
     def _apply_size(self) -> None:
@@ -189,6 +192,9 @@ class MapLabelCanvas(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         nx, ny = self._to_norm(event.position().toPoint())
+        if self.map_corner_mode:
+            self.map_corner_marked.emit(nx, ny)
+            return
         if self.mark_actual:
             self.mark_actual = False
             self.actual_marked.emit(nx, ny)
@@ -239,6 +245,18 @@ class MapLabelCanvas(QWidget):
                     max(12, y0 - 3),
                     str(item.get("text", ""))[:20],
                 )
+        if self.map_rect is not None:
+            x0, y0, x1, y1 = self.map_rect
+            rx0 = int(x0 * iw * s)
+            ry0 = int(y0 * ih * s)
+            rx1 = int(x1 * iw * s)
+            ry1 = int(y1 * ih * s)
+            painter.setPen(QPen(QColor("#ffd60a"), 2))
+            painter.drawRect(QRect(rx0, ry0, max(2, rx1 - rx0), max(2, ry1 - ry0)))
+            painter.drawLine(rx0 - 14, ry0, rx0 + 14, ry0)
+            painter.drawLine(rx0, ry0 - 14, rx0, ry0 + 14)
+            painter.setFont(QFont("Microsoft YaHei", 9, QFont.Weight.Bold))
+            painter.drawText(rx0 + 16, max(14, ry0 - 4), "地图零点")
         for idx, target in enumerate(self.targets):
             try:
                 nx = float(target.get("nx", 0.5)) + float(target.get("offset_x", 0.0))
@@ -258,7 +276,11 @@ class MapLabelCanvas(QWidget):
                 max(14, y - 6),
                 f"{target.get('name', '')} [{TARGET_KINDS.get(str(target.get('kind')), '')}]",
             )
-        if self.mark_actual:
+        if self.map_corner_mode:
+            painter.setPen(QPen(QColor("#ffd60a"), 2))
+            painter.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+            painter.drawText(20, 30, "请点击地图的左上角零点，再点右下角确定地图范围")
+        elif self.mark_actual:
             painter.setPen(QPen(QColor("#ff3b30"), 2))
             painter.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
             painter.drawText(20, 30, "请点击真正的入口位置（会自动关联最近的中文标注）")
@@ -284,6 +306,8 @@ class MapLabelDialog(QDialog):
         self.selected_item = -1
         self.saved = False
         self._manual_marking = False
+        self.map_rect_norm: Optional[tuple[float, float, float, float]] = None
+        self._map_corners: list[tuple[float, float]] = []
 
         self._build_ui()
         self._refresh_map_combo()
@@ -303,6 +327,12 @@ class MapLabelDialog(QDialog):
         self.edit_map_check.setPlaceholderText(
             "用于运行时确认地图的文字，例如：晨瞻之森（可留空）"
         )
+        self.lbl_map_rect = QLabel("地图零点/范围：未标定")
+        self.lbl_map_rect.setStyleSheet("color: #b26a00;")
+        self.btn_calibrate_map = QPushButton("标定地图零点/范围")
+        self.btn_calibrate_map.setToolTip(
+            "在截图上先点地图左上角零点，再点地图右下角，确定地图在窗口中的范围"
+        )
         row = QHBoxLayout()
         row.addWidget(QLabel("已保存地图"))
         self.combo_maps = QComboBox()
@@ -314,6 +344,10 @@ class MapLabelDialog(QDialog):
         row.addWidget(self.btn_capture)
         top_form.addRow("地图名", self.edit_map_name)
         top_form.addRow("地图校验文字", self.edit_map_check)
+        map_rect_row = QHBoxLayout()
+        map_rect_row.addWidget(self.lbl_map_rect, 1)
+        map_rect_row.addWidget(self.btn_calibrate_map)
+        top_form.addRow("地图范围", map_rect_row)
         top_form.addRow("", row)
         root.addWidget(top)
 
@@ -413,6 +447,8 @@ class MapLabelDialog(QDialog):
         self.btn_manual_point.clicked.connect(self.start_manual_point)
         self.btn_mark_actual.clicked.connect(self.start_mark_actual)
         self.canvas.actual_marked.connect(self._on_actual_marked_or_manual)
+        self.canvas.map_corner_marked.connect(self._on_map_corner)
+        self.btn_calibrate_map.clicked.connect(self.start_calibrate_map)
         self.btn_set_farm.clicked.connect(lambda: self.set_selected_kind("farm"))
         self.btn_set_boss.clicked.connect(lambda: self.set_selected_kind("boss"))
         self.btn_calibrate.clicked.connect(self.start_calibrate)
@@ -437,6 +473,18 @@ class MapLabelDialog(QDialog):
             return
         self.edit_map_name.setText(str(mp.get("name", "")))
         self.edit_map_check.setText(str(mp.get("check", "")))
+        rect = mp.get("map_rect_norm")
+        self.map_rect_norm = None
+        try:
+            if isinstance(rect, (list, tuple)) and len(rect) == 4:
+                x0, y0, x1, y1 = (float(v) for v in rect)
+                if 0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0:
+                    self.map_rect_norm = (x0, y0, x1, y1)
+        except (TypeError, ValueError):
+            pass
+        self.canvas.map_rect = self.map_rect_norm
+        self.canvas.update()
+        self._update_map_rect_label()
         self.targets = [dict(t) for t in mp.get("targets", []) if isinstance(t, dict)]
         self.canvas.set_targets(self.targets)
         self._refresh_target_list()
@@ -466,7 +514,9 @@ class MapLabelDialog(QDialog):
         self.items = []
         self.list_ocr.clear()
         self.canvas.set_image(self.image, [])
+        self.canvas.map_rect = self.map_rect_norm
         self.canvas.set_targets(self.targets)
+        self._update_map_rect_label()
         self.status.setText("截图完成。OCR 识别中…（识别不到可直接手动点选）")
         QApplication.processEvents()
         try:
@@ -568,6 +618,9 @@ class MapLabelDialog(QDialog):
             key = compact_text(text)
             if key in existing:
                 continue
+            mx, my = self._to_map_coords(
+                float(item.get("nx", 0.5)), float(item.get("ny", 0.5))
+            )
             self.targets.append(
                 {
                     "name": text,
@@ -575,6 +628,8 @@ class MapLabelDialog(QDialog):
                     "text": text,
                     "nx": float(item.get("nx", 0.5)),
                     "ny": float(item.get("ny", 0.5)),
+                    "map_x": mx,
+                    "map_y": my,
                     "offset_x": 0.0,
                     "offset_y": 0.0,
                 }
@@ -588,6 +643,74 @@ class MapLabelDialog(QDialog):
         self.status.setText(
             f"自动标注完成：新增 {added} 个候选；在右侧目标列表里选出打怪点/BOSS点即可"
         )
+
+    def start_calibrate_map(self) -> None:
+        if self.image is None:
+            QMessageBox.information(self, "没有地图", "先截图，再标定地图范围。")
+            return
+        self._map_corners = []
+        self.canvas.map_corner_mode = True
+        self.canvas.update()
+        self.status.setText("请在截图上点击地图左上角零点（地图图像/面板的左上角）")
+
+    def _on_map_corner(self, nx: float, ny: float) -> None:
+        self._map_corners.append((nx, ny))
+        if len(self._map_corners) == 1:
+            self.status.setText("再点击地图右下角，确定地图范围")
+            return
+        if len(self._map_corners) < 2:
+            return
+        (x0, y0), (x1, y1) = self._map_corners[:2]
+        self._map_corners = []
+        rx0, rx1 = sorted((x0, x1))
+        ry0, ry1 = sorted((y0, y1))
+        if rx1 - rx0 < 0.02 or ry1 - ry0 < 0.02:
+            self.canvas.map_corner_mode = False
+            self.canvas.update()
+            self.status.setText("地图范围太小，请重新标定")
+            return
+        self.map_rect_norm = (rx0, ry0, rx1, ry1)
+        self.canvas.map_rect = self.map_rect_norm
+        self.canvas.map_corner_mode = False
+        self.canvas.update()
+        self._update_map_rect_label()
+        # 已有目标如果是地图坐标，按新范围重算
+        for target in self.targets:
+            if target.get("map_x") is None or target.get("map_y") is None:
+                continue
+            nx = float(target.get("nx", 0.5))
+            ny = float(target.get("ny", 0.5))
+            mx = (nx - rx0) / max(0.0001, rx1 - rx0)
+            my = (ny - ry0) / max(0.0001, ry1 - ry0)
+            target["map_x"] = max(0.0, min(1.0, mx))
+            target["map_y"] = max(0.0, min(1.0, my))
+        self.canvas.set_targets(self.targets)
+        self._refresh_target_list()
+        self.status.setText(
+            f"地图范围已标定：零点 {rx0*100:.1f}%, {ry0*100:.1f}%  "
+            f"右下 {rx1*100:.1f}%, {ry1*100:.1f}%"
+        )
+
+    def _update_map_rect_label(self) -> None:
+        if self.map_rect_norm is None:
+            self.lbl_map_rect.setText("地图零点/范围：未标定")
+            self.lbl_map_rect.setStyleSheet("color: #b26a00;")
+        else:
+            x0, y0, x1, y1 = self.map_rect_norm
+            self.lbl_map_rect.setText(
+                f"地图范围：{x0*100:.1f},{y0*100:.1f} → {x1*100:.1f},{y1*100:.1f}"
+            )
+            self.lbl_map_rect.setStyleSheet("color: #2e7d32;")
+
+    def _to_map_coords(self, nx: float, ny: float) -> tuple[Optional[float], Optional[float]]:
+        if self.map_rect_norm is None:
+            return None, None
+        x0, y0, x1, y1 = self.map_rect_norm
+        mx = (float(nx) - x0) / max(0.0001, x1 - x0)
+        my = (float(ny) - y0) / max(0.0001, y1 - y0)
+        if not (0.0 <= mx <= 1.0 and 0.0 <= my <= 1.0):
+            return None, None
+        return max(0.0, min(1.0, mx)), max(0.0, min(1.0, my))
 
     def start_manual_point(self) -> None:
         if self.image is None:
@@ -617,12 +740,15 @@ class MapLabelDialog(QDialog):
             name = name.strip()
             self.edit_target_name.setText(name)
         kind = str(self.combo_target_kind.currentData() or "farm")
+        mx, my = self._to_map_coords(nx, ny)
         target = {
             "name": name,
             "kind": kind,
             "text": "",
             "nx": float(nx),
             "ny": float(ny),
+            "map_x": mx,
+            "map_y": my,
             "offset_x": 0.0,
             "offset_y": 0.0,
         }
@@ -636,9 +762,14 @@ class MapLabelDialog(QDialog):
         self.canvas.set_targets(self.targets)
         self._refresh_target_list()
         self.list_targets.setCurrentRow(len(self.targets) - 1)
+        extra = (
+            f"；地图坐标 {mx*100:.1f}%, {my*100:.1f}%"
+            if mx is not None and my is not None
+            else "（未标定地图范围，使用窗口相对坐标）"
+        )
         self.status.setText(
             f"已保存{TARGET_KINDS.get(kind, kind)}「{name}」："
-            f"{nx*100:.1f}%, {ny*100:.1f}%（窗口相对坐标）"
+            f"{nx*100:.1f}%, {ny*100:.1f}%（窗口坐标）{extra}"
         )
 
     def start_mark_actual(self) -> None:
@@ -676,23 +807,29 @@ class MapLabelDialog(QDialog):
         kind = str(self.combo_target_kind.currentData() or "farm")
         if best is not None and best_dist <= 0.32:
             text = str(best.get("text", "")).strip()
+            mx, my = self._to_map_coords(nx, ny)
             target = {
                 "name": self.edit_target_name.text().strip() or text,
                 "kind": kind,
                 "text": text,
                 "nx": float(best.get("nx", 0.5)),
                 "ny": float(best.get("ny", 0.5)),
+                "map_x": mx,
+                "map_y": my,
                 "offset_x": nx - float(best.get("nx", 0.5)),
                 "offset_y": ny - float(best.get("ny", 0.5)),
             }
             note = f"已关联标注「{text}」，偏移 ({target['offset_x']*100:.1f}%, {target['offset_y']*100:.1f}%)"
         else:
+            mx, my = self._to_map_coords(nx, ny)
             target = {
                 "name": self.edit_target_name.text().strip() or f"入口 {len(self.targets)+1}",
                 "kind": kind,
                 "text": "",
                 "nx": nx,
                 "ny": ny,
+                "map_x": mx,
+                "map_y": my,
                 "offset_x": 0.0,
                 "offset_y": 0.0,
             }
@@ -724,12 +861,17 @@ class MapLabelDialog(QDialog):
             item = self.items[self.selected_item]
             text = str(item.get("text", "")).strip()
             name = self.edit_target_name.text().strip() or text
+            mx, my = self._to_map_coords(
+                float(item.get("nx", 0.5)), float(item.get("ny", 0.5))
+            )
             target = {
                 "name": name,
                 "kind": kind,
                 "text": text,
                 "nx": float(item.get("nx", 0.5)),
                 "ny": float(item.get("ny", 0.5)),
+                "map_x": mx,
+                "map_y": my,
                 "offset_x": 0.0,
                 "offset_y": 0.0,
             }
@@ -782,6 +924,11 @@ class MapLabelDialog(QDialog):
         self.list_targets.clear()
         for target in self.targets:
             anchor = str(target.get("text", "")).strip() or "固定坐标"
+            if target.get("map_x") is not None and target.get("map_y") is not None:
+                anchor += (
+                    f" / 地图坐标 {float(target['map_x'])*100:.1f}%,"
+                    f"{float(target['map_y'])*100:.1f}%"
+                )
             self.list_targets.addItem(
                 f"{target.get('name', '')}  [{TARGET_KINDS.get(str(target.get('kind')), '')}]  "
                 f"锚点：{anchor}"
@@ -830,6 +977,7 @@ class MapLabelDialog(QDialog):
         profile = {
             "name": name,
             "check": self.edit_map_check.text().strip(),
+            "map_rect_norm": list(self.map_rect_norm) if self.map_rect_norm else None,
             "targets": [dict(t) for t in self.targets],
             "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -940,6 +1088,34 @@ class MapTravelRunner(QThread):
         app._send_mouse_button("left", False)
         time.sleep(0.15)
 
+    def _target_norm(self, target: dict) -> tuple[float, float]:
+        rect = self.profile.get("map_rect_norm")
+        mx = target.get("map_x")
+        my = target.get("map_y")
+        try:
+            if (
+                isinstance(rect, (list, tuple))
+                and len(rect) == 4
+                and mx is not None
+                and my is not None
+            ):
+                x0, y0, x1, y1 = (float(v) for v in rect)
+                if 0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0:
+                    nx = x0 + float(mx) * (x1 - x0)
+                    ny = y0 + float(my) * (y1 - y0)
+                    return (
+                        max(0.0, min(1.0, nx)),
+                        max(0.0, min(1.0, ny)),
+                    )
+        except (TypeError, ValueError):
+            pass
+        nx = float(target.get("nx", 0.5)) + float(target.get("offset_x", 0.0))
+        ny = float(target.get("ny", 0.5)) + float(target.get("offset_y", 0.0))
+        return (
+            max(0.0, min(1.0, nx)),
+            max(0.0, min(1.0, ny)),
+        )
+
     def _find_target(self) -> Optional[dict]:
         app = _app()
         if app is None:
@@ -985,12 +1161,7 @@ class MapTravelRunner(QThread):
             target_text = str(self.target.get("text", "")).strip()
             if not target_text:
                 # 没有文字锚点：直接使用学习时记录的实际窗口坐标
-                nx = float(self.target.get("nx", 0.5)) + float(
-                    self.target.get("offset_x", 0.0)
-                )
-                ny = float(self.target.get("ny", 0.5)) + float(
-                    self.target.get("offset_y", 0.0)
-                )
+                nx, ny = self._target_norm(self.target)
                 self.log(
                     f"目标没有文字锚点，使用固定窗口坐标 "
                     f"{nx*100:.1f}%, {ny*100:.1f}%"
