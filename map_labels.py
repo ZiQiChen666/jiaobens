@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -282,6 +283,7 @@ class MapLabelDialog(QDialog):
         self.targets: list[dict] = []
         self.selected_item = -1
         self.saved = False
+        self._manual_marking = False
 
         self._build_ui()
         self._refresh_map_combo()
@@ -353,13 +355,18 @@ class MapLabelDialog(QDialog):
         self.btn_auto_labels.setToolTip(
             "自动把地图区域识别到的中文标注加入候选列表，你再删掉不需要的"
         )
-        self.btn_mark_actual = QPushButton("点选实际入口")
+        self.btn_manual_point = QPushButton("手动点选坐标")
+        self.btn_manual_point.setToolTip(
+            "不依赖 OCR：先填名称/选类型，再点这里，然后在截图上点真正的入口"
+        )
+        self.btn_mark_actual = QPushButton("点选实际入口（自动关联文字）")
         self.btn_mark_actual.setToolTip(
             "先选目标类型，再点这里，然后在截图上点真正入口；程序会自动关联最近的中文标注并保存偏移"
         )
         self.btn_set_farm = QPushButton("选中→打怪点")
         self.btn_set_boss = QPushButton("选中→BOSS点")
         quick_row.addWidget(self.btn_auto_labels)
+        quick_row.addWidget(self.btn_manual_point)
         quick_row.addWidget(self.btn_mark_actual)
         quick_row.addWidget(self.btn_set_farm)
         quick_row.addWidget(self.btn_set_boss)
@@ -391,9 +398,9 @@ class MapLabelDialog(QDialog):
         root.addLayout(bottom)
 
         hint = QLabel(
-            "流程：先打开游戏地图 → 点“重新截图 + OCR” → 可点“自动标注全部地图文字”直接生成候选；"
-            "然后在目标列表里选一个，点“选中→打怪点/选中→BOSS点”。若文字本身不能点，"
-            "选中目标后点“校准实际入口”，再到截图上点真正入口。坐标全部相对游戏窗口客户区左上角。"
+            "推荐手动标注：打开地图 → 重新截图 → 填名称/选类型 → 点“手动点选坐标” → "
+            "在截图上点真正入口。程序只记住“名称 → 窗口相对坐标”，不依赖 OCR。"
+            "OCR 认不出小字时完全不影响手动标注。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #666;")
@@ -403,8 +410,9 @@ class MapLabelDialog(QDialog):
         self.list_targets.currentRowChanged.connect(self._on_target_row)
         self.btn_add_target.clicked.connect(self.add_target)
         self.btn_auto_labels.clicked.connect(self.auto_annotate_all)
+        self.btn_manual_point.clicked.connect(self.start_manual_point)
         self.btn_mark_actual.clicked.connect(self.start_mark_actual)
-        self.canvas.actual_marked.connect(self._on_actual_marked)
+        self.canvas.actual_marked.connect(self._on_actual_marked_or_manual)
         self.btn_set_farm.clicked.connect(lambda: self.set_selected_kind("farm"))
         self.btn_set_boss.clicked.connect(lambda: self.set_selected_kind("boss"))
         self.btn_calibrate.clicked.connect(self.start_calibrate)
@@ -454,12 +462,19 @@ class MapLabelDialog(QDialog):
         self.image = QImage(
             bytes(data), w, h, w * 4, QImage.Format.Format_RGB32
         ).copy()
-        self.status.setText("正在 OCR 识别中文标注…")
+        # 先把截图显示出来：即使 OCR 失败，也可以手动点选坐标
+        self.items = []
+        self.list_ocr.clear()
+        self.canvas.set_image(self.image, [])
+        self.canvas.set_targets(self.targets)
+        self.status.setText("截图完成。OCR 识别中…（识别不到可直接手动点选）")
         QApplication.processEvents()
         try:
             items = app.ocr_screen_items(data, w, h)
         except Exception as exc:
-            self.status.setText(f"OCR 失败：{type(exc).__name__}: {exc}")
+            self.status.setText(
+                f"OCR 失败：{type(exc).__name__}: {exc}；可直接用“手动点选坐标”"
+            )
             return
         items = [
             it
@@ -574,6 +589,58 @@ class MapLabelDialog(QDialog):
             f"自动标注完成：新增 {added} 个候选；在右侧目标列表里选出打怪点/BOSS点即可"
         )
 
+    def start_manual_point(self) -> None:
+        if self.image is None:
+            QMessageBox.information(self, "没有地图", "先点“重新截图 + OCR”把地图截下来。")
+            return
+        name = self.edit_target_name.text().strip()
+        if not name:
+            name, ok = QInputDialog.getText(
+                self, "目标名称", "给这个入口起个名字（例如：大角城 / 打怪点 / BOSS）："
+            )
+            if not ok or not name.strip():
+                return
+            self.edit_target_name.setText(name.strip())
+        self._manual_marking = True
+        self.canvas.mark_actual = True
+        self.canvas.update()
+        self.status.setText("请在左侧截图上点击真正的入口坐标（不依赖 OCR）")
+
+    def _on_manual_marked(self, nx: float, ny: float) -> None:
+        name = self.edit_target_name.text().strip()
+        if not name:
+            name, ok = QInputDialog.getText(
+                self, "目标名称", "给这个入口起个名字："
+            )
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+            self.edit_target_name.setText(name)
+        kind = str(self.combo_target_kind.currentData() or "farm")
+        target = {
+            "name": name,
+            "kind": kind,
+            "text": "",
+            "nx": float(nx),
+            "ny": float(ny),
+            "offset_x": 0.0,
+            "offset_y": 0.0,
+        }
+        for idx, old in enumerate(self.targets):
+            if old.get("name") == name and old.get("kind") == kind:
+                self.targets[idx] = target
+                break
+        else:
+            self.targets.append(target)
+        self._manual_marking = False
+        self.canvas.set_targets(self.targets)
+        self._refresh_target_list()
+        self.list_targets.setCurrentRow(len(self.targets) - 1)
+        self.status.setText(
+            f"已保存{TARGET_KINDS.get(kind, kind)}「{name}」："
+            f"{nx*100:.1f}%, {ny*100:.1f}%（窗口相对坐标）"
+        )
+
     def start_mark_actual(self) -> None:
         if self.image is None:
             QMessageBox.information(self, "没有地图", "先截图 + OCR。")
@@ -583,6 +650,12 @@ class MapLabelDialog(QDialog):
         self.status.setText(
             "请在左侧截图上点击真正的入口；会自动找最近的中文标注并保存偏移"
         )
+
+    def _on_actual_marked_or_manual(self, nx: float, ny: float) -> None:
+        if self._manual_marking:
+            self._on_manual_marked(nx, ny)
+        else:
+            self._on_actual_marked(nx, ny)
 
     def _on_actual_marked(self, nx: float, ny: float) -> None:
         # 找最近的中文标注作为锚点
