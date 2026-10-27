@@ -338,6 +338,17 @@ class MapLabelDialog(QDialog):
         target_form.addRow("目标名称", self.edit_target_name)
         target_form.addRow("目标类型", self.combo_target_kind)
         target_form.addRow("", self.btn_add_target)
+        quick_row = QHBoxLayout()
+        self.btn_auto_labels = QPushButton("自动标注全部地图文字")
+        self.btn_auto_labels.setToolTip(
+            "自动把地图区域识别到的中文标注加入候选列表，你再删掉不需要的"
+        )
+        self.btn_set_farm = QPushButton("选中→打怪点")
+        self.btn_set_boss = QPushButton("选中→BOSS点")
+        quick_row.addWidget(self.btn_auto_labels)
+        quick_row.addWidget(self.btn_set_farm)
+        quick_row.addWidget(self.btn_set_boss)
+        target_form.addRow("快捷", quick_row)
         right.addWidget(target_box)
 
         targets_box = QGroupBox("本图已添加的目标")
@@ -365,9 +376,9 @@ class MapLabelDialog(QDialog):
         root.addLayout(bottom)
 
         hint = QLabel(
-            "流程：先打开游戏地图 → 点“重新截图 + OCR” → 在左侧或列表里选中中文标注 → "
-            "填目标名称/类型 → 添加目标。若文字本身不能点，选中目标后点“校准实际入口”，"
-            "再到截图上点真正入口。坐标全部相对游戏窗口客户区左上角。"
+            "流程：先打开游戏地图 → 点“重新截图 + OCR” → 可点“自动标注全部地图文字”直接生成候选；"
+            "然后在目标列表里选一个，点“选中→打怪点/选中→BOSS点”。若文字本身不能点，"
+            "选中目标后点“校准实际入口”，再到截图上点真正入口。坐标全部相对游戏窗口客户区左上角。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #666;")
@@ -376,6 +387,9 @@ class MapLabelDialog(QDialog):
         self.list_ocr.currentRowChanged.connect(self._on_ocr_row)
         self.list_targets.currentRowChanged.connect(self._on_target_row)
         self.btn_add_target.clicked.connect(self.add_target)
+        self.btn_auto_labels.clicked.connect(self.auto_annotate_all)
+        self.btn_set_farm.clicked.connect(lambda: self.set_selected_kind("farm"))
+        self.btn_set_boss.clicked.connect(lambda: self.set_selected_kind("boss"))
         self.btn_calibrate.clicked.connect(self.start_calibrate)
         self.btn_delete_target.clicked.connect(self.delete_target)
         self.btn_capture.clicked.connect(self.capture_and_ocr)
@@ -480,6 +494,104 @@ class MapLabelDialog(QDialog):
 
     def _on_target_kind(self, _index: int) -> None:
         pass
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _looks_like_map_label(item: dict) -> bool:
+        text = str(item.get("text", "")).strip()
+        if not text:
+            return False
+        if float(item.get("score", 0)) < 0.35:
+            return False
+        if len(text) > 14:
+            return False
+        chinese = len(re.findall(r"[一-鿿]", text))
+        if chinese < 2:
+            return False
+        block_words = (
+            "当前位置", "传送门", "危险区域", "说明", "任务", "经验", "获得",
+            "系统", "世界", "发送", "仓库", "设置", "杂货铺", "制作组",
+            "背包", "材料", "装备", "全部", "出售", "单价", "总价",
+            "数量", "最大", "攻击", "防御", "生命", "速度", "命中",
+            "暴击", "闪躲", "疲劳", "名称", "类型", "等级", "属性",
+        )
+        if any(w in text for w in block_words):
+            return False
+        # 太靠上的 HUD / 太靠下的聊天栏先排除
+        ny = float(item.get("ny", 0.5))
+        if ny < 0.12 or ny > 0.82:
+            return False
+        return True
+
+    def auto_annotate_all(self) -> None:
+        if not self.items:
+            QMessageBox.information(self, "没有文字", "先截图 + OCR。")
+            return
+        added = 0
+        existing = {compact_text(str(t.get("text", ""))) for t in self.targets}
+        for item in self.items:
+            if not self._looks_like_map_label(item):
+                continue
+            text = str(item.get("text", "")).strip()
+            key = compact_text(text)
+            if key in existing:
+                continue
+            self.targets.append(
+                {
+                    "name": text,
+                    "kind": "other",
+                    "text": text,
+                    "nx": float(item.get("nx", 0.5)),
+                    "ny": float(item.get("ny", 0.5)),
+                    "offset_x": 0.0,
+                    "offset_y": 0.0,
+                }
+            )
+            existing.add(key)
+            added += 1
+        self.canvas.set_targets(self.targets)
+        self._refresh_target_list()
+        if self.targets:
+            self.list_targets.setCurrentRow(0)
+        self.status.setText(
+            f"自动标注完成：新增 {added} 个候选；在右侧目标列表里选出打怪点/BOSS点即可"
+        )
+
+    def set_selected_kind(self, kind: str) -> None:
+        row = self.list_targets.currentRow()
+        if 0 <= row < len(self.targets):
+            self.targets[row]["kind"] = kind
+            self.canvas.set_targets(self.targets)
+            self._refresh_target_list()
+            self.list_targets.setCurrentRow(row)
+            self.status.setText(
+                f"已把「{self.targets[row].get('name', '')}」设为{TARGET_KINDS.get(kind, kind)}"
+            )
+            return
+        if 0 <= self.selected_item < len(self.items):
+            item = self.items[self.selected_item]
+            text = str(item.get("text", "")).strip()
+            name = self.edit_target_name.text().strip() or text
+            target = {
+                "name": name,
+                "kind": kind,
+                "text": text,
+                "nx": float(item.get("nx", 0.5)),
+                "ny": float(item.get("ny", 0.5)),
+                "offset_x": 0.0,
+                "offset_y": 0.0,
+            }
+            self.targets.append(target)
+            self.canvas.set_targets(self.targets)
+            self._refresh_target_list()
+            self.list_targets.setCurrentRow(len(self.targets) - 1)
+            self.status.setText(
+                f"已添加「{name}」为{TARGET_KINDS.get(kind, kind)}"
+            )
+            return
+        QMessageBox.information(
+            self, "先选标注", "请先在左侧截图/OCR列表里选一个标注，或在目标列表里选一个目标。"
+        )
 
     # ------------------------------------------------------------------
     def add_target(self) -> None:
