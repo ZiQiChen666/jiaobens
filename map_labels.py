@@ -380,7 +380,7 @@ class MapLabelDialog(QDialog):
         self.combo_target_kind = QComboBox()
         for key, label in TARGET_KINDS.items():
             self.combo_target_kind.addItem(label, key)
-        self.btn_add_target = QPushButton("添加/更新这个目标")
+        self.btn_add_target = QPushButton("添加/更新 OCR 标注目标")
         target_form.addRow("目标名称", self.edit_target_name)
         target_form.addRow("目标类型", self.combo_target_kind)
         target_form.addRow("", self.btn_add_target)
@@ -389,7 +389,7 @@ class MapLabelDialog(QDialog):
         self.btn_auto_labels.setToolTip(
             "自动把地图区域识别到的中文标注加入候选列表，你再删掉不需要的"
         )
-        self.btn_manual_point = QPushButton("手动点选坐标")
+        self.btn_manual_point = QPushButton("手动添加目标（不用 OCR）")
         self.btn_manual_point.setToolTip(
             "不依赖 OCR：先填名称/选类型，再点这里，然后在截图上点真正的入口"
         )
@@ -399,8 +399,8 @@ class MapLabelDialog(QDialog):
         )
         self.btn_set_farm = QPushButton("选中→打怪点")
         self.btn_set_boss = QPushButton("选中→BOSS点")
-        quick_row.addWidget(self.btn_auto_labels)
         quick_row.addWidget(self.btn_manual_point)
+        quick_row.addWidget(self.btn_auto_labels)
         quick_row.addWidget(self.btn_mark_actual)
         quick_row.addWidget(self.btn_set_farm)
         quick_row.addWidget(self.btn_set_boss)
@@ -432,8 +432,8 @@ class MapLabelDialog(QDialog):
         root.addLayout(bottom)
 
         hint = QLabel(
-            "推荐手动标注：打开地图 → 重新截图 → 填名称/选类型 → 点“手动点选坐标” → "
-            "在截图上点真正入口。程序只记住“名称 → 窗口相对坐标”，不依赖 OCR。"
+            "推荐手动标注：打开地图 → 重新截图 → 填名称/选类型 → 点“手动添加目标（不用 OCR）” → "
+            "在截图上点真正入口。程序只记住“名称 → 地图内坐标”，不依赖 OCR。"
             "OCR 认不出小字时完全不影响手动标注。"
         )
         hint.setWordWrap(True)
@@ -890,7 +890,12 @@ class MapLabelDialog(QDialog):
     # ------------------------------------------------------------------
     def add_target(self) -> None:
         if not (0 <= self.selected_item < len(self.items)):
-            QMessageBox.information(self, "先选标注", "请先选中一个 OCR 中文标注。")
+            QMessageBox.information(
+                self,
+                "这是 OCR 标注模式",
+                "这个按钮需要先在 OCR 列表里选中文字。\n"
+                "不需要 OCR 请点“手动添加目标（不用 OCR）”。",
+            )
             return
         name = self.edit_target_name.text().strip()
         if not name:
