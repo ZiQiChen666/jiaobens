@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller / build outputs
+build/
+dist/
+_build.log
+
+# Runtime / local state
+boss_states/
+last_probe_session.txt
+*.log
+*.tmp
