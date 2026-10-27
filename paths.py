@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import re
 import sys
@@ -303,6 +304,73 @@ class PathRunner(QThread):
         ny = float(target.get("ny", 0.5))
         return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
 
+    def _read_current_profile(self) -> Optional[dict]:
+        _text, texts = ocr_top_right_map(self.hwnd)
+        return match_map_profile(self.profiles, texts)
+
+    @staticmethod
+    def _same_map(a: str, b: str) -> bool:
+        ca, cb = _compact(a), _compact(b)
+        if not ca or not cb:
+            return False
+        return ca in cb or cb in ca
+
+    def _ensure_entered(
+        self,
+        profile: dict,
+        target: dict,
+        expected_map: str,
+    ) -> bool:
+        """如果没进入期望的新地图，就在标记点 5% 半径内绕圈重点，直到进入。"""
+        current = self._read_current_profile()
+        if current is not None and self._same_map(
+            str(current.get("name", "")), expected_map
+        ):
+            self.log(f"已进入目标地图：{expected_map}")
+            return True
+
+        # 以点击目标的窗口坐标为圆心，5% 地图范围作为半径
+        base_nx, base_ny = self._target_norm(profile, target)
+        rect = _valid_rect(profile.get("map_rect_norm"))
+        if rect is not None:
+            x0, y0, x1, y1 = rect
+            rx = 0.05 * (x1 - x0)
+            ry = 0.05 * (y1 - y0)
+        else:
+            rx = ry = 0.05
+        self.log(
+            f"没识别到新地图「{expected_map}」，在标记点附近 5% 半径绕圈重试…"
+        )
+        attempts = 0
+        for loop in range(2):
+            for k in range(8):
+                if self._stop:
+                    raise RuntimeError("已停止。")
+                angle = 2.0 * math.pi * k / 8.0 + loop * math.pi / 8.0
+                nx = base_nx + rx * math.cos(angle)
+                ny = base_ny + ry * math.sin(angle)
+                if not (0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0):
+                    continue
+                attempts += 1
+                self.log(f"绕圈第 {attempts} 次：{nx*100:.1f}%, {ny*100:.1f}%")
+                self._tap_key(self.map_key)
+                if not self._sleep(1.2):
+                    raise RuntimeError("已停止。")
+                self._click_norm(nx, ny)
+                if not self._sleep(0.5):
+                    raise RuntimeError("已停止。")
+                self._close_map_safely()
+                if not self._sleep(4.0):
+                    raise RuntimeError("已停止。")
+                current = self._read_current_profile()
+                if current is not None and self._same_map(
+                    str(current.get("name", "")), expected_map
+                ):
+                    self.log(f"绕圈后成功进入：{expected_map}")
+                    return True
+        self.log(f"绕圈 {attempts} 次仍未进入「{expected_map}」")
+        return False
+
     def run(self) -> None:
         try:
             steps = [s for s in self.path.get("steps", []) if isinstance(s, dict)]
@@ -350,6 +418,16 @@ class PathRunner(QThread):
                 self.log(f"等待 {wait:.0f} 秒…")
                 if not self._sleep(wait):
                     raise RuntimeError("已停止。")
+                # 如果本步应该进入新地图（下一步的地图与当前不同），
+                # 但右上角还没识别到新地图，就在标记点 5% 半径绕圈重试。
+                if index < len(steps):
+                    next_step = steps[index]
+                    next_map = str(next_step.get("map", "")).strip()
+                    if next_map and not self._same_map(profile_name, next_map):
+                        if not self._ensure_entered(profile, target, next_map):
+                            raise RuntimeError(
+                                f"没有进入新地图「{next_map}」"
+                            )
             self.log("路径执行完成。")
             self.done.emit()
         except Exception as exc:
