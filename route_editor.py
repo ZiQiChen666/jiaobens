@@ -22,11 +22,12 @@ import sys
 import threading
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QRect, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -106,6 +107,120 @@ def find_game_window() -> int:
         if "unity" in cls.lower():
             return hwnd
     return found[0][0] if found else 0
+
+
+class PointPickCanvas(QWidget):
+    """在截图上点一个点，返回窗口内归一化坐标。"""
+
+    point_changed = Signal(object)
+
+    def __init__(self, image: QImage, parent=None) -> None:
+        super().__init__(parent)
+        self.image = image
+        self.scale = 1.0
+        self.point: Optional[tuple[float, float]] = None
+        self._apply_size()
+
+    def _apply_size(self) -> None:
+        iw = max(1, self.image.width())
+        ih = max(1, self.image.height())
+        screen = QApplication.primaryScreen()
+        max_w, max_h = 1500, 900
+        if screen is not None:
+            avail = screen.availableGeometry()
+            max_w = max(400, min(1500, avail.width() - 80))
+            max_h = max(300, min(900, avail.height() - 180))
+        self.scale = min(max_w / iw, max_h / ih, 1.0)
+        self.setFixedSize(
+            max(1, int(iw * self.scale)), max(1, int(ih * self.scale))
+        )
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        iw = max(1, self.image.width())
+        ih = max(1, self.image.height())
+        x = event.position().x() / max(0.0001, self.scale)
+        y = event.position().y() / max(0.0001, self.scale)
+        nx = max(0.0, min(1.0, x / iw))
+        ny = max(0.0, min(1.0, y / ih))
+        self.point = (nx, ny)
+        self.point_changed.emit(self.point)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawImage(self.rect(), self.image)
+        # 10% 网格，方便确认位置
+        painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        iw = max(1, self.image.width())
+        ih = max(1, self.image.height())
+        for i in range(1, 10):
+            x = int(iw * i / 10 * self.scale)
+            y = int(ih * i / 10 * self.scale)
+            painter.drawLine(x, 0, x, self.height())
+            painter.drawLine(0, y, self.width(), y)
+        if self.point is not None:
+            x = int(self.point[0] * iw * self.scale)
+            y = int(self.point[1] * ih * self.scale)
+            painter.setPen(QPen(QColor("#ff3b30"), 3))
+            painter.drawLine(x - 18, y, x + 18, y)
+            painter.drawLine(x, y - 18, x, y + 18)
+            painter.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+            painter.drawText(
+                x + 22,
+                max(16, y - 8),
+                f"{self.point[0]*100:.1f}%, {self.point[1]*100:.1f}%",
+            )
+
+
+class PointPickDialog(QDialog):
+    def __init__(
+        self,
+        image: QImage,
+        title: str,
+        info: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 10)
+        layout.setSpacing(8)
+        info_label = QLabel(info)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        self.canvas = PointPickCanvas(image, self)
+        layout.addWidget(self.canvas, 0, Qt.AlignmentFlag.AlignCenter)
+        self.status = QLabel("尚未选择点位")
+        self.status.setStyleSheet("color: #b26a00;")
+        layout.addWidget(self.status)
+        buttons = QHBoxLayout()
+        self.btn_ok = QPushButton("使用这个点")
+        self.btn_ok.setEnabled(False)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel.clicked.connect(self.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(self.btn_cancel)
+        buttons.addWidget(self.btn_ok)
+        layout.addLayout(buttons)
+        self.canvas.point_changed.connect(self._on_point)
+        self.adjustSize()
+
+    def _on_point(self, point) -> None:
+        if point is None:
+            return
+        self.status.setText(
+            f"已选：{point[0]*100:.1f}%, {point[1]*100:.1f}%"
+        )
+        self.status.setStyleSheet("color: #2e7d32;")
+        self.btn_ok.setEnabled(True)
+
+    def selected_point(self) -> Optional[tuple[float, float]]:
+        return self.canvas.point
 
 
 class ClickPathRecorder:
@@ -236,8 +351,13 @@ class RouteEditor(QMainWindow):
         self.spin_entrance_wait.setFixedWidth(100)
         self.lbl_entrance = QLabel("入口点：未记录")
         self.lbl_entrance.setStyleSheet("color: #b26a00;")
-        self.btn_arm_entrance = QPushButton("记录入口点（F8）")
-        self.btn_arm_entrance.setToolTip("按 F8 后，切到游戏地图，点击一次入口点")
+        self.btn_capture_entrance = QPushButton("截图标记入口")
+        self.btn_capture_entrance.setToolTip(
+            "先打开游戏地图，再点这里；程序截取游戏画面，你在截图上点入口，"
+            "不需要按 F8，也不会走到入口里"
+        )
+        self.btn_arm_entrance = QPushButton("F8 记录入口")
+        self.btn_arm_entrance.setToolTip("备用：按 F8 后，切到游戏地图，点击一次入口点")
         form.addRow("路线名", self.edit_name)
         form.addRow("地图名", self.edit_map)
         form.addRow("路径所在界面", self.combo_path_mode)
@@ -254,6 +374,7 @@ class RouteEditor(QMainWindow):
         form.addRow("按键/等待", keys_row)
         entrance_row = QHBoxLayout()
         entrance_row.addWidget(self.lbl_entrance, 1)
+        entrance_row.addWidget(self.btn_capture_entrance)
         entrance_row.addWidget(self.btn_arm_entrance)
         form.addRow("入口", entrance_row)
         right_layout.addWidget(form_box)
@@ -289,8 +410,13 @@ class RouteEditor(QMainWindow):
         rec_layout.addWidget(self.table, 1)
 
         btns = QHBoxLayout()
-        self.btn_start_record = QPushButton("开始连续记录（F9）")
-        self.btn_stop_record = QPushButton("停止记录（F10）")
+        self.btn_start_record = QPushButton("开始连续记录（3秒后）")
+        self.btn_start_record.setToolTip("点按钮后有 3 秒切到游戏；也可以直接按 F9 立即开始")
+        self.btn_stop_record = QPushButton("停止记录")
+        self.btn_capture_step = QPushButton("截图添加路径点")
+        self.btn_capture_step.setToolTip(
+            "先站到路径位置，再点这里；程序截取游戏画面，你在截图上点目标位置"
+        )
         self.btn_add_wait = QPushButton("添加等待")
         self.btn_add_key = QPushButton("添加按键")
         self.btn_up = QPushButton("上移")
@@ -299,6 +425,7 @@ class RouteEditor(QMainWindow):
         for b in (
             self.btn_start_record,
             self.btn_stop_record,
+            self.btn_capture_step,
             self.btn_add_wait,
             self.btn_add_key,
             self.btn_up,
@@ -381,8 +508,10 @@ class RouteEditor(QMainWindow):
         self.entrance_recorded.connect(
             self.set_entrance, Qt.ConnectionType.QueuedConnection
         )
+        self.btn_capture_entrance.clicked.connect(self.record_entrance_by_screenshot)
         self.btn_arm_entrance.clicked.connect(self.arm_entrance)
-        self.btn_start_record.clicked.connect(self.start_recording)
+        self.btn_start_record.clicked.connect(self.start_recording_delayed)
+        self.btn_capture_step.clicked.connect(self.add_step_by_screenshot)
         self.btn_stop_record.clicked.connect(self.stop_recording)
         self.btn_add_wait.clicked.connect(self.add_wait_step)
         self.btn_add_key.clicked.connect(self.add_key_step)
@@ -595,6 +724,66 @@ class RouteEditor(QMainWindow):
                 f"入口点：{self.entrance[0]*100:.1f}%, {self.entrance[1]*100:.1f}%"
             )
             self.lbl_entrance.setStyleSheet("color: #2e7d32;")
+
+    # ------------------------------------------------------------------
+    def _capture_game_image(self) -> Optional[QImage]:
+        app = _app()
+        if app is None or not hasattr(app, "capture_client_bgra"):
+            self.lbl_status.setText("主程序截图模块不可用。")
+            return None
+        if not self.hwnd or not win32gui.IsWindow(self.hwnd):
+            self.hwnd = find_game_window()
+        if not self.hwnd:
+            self.lbl_status.setText("找不到游戏窗口，请先启动 CreatureCurios。")
+            return None
+        cap, err = app.capture_client_bgra(self.hwnd)
+        if cap is None:
+            self.lbl_status.setText(f"截图失败：{err}")
+            return None
+        w, h, data = cap
+        return QImage(
+            bytes(data), w, h, w * 4, QImage.Format.Format_RGB32
+        ).copy()
+
+    def record_entrance_by_screenshot(self) -> None:
+        self._cancel_point_capture()
+        image = self._capture_game_image()
+        if image is None:
+            return
+        dlg = PointPickDialog(
+            image,
+            "标记地图入口",
+            "先确认游戏里地图已经打开。然后在这张截图上点击地图入口。\n"
+            "这里只是点截图，不会走到入口、不会进入副本。",
+            self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            point = dlg.selected_point()
+            if point is not None:
+                self.set_entrance(point)
+
+    def add_step_by_screenshot(self) -> None:
+        image = self._capture_game_image()
+        if image is None:
+            return
+        dlg = PointPickDialog(
+            image,
+            "标记路径点",
+            "先让游戏画面停在当前路径位置。然后在这张截图上点击目标点。\n"
+            "这里只是点截图，不会操作游戏。",
+            self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            point = dlg.selected_point()
+            if point is not None:
+                self.add_click_step(point[0], point[1])
+
+    def start_recording_delayed(self) -> None:
+        if self._click_recorder is not None:
+            return
+        self.lbl_status.setText("3 秒后开始记录，请切到游戏；F10 或“停止记录”结束")
+        beep(1000, 80)
+        QTimer.singleShot(3000, self.start_recording)
 
     # ------------------------------------------------------------------
     def start_recording(self) -> None:
