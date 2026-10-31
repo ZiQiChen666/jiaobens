@@ -16,7 +16,6 @@ from __future__ import annotations
 import datetime
 import json
 import os
-import re
 import sys
 import time
 from typing import Optional
@@ -64,6 +63,109 @@ TARGET_KINDS = {
     "boss": "BOSS点",
     "other": "其他入口",
 }
+
+# 点击地图目标后，游戏可能提示这些文字，表示这次点击没有生效。
+REACH_FAIL_KEYWORDS = (
+    "无法到达",
+    "不能到达",
+    "无法前往",
+    "不能前往",
+    "不可到达",
+    "该地点无法到达",
+    "目的地无法到达",
+    "无法自动寻路",
+    "自动寻路失败",
+    "寻路失败",
+    "移动失败",
+)
+
+# 出现这些按钮/文字时，说明游戏打开了弹窗，不要当成“人物没动”盲目重试。
+PROMPT_CONFIRM_KEYWORDS = (
+    "确定",
+    "确认",
+    "取消",
+    "知道了",
+    "好的",
+)
+
+# 两帧画面平均差异低于这个值，认为人物没有移动。
+# 只比较画面中间区域，避免聊天框/小地图/技能栏的动画干扰。
+NO_MOVE_DIFF_RATIO = 0.006
+
+# 场景切换（加载/淡入淡出）检测参数
+SCENE_DARK_BRIGHTNESS = 40.0     # 平均亮度低于此值，视为黑屏/淡出
+SCENE_LIGHT_BRIGHTNESS = 218.0   # 平均亮度高于此值，视为白屏/闪光
+SCENE_BIG_DIFF = 0.55            # 单帧变化超过此值，视为硬切场景
+SCENE_STABLE_DIFF = 0.08         # 切换后画面稳定阈值
+SCENE_STABLE_FRAMES = 3          # 连续稳定帧数
+SCENE_SETTLE_SECONDS = 2.5       # 黑屏/硬切后，最长再等多久视为切换完成
+SCENE_RECOVER_DIFF = 0.30        # 从加载画面恢复到新场景时，与加载帧的差异
+SCENE_RECOVER_SECONDS = 1.5      # 新场景出现后，再观察多久就认为切换完成
+
+
+def compact_text(text: str) -> str:
+    return "".join(
+        ch for ch in str(text or "") if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+    )
+
+
+def prompt_has_keyword(items: list[dict], keywords: tuple[str, ...]) -> bool:
+    blob = compact_text(
+        "".join(str(item.get("text", "")) for item in (items or []))
+    )
+    if not blob:
+        return False
+    return any(compact_text(key) in blob for key in keywords if key)
+
+
+def frame_diff_ratio(cap_a, cap_b) -> float:
+    """粗略计算两帧 BGRA 客户区截图中间区域的平均差异（0~1）。"""
+    if not cap_a or not cap_b:
+        return 1.0
+    w1, h1, data1 = cap_a
+    w2, h2, data2 = cap_b
+    w1, h1, w2, h2 = int(w1), int(h1), int(w2), int(h2)
+    if (w1, h1) != (w2, h2) or w1 < 8 or h1 < 8:
+        return 1.0
+    total = min(len(data1), len(data2))
+    row_bytes = w1 * 4
+    if total < row_bytes or len(data1) < h1 * row_bytes or len(data2) < h1 * row_bytes:
+        return 1.0
+    # 只看中间 60%：左右各排除 20%，上下各排除 20%。
+    x0 = max(0, int(w1 * 0.20))
+    x1 = min(w1, int(w1 * 0.80))
+    y0 = max(0, int(h1 * 0.20))
+    y1 = min(h1, int(h1 * 0.80))
+    step_x = max(1, (x1 - x0) // 40)
+    step_y = max(1, (y1 - y0) // 24)
+    diff = 0
+    count = 0
+    for y in range(y0, y1, step_y):
+        base = y * row_bytes
+        for x in range(x0, x1, step_x):
+            i = base + x * 4
+            diff += abs(data1[i] - data2[i])
+            diff += abs(data1[i + 1] - data2[i + 1])
+            diff += abs(data1[i + 2] - data2[i + 2])
+            count += 3
+    return diff / count / 255.0 if count else 1.0
+
+
+def mean_brightness(cap) -> float:
+    """粗略计算 BGRA 客户区截图的平均亮度（0~255）。"""
+    if not cap:
+        return 0.0
+    _w, _h, data = cap
+    total = len(data)
+    if total < 4:
+        return 0.0
+    step = 4 * 64
+    value = 0
+    count = 0
+    for i in range(0, total - 3, step):
+        value += data[i] + data[i + 1] + data[i + 2]
+        count += 3
+    return value / count if count else 0.0
 
 
 def _app():
@@ -149,66 +251,6 @@ def _compact(text: str) -> str:
     return "".join(
         ch for ch in str(text or "") if ch.isalnum() or "一" <= ch <= "鿿"
     )
-
-
-def ocr_top_right_map(hwnd: int) -> tuple[str, list[str]]:
-    """OCR 右上角小字（地图名/区域名）。"""
-    app = _app()
-    if app is None:
-        return "", []
-    try:
-        from PIL import Image
-        import numpy as np
-    except Exception:
-        return "", []
-    cap, _err = app.capture_client_bgra(hwnd)
-    if cap is None:
-        return "", []
-    w, h, data = cap
-    arr = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 4))
-    rgb = arr[:, :, [2, 1, 0]].copy()
-    image = Image.fromarray(rgb, "RGB")
-    # 右上角圆圈区域：按 1366x768 实测约在 x 0.78~1.0, y 0.12~0.35
-    x0 = int(w * 0.78)
-    y0 = int(h * 0.12)
-    x1 = w
-    y1 = int(h * 0.38)
-    crop = image.crop((x0, y0, x1, y1))
-    crop = crop.resize((crop.width * 3, crop.height * 3), Image.Resampling.LANCZOS)
-    engine = app._get_ocr_engine()
-    with app._OCR_LOCK:
-        result, _elapse = engine(np.array(crop)[:, :, ::-1])
-    texts = [str(it[1]).strip() for it in (result or []) if len(it) >= 3]
-    return " ".join(texts), texts
-
-
-def match_map_profile(profiles: list[dict], texts: list[str]) -> Optional[dict]:
-    blob = _compact(" ".join(texts))
-    if not blob:
-        return None
-    best = None
-    best_score = 0.0
-    for profile in profiles:
-        name = str(profile.get("name", ""))
-        parts = [p for p in re.split(r"[|｜/、,，\s]+", name) if len(_compact(p)) >= 2]
-        for part in parts:
-            key = _compact(part)
-            if key and key in blob:
-                return profile
-        full = _compact(name)
-        if full and full in blob:
-            return profile
-        # 简单相似度兜底
-        from difflib import SequenceMatcher
-        for part in parts:
-            key = _compact(part)
-            ratio = SequenceMatcher(None, key, blob).ratio()
-            if ratio > best_score:
-                best_score = ratio
-                best = profile
-    if best is not None and best_score >= 0.55:
-        return best
-    return None
 
 
 def find_target(profile: dict, target_name: str) -> Optional[dict]:
@@ -928,6 +970,134 @@ class MapTravelRunner(QThread):
             max(0.0, min(1.0, ny)),
         )
 
+    def _close_map_safely(self) -> None:
+        """只按一次 Esc；如果出现“退出游戏”菜单，再补一次。"""
+        self._tap_key(self.close_key)
+        if not self._sleep(0.55):
+            raise RuntimeError("已停止。")
+        cap = self._capture()
+        items = self._ocr_items(cap)
+        if prompt_has_keyword(items, ("退出游戏", "退出")):
+            self._tap_key(self.close_key)
+            if not self._sleep(0.5):
+                raise RuntimeError("已停止。")
+
+    def _capture(self):
+        app = _app()
+        if app is None or not hasattr(app, "capture_client_bgra"):
+            return None
+        cap, _err = app.capture_client_bgra(self.hwnd)
+        return cap
+
+    def _ocr_items(self, cap) -> list[dict]:
+        app = _app()
+        if app is None or cap is None or not hasattr(app, "ocr_screen_items"):
+            return []
+        try:
+            w, h, data = cap
+            return list(app.ocr_screen_items(data, w, h))
+        except Exception:
+            return []
+
+    def _wait_map_closed(self, map_cap) -> None:
+        """等地图界面真正消失，避免把“地图→世界”的变化当成人物移动。"""
+        if not map_cap:
+            if not self._sleep(0.8):
+                raise RuntimeError("已停止。")
+            return
+        end = time.monotonic() + 2.5
+        closed = False
+        while time.monotonic() < end:
+            if not self._sleep(0.15):
+                raise RuntimeError("已停止。")
+            cap = self._capture()
+            if cap and frame_diff_ratio(map_cap, cap) >= 0.05:
+                closed = True
+                break
+        if not closed:
+            self.log("关闭地图后画面仍像地图，再按一次关闭键")
+            self._close_map_safely()
+            if not self._sleep(0.6):
+                raise RuntimeError("已停止。")
+
+    def _travel_once(self, nx: float, ny: float):
+        self._tap_key(self.map_key)
+        if not self._sleep(1.2):
+            raise RuntimeError("已停止。")
+        map_cap = self._capture()
+        self._click_norm(nx, ny)
+        if not self._sleep(0.5):
+            raise RuntimeError("已停止。")
+        self._close_map_safely()
+        self._wait_map_closed(map_cap)
+        return map_cap
+
+    def _dismiss_prompt(self, items: list[dict]) -> None:
+        clicked = False
+        for item in items or []:
+            if prompt_has_keyword([item], PROMPT_CONFIRM_KEYWORDS):
+                try:
+                    self._click_norm(float(item["nx"]), float(item["ny"]))
+                    clicked = True
+                    break
+                except Exception:
+                    pass
+        if not clicked:
+            self._tap_key(self.close_key)
+        if not self._sleep(0.45):
+            raise RuntimeError("已停止。")
+        # 提示框可能盖在地图上，关掉提示后再确保地图/菜单已关闭。
+        self._close_map_safely()
+
+    def _travel_with_retry(
+        self, nx: float, ny: float, max_attempts: int = 2
+    ) -> None:
+        """点击目标后检查是否真的开始寻路；没动或提示无法到达时再点一次。"""
+        for attempt in range(1, max_attempts + 1):
+            self._travel_once(nx, ny)
+            if attempt >= max_attempts:
+                return
+            self.log("检查点击后是否开始移动…")
+            # 多等一会儿，避开地图关闭/淡出的收尾动画，再取基线帧。
+            if not self._sleep(1.2):
+                raise RuntimeError("已停止。")
+            cap_a = self._capture()
+            items = self._ocr_items(cap_a)
+            if prompt_has_keyword(items, REACH_FAIL_KEYWORDS):
+                self.log("检测到“无法到达”提示，关闭提示后重试一次")
+                self._dismiss_prompt(items)
+                continue
+            if prompt_has_keyword(items, PROMPT_CONFIRM_KEYWORDS):
+                self.log("检测到游戏弹窗，先不重试")
+                return
+            if not self._sleep(1.2):
+                raise RuntimeError("已停止。")
+            cap_b = self._capture()
+            ratio = frame_diff_ratio(cap_a, cap_b)
+            if ratio < NO_MOVE_DIFF_RATIO:
+                # 再等一会儿确认：可能是加载画面，不要刚点完就重试。
+                if not self._sleep(1.2):
+                    raise RuntimeError("已停止。")
+                cap_c = self._capture()
+                late_items = self._ocr_items(cap_c)
+                if prompt_has_keyword(late_items, REACH_FAIL_KEYWORDS):
+                    self.log("检测到“无法到达”提示，关闭提示后重试一次")
+                    self._dismiss_prompt(late_items)
+                    continue
+                if prompt_has_keyword(late_items, PROMPT_CONFIRM_KEYWORDS):
+                    self.log("检测到游戏弹窗，先不重试")
+                    return
+                ratio2 = frame_diff_ratio(cap_b, cap_c)
+                if ratio2 < NO_MOVE_DIFF_RATIO:
+                    self.log(
+                        f"点击后画面一直没有变化（差异 {ratio:.4f}/{ratio2:.4f}），重试一次"
+                    )
+                    continue
+                self.log(f"已开始移动（画面差异 {ratio2:.4f}）")
+                return
+            self.log(f"已开始移动（画面差异 {ratio:.4f}）")
+            return
+
     def run(self) -> None:
         try:
             if not win32gui.IsWindow(self.hwnd):
@@ -937,13 +1107,7 @@ class MapTravelRunner(QThread):
                 f"打开地图，前往「{self.target.get('name', '')}」"
                 f"（窗口坐标 {nx*100:.1f}%, {ny*100:.1f}%）…"
             )
-            self._tap_key(self.map_key)
-            if not self._sleep(1.2):
-                raise RuntimeError("已停止。")
-            self._click_norm(nx, ny)
-            if not self._sleep(0.5):
-                raise RuntimeError("已停止。")
-            self._tap_key(self.close_key)
+            self._travel_with_retry(nx, ny)
             self.log(f"已关闭地图，等待自动寻路 {self.travel_wait:.0f} 秒…")
             if not self._sleep(self.travel_wait):
                 raise RuntimeError("已停止。")

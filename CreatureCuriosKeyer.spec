@@ -11,10 +11,10 @@ a = Analysis(
     binaries=[],
     datas=rapidocr_datas,
     hiddenimports=[
-        'stable_boss',
         'route_editor',
         'map_labels',
         'paths',
+        'multi_open',
         'keyboard._winkeyboard',
         'keyboard._winmouse',
         'keyboard._generic',
