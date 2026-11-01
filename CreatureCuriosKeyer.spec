@@ -15,6 +15,7 @@ a = Analysis(
         'map_labels',
         'paths',
         'multi_open',
+        'input_lock',
         'keyboard._winkeyboard',
         'keyboard._winmouse',
         'keyboard._generic',
