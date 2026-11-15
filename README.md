@@ -1,4 +1,4 @@
-# CreatureCurios 后台按键器 v3.6.0
+# CreatureCurios 后台按键器 v3.6.1
 
 Windows 桌面小工具：绑定 `CreatureCurios` 窗口后，在后台循环投递 `A`
 （可选空格拾取），可选技能、喝药、疲劳检测、定时提醒，支持**自动打BOSS**、**后台回放（不抢鼠标键盘）**，
@@ -422,6 +422,21 @@ BOSS 功能建立在基础挂机之上，**单窗口**运行。有两种方式�
 
 如果你有 KMBox/Arduino 之类的硬件，或者游戏支持手柄，告诉我型号/协议，
 我可以再针对那种方式做。
+
+### 录制时闪退
+
+新版把录制用的 Raw Input 隐藏窗口改为**每次实例独立窗口类**，并在停止时注销，
+避免旧窗口类指向已释放的 Python 回调导致崩溃。
+
+如果仍然闪退，查看：
+
+```text
+%APPDATA%\CreatureCuriosKeyer\crash.log
+%APPDATA%\CreatureCuriosKeyer\record_debug.log
+```
+
+`crash.log` 会记录未处理异常/原生崩溃；`record_debug.log` 里 `[REC] START`
+可以看到崩溃发生在哪一次录制。
 
 ### 全局热键无效
 

@@ -30,12 +30,14 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import datetime
+import faulthandler
 import json
 import os
 import re
 import sys
 import threading
 import time
+import traceback
 from typing import Optional
 
 try:
@@ -1487,9 +1489,23 @@ class MacroRecorder:
         # Raw Input：记录不受系统鼠标加速影响的相对位移
         try:
             self._raw_recorder = RawMouseRecorder(self._on_raw_delta)
-            self._raw_recorder.start()
+            raw_ok = self._raw_recorder.start()
+            append_debug_log(
+                RECORD_DEBUG_PATH,
+                [
+                    f"[REC] START {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"hwnd=0x{self.game_hwnd:X} raw_input={raw_ok}"
+                ],
+            )
         except Exception:
             self._raw_recorder = None
+            append_debug_log(
+                RECORD_DEBUG_PATH,
+                [
+                    f"[REC] START {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"hwnd=0x{self.game_hwnd:X} raw_input=FAILED"
+                ],
+            )
 
     def stop(self) -> list[dict]:
         self._active = False
@@ -8775,7 +8791,64 @@ def _run_ocr_selftest(image_path: str, out_path: str) -> int:
     return 0
 
 
+_CRASH_LOG_HANDLE = None
+
+
+def _install_crash_logging() -> None:
+    global _CRASH_LOG_HANDLE
+    try:
+        _CRASH_LOG_HANDLE = open(
+            os.path.join(_data_folder(), "crash.log"),
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
+        faulthandler.enable(file=_CRASH_LOG_HANDLE, all_threads=True)
+    except Exception:
+        _CRASH_LOG_HANDLE = None
+
+    def _write_exception(exc_type, exc_value, exc_tb, prefix="") -> None:
+        try:
+            with open(
+                os.path.join(_data_folder(), "crash.log"),
+                "a",
+                encoding="utf-8",
+            ) as f:
+                f.write(
+                    chr(10)
+                    + "=== "
+                    + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    + " "
+                    + prefix
+                    + " ==="
+                    + chr(10)
+                )
+                traceback.print_exception(
+                    exc_type, exc_value, exc_tb, file=f
+                )
+        except Exception:
+            pass
+
+    def _sys_hook(exc_type, exc_value, exc_tb):
+        _write_exception(exc_type, exc_value, exc_tb, "UNHANDLED")
+
+    def _thread_hook(args):
+        _write_exception(
+            args.exc_type,
+            args.exc_value,
+            args.exc_traceback,
+            f"THREAD {args.thread.name if args.thread else ''}",
+        )
+
+    sys.excepthook = _sys_hook
+    try:
+        threading.excepthook = _thread_hook
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _install_crash_logging()
     if "--ocr-selftest" in sys.argv:
         try:
             index = sys.argv.index("--ocr-selftest")

@@ -103,6 +103,8 @@ user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 user32.PostQuitMessage.argtypes = [ctypes.c_int]
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.DestroyWindow.argtypes = [wt.HWND]
+user32.UnregisterClassW.argtypes = [wt.LPCWSTR, wt.HINSTANCE]
+user32.UnregisterClassW.restype = wt.BOOL
 user32.RegisterRawInputDevices.argtypes = [
     ctypes.POINTER(RAWINPUTDEVICE), wt.UINT, wt.UINT
 ]
@@ -114,7 +116,8 @@ user32.GetRawInputData.argtypes = [
 user32.GetRawInputData.restype = wt.UINT
 
 _ACTIVE: Optional["RawMouseRecorder"] = None
-_WNDPROC_KEEP = None
+# 线程没能及时退出时保留实例，避免窗口类回调指针被释放
+_ZOMBIES: list["RawMouseRecorder"] = []
 
 
 def _wnd_proc(hwnd, msg, wparam, lparam):
@@ -145,6 +148,10 @@ class RawMouseRecorder:
         self.is_active = False
         self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # 每次实例用独立窗口类，避免旧窗口类指向已经释放的 Python 回调
+        self._class_name = f"CCRawInputSink_{id(self)}"
+        self._hinst = None
+        self._proc = None
 
     def start(self) -> bool:
         if self._thread is not None:
@@ -171,17 +178,25 @@ class RawMouseRecorder:
                 thread.join(1.5)
             except Exception:
                 pass
+            try:
+                if thread.is_alive():
+                    _ZOMBIES.append(self)
+            except Exception:
+                pass
         _ACTIVE = None
         self.is_active = False
 
     def _run(self) -> None:
-        global _ACTIVE, _WNDPROC_KEEP
+        global _ACTIVE
+        hinst = None
         try:
             hinst = kernel32.GetModuleHandleW(None)
-            _WNDPROC_KEEP = WNDPROC(_wnd_proc)
+            self._hinst = hinst
+            # 实例自己持有 WNDPROC 回调，避免被 GC 后旧窗口类调用野指针
+            self._proc = WNDPROC(_wnd_proc)
             wc = _WNDCLASSW()
             wc.style = 0
-            wc.lpfnWndProc = _WNDPROC_KEEP
+            wc.lpfnWndProc = self._proc
             wc.cbClsExtra = 0
             wc.cbWndExtra = 0
             wc.hInstance = hinst
@@ -189,12 +204,12 @@ class RawMouseRecorder:
             wc.hCursor = None
             wc.hbrBackground = None
             wc.lpszMenuName = None
-            wc.lpszClassName = self.CLASS_NAME
+            wc.lpszClassName = self._class_name
             user32.RegisterClassW(ctypes.byref(wc))
             hwnd = user32.CreateWindowExW(
                 0,
-                self.CLASS_NAME,
-                self.CLASS_NAME,
+                self._class_name,
+                self._class_name,
                 0x80000000,  # WS_POPUP，隐藏
                 0,
                 0,
@@ -225,6 +240,7 @@ class RawMouseRecorder:
         finally:
             self._ready.set()
         if not self.is_active or not self.hwnd:
+            self._cleanup_window(hinst)
             return
         msg = wt.MSG()
         try:
@@ -236,6 +252,21 @@ class RawMouseRecorder:
         finally:
             self.is_active = False
             _ACTIVE = None
+            self._cleanup_window(hinst)
+
+    def _cleanup_window(self, hinst) -> None:
+        hwnd = self.hwnd
+        self.hwnd = 0
+        try:
+            if hwnd:
+                user32.DestroyWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            if hinst:
+                user32.UnregisterClassW(self._class_name, hinst)
+        except Exception:
+            pass
 
     def _handle_input(self, lparam: int) -> None:
         try:
