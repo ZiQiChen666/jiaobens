@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CreatureCurios 后台按键器 v2.
+"""CreatureCurios 后台按键器（基础挂机 · 单开）
 
 功能：
-    * 枚举标题包含 "CreatureCurios" 的可见窗口并绑定 HWND；
-    * 在独立 QThread 中通过 win32api.PostMessage 后台投递 A（可选空格拾取）；
+    * 绑定标题包含 "CreatureCurios" 的可见窗口；
+    * 在独立 QThread 中通过 win32api.PostMessage 后台投递 A
+      （可选空格拾取）；
     * 可选技能 1 / 2（12s / 6s）和自动喝药 Q（默认 60s）；
-    * 疲劳检测：用户框选右下角的疲劳提示区域，每 30 秒短暂点击一下，
-      OCR 读取“当前疲劳值:xxx/xxx”，超过 ±可配置阈值时弹出不抢焦点的提醒；
+    * 疲劳检测：框选游戏右下的疲劳提示区域，每 30 秒短暂点击一次，
+      OCR 读取“当前疲劳值:xxx/xxx”，超过 ±阈值时弹出不抢焦点的提醒；
     * 定时提醒：支持倒计时和指定时刻；
-    * 支持每轮间隔设置、轮次统计、Ctrl+Alt+F8 全局热键；
+    * 每轮间隔设置、轮次统计、Ctrl+Alt+F8 全局热键；
     * 最小化后驻留系统托盘，双击托盘图标恢复。
 
 安装依赖：
@@ -19,9 +20,9 @@
     python creature_curios_keyer.py
 
 说明：
-    本程序只使用 PostMessage 后台投递，不会调用 SendInput / keyboard.press_and_release，
-    因此不会抢占键盘、鼠标或窗口焦点。若目标游戏以管理员权限运行，请同样以管理员
-    权限运行本程序，否则 Windows 的 UIPI 机制可能拦截消息。
+    本程序只使用 PostMessage 后台投递，不会抢占键盘、鼠标或窗口焦点。
+    若目标游戏以管理员权限运行，请同样以管理员权限运行本程序，
+    否则 Windows 的 UIPI 机制可能拦截消息。
 """
 
 from __future__ import annotations
@@ -63,7 +64,18 @@ except Exception as exc:
 else:
     MOUSE_IMPORT_ERROR = None
 
-from PySide6.QtCore import QEvent, QRect, QSettings, QTime, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QRect,
+    QSettings,
+    QTime,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -82,14 +94,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QFormLayout,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -106,12 +116,13 @@ from PySide6.QtWidgets import (
 )
 
 from multi_open import SlotRunner
+from raw_input_recorder import RawMouseRecorder
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 
-APP_NAME = "CreatureCurios 后台按键器 v2"
+APP_NAME = "CreatureCurios 后台按键器"
 WINDOW_TITLE_KEYWORD = "CreatureCurios"
 
 VK_A = 0x41
@@ -119,6 +130,7 @@ VK_SPACE = 0x20
 VK_1 = 0x31
 VK_2 = 0x32
 VK_Q = 0x51
+VK_W = 0x57
 
 WM_KEYDOWN = win32con.WM_KEYDOWN  # 0x0100
 WM_KEYUP = win32con.WM_KEYUP      # 0x0101
@@ -141,199 +153,41 @@ SKILL2_COOLDOWN_SECONDS = 6.0
 DEFAULT_POTION_SECONDS = 60
 FATIGUE_CHECK_SECONDS = 30.0
 DEFAULT_FATIGUE_THRESHOLD = 800
-FATIGUE_BAND_MARGIN = 20
+
+# 多开血量保护：回血红线最低值
+HP_RED_LINE = 300
 
 HOTKEY_ID = "ctrl+alt+f8"
 HOTKEY_TEXT = "Ctrl + Alt + F8"
 HOTKEY_QT = "Ctrl+Alt+F8"
 
 
-def _fatigue_config_path() -> str:
+def _data_folder() -> str:
     base = os.getenv("APPDATA") or os.path.expanduser("~")
     folder = os.path.join(base, "CreatureCuriosKeyer")
     try:
         os.makedirs(folder, exist_ok=True)
     except Exception:
         pass
-    return os.path.join(folder, "fatigue_roi.json")
+    return folder
 
 
-FATIGUE_CONFIG_PATH = _fatigue_config_path()
-MACRO_CONFIG_PATH = os.path.join(
-    os.path.dirname(FATIGUE_CONFIG_PATH), "macros.json"
-)
-RECORDS_PATH = os.path.join(
-    os.path.dirname(FATIGUE_CONFIG_PATH), "records.json"
-)
-COMBOS_PATH = os.path.join(
-    os.path.dirname(FATIGUE_CONFIG_PATH), "combos.json"
-)
-REPLAY_LOG_PATH = os.path.join(
-    os.path.dirname(FATIGUE_CONFIG_PATH), "macro_replay.log"
-)
+FATIGUE_CONFIG_PATH = os.path.join(_data_folder(), "fatigue_roi.json")
+RECORDS_PATH = os.path.join(_data_folder(), "boss_records.json")
+HEAL_RECORDS_PATH = os.path.join(_data_folder(), "heal_records.json")
+BOSS_LOG_PATH = os.path.join(_data_folder(), "boss_replay.log")
+RECORD_DEBUG_PATH = os.path.join(_data_folder(), "record_debug.log")
+PLAYER_DEBUG_PATH = os.path.join(_data_folder(), "player_debug.log")
 
 
-def default_macro_config() -> dict:
-    return {
-        "map_key": "m",
-        "close_map_key": "esc",
-        "mount_key": "f",
-    }
-
-
-def load_macro_config() -> dict:
-    """只保留地图寻路/路径执行需要的按键配置，兼容旧版 macros.json。"""
-    cfg = default_macro_config()
+def append_debug_log(path: str, lines: list[str]) -> None:
+    if not lines:
+        return
     try:
-        with open(MACRO_CONFIG_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return cfg
-        for key in ("map_key", "close_map_key", "mount_key"):
-            value = data.get(key, "")
-            if isinstance(value, str):
-                value = value.strip()
-                if value:
-                    cfg[key] = value[:30]
-    except FileNotFoundError:
-        pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(chr(10).join(lines) + chr(10))
     except Exception:
         pass
-    return cfg
-
-
-def save_macro_config(cfg: dict) -> bool:
-    """原子写入，避免程序中途退出时把已有的配置文件截断。"""
-    tmp_path = MACRO_CONFIG_PATH + ".tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(
-                cfg,
-                f,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, MACRO_CONFIG_PATH)
-        return True
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        return False
-
-
-def load_records() -> list[dict]:
-    """读取整段副本录制列表。"""
-    try:
-        with open(RECORDS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        records = data.get("records", [])
-        if not isinstance(records, list):
-            return []
-        result = []
-        for item in records:
-            if not isinstance(item, dict):
-                continue
-            events = item.get("events", [])
-            if not isinstance(events, list):
-                continue
-            record = dict(item)
-            record["name"] = str(record.get("name", "未命名"))
-            record["events"] = [e for e in events if isinstance(e, dict)]
-            result.append(record)
-        return result
-    except FileNotFoundError:
-        return []
-    except Exception:
-        return []
-
-
-def save_records(records: list[dict]) -> bool:
-    """原子写入整段副本录制。"""
-    tmp_path = RECORDS_PATH + ".tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {"records": records},
-                f,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, RECORDS_PATH)
-        return True
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        return False
-
-
-def load_combos() -> list[dict]:
-    """读取“路径 + 副本录制”的组合列表。"""
-    try:
-        with open(COMBOS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        combos = data.get("combos", [])
-        if not isinstance(combos, list):
-            return []
-        result = []
-        for item in combos:
-            if not isinstance(item, dict):
-                continue
-            combo = dict(item)
-            combo["name"] = str(combo.get("name", "未命名"))
-            combo["path"] = str(combo.get("path", ""))
-            combo["record"] = str(combo.get("record", ""))
-            try:
-                combo["repeat"] = max(0, int(combo.get("repeat", 1)))
-            except (TypeError, ValueError):
-                combo["repeat"] = 1
-            try:
-                combo["interval"] = max(0.0, float(combo.get("interval", 3)))
-            except (TypeError, ValueError):
-                combo["interval"] = 3.0
-            try:
-                combo["speed"] = max(0.5, min(2.0, float(combo.get("speed", 1.0))))
-            except (TypeError, ValueError):
-                combo["speed"] = 1.0
-            result.append(combo)
-        return result
-    except FileNotFoundError:
-        return []
-    except Exception:
-        return []
-
-
-def save_combos(combos: list[dict]) -> bool:
-    """原子写入组合列表。"""
-    tmp_path = COMBOS_PATH + ".tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {"combos": combos},
-                f,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, COMBOS_PATH)
-        return True
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        return False
 
 
 def load_fatigue_roi_norm() -> Optional[tuple[float, float, float, float]]:
@@ -368,6 +222,85 @@ def save_fatigue_roi_norm(roi_norm: tuple[float, float, float, float]) -> bool:
         return True
     except Exception:
         return False
+
+
+
+def _load_records(path: str) -> list[dict]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        records: list[dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            events = item.get("events")
+            if not isinstance(events, list) or not events:
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            meta = item.get("meta")
+            records.append(
+                {
+                    "name": name,
+                    "created": str(item.get("created") or ""),
+                    "events": events,
+                    "meta": meta if isinstance(meta, dict) else None,
+                }
+            )
+        return records
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+
+
+def _save_records(path: str, records: list[dict]) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def load_boss_records() -> list[dict]:
+    return _load_records(RECORDS_PATH)
+
+
+def save_boss_records(records: list[dict]) -> bool:
+    return _save_records(RECORDS_PATH, records)
+
+
+def load_heal_records() -> list[dict]:
+    return _load_records(HEAL_RECORDS_PATH)
+
+
+def save_heal_records(records: list[dict]) -> bool:
+    return _save_records(HEAL_RECORDS_PATH, records)
+
+
+def strip_hotkey_tail(events: list[dict]) -> list[dict]:
+    """去掉录制末尾用于停止录制的 Ctrl+Alt+F8。"""
+    names = {
+        "ctrl", "left ctrl", "right ctrl",
+        "alt", "left alt", "right alt", "f8",
+    }
+    start = len(events)
+    saw_f8 = False
+    while start > 0:
+        event = events[start - 1]
+        if event.get("type") not in ("key_down", "key_up"):
+            break
+        name = str(event.get("name", "")).lower()
+        if name not in names:
+            break
+        if name == "f8":
+            saw_f8 = True
+        start -= 1
+    return events[:start] if saw_f8 else events
 
 
 def roi_from_norm(
@@ -575,43 +508,6 @@ def _get_ocr_engine():
         return _OCR_ENGINE
 
 
-def ocr_screen_items(data: bytes, w: int, h: int) -> list[dict]:
-    """OCR 整个游戏客户区，返回文字和归一化坐标。"""
-    try:
-        import numpy as np
-        from PIL import Image
-    except Exception as exc:
-        raise RuntimeError(f"缺少 OCR 依赖：{type(exc).__name__}: {exc}")
-    arr = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 4))
-    rgb = arr[:, :, [2, 1, 0]].copy()
-    image = Image.fromarray(rgb, "RGB")
-    engine = _get_ocr_engine()
-    with _OCR_LOCK:
-        result, _elapse = engine(np.array(image)[:, :, ::-1])
-    items: list[dict] = []
-    for item in (result or []):
-        if len(item) < 3:
-            continue
-        box, text, score = item[0], item[1], item[2]
-        xs = [float(p[0]) for p in box]
-        ys = [float(p[1]) for p in box]
-        x0, x1 = min(xs), max(xs)
-        y0, y1 = min(ys), max(ys)
-        items.append(
-            {
-                "text": str(text).strip(),
-                "score": float(score),
-                "x0": x0,
-                "y0": y0,
-                "x1": x1,
-                "y1": y1,
-                "nx": (x0 + x1) / 2.0 / max(1, w),
-                "ny": (y0 + y1) / 2.0 / max(1, h),
-            }
-        )
-    return items
-
-
 def ocr_fatigue_from_bgra(
     data: bytes, w: int, h: int, roi: tuple[int, int, int, int],
 ) -> tuple[Optional[int], Optional[int], str]:
@@ -691,342 +587,90 @@ def ocr_fatigue_from_bgra(
         return None, None, f"OCR 失败：{type(exc).__name__}: {exc}"
 
 
-# ---------------------------------------------------------------------------
-# 全局样式
-# ---------------------------------------------------------------------------
+def ocr_text_from_bgra(
+    data: bytes,
+    w: int,
+    h: int,
+    roi: tuple[int, int, int, int],
+) -> str:
+    """对截图里的指定区域做 OCR，返回识别到的文字。"""
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception as exc:
+        raise RuntimeError(f"缺少 OCR 依赖：{type(exc).__name__}: {exc}")
 
-APP_STYLE = """
-* {
-    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
-}
-QMainWindow, QWidget#central {
-    background: #1b1c1f;
-}
-QWidget {
-    color: #e4e6e9;
-    font-size: 13px;
-}
-QGroupBox {
-    background: #202226;
-    border: 1px solid #303338;
-    border-radius: 10px;
-    margin-top: 14px;
-    padding: 16px 14px 14px 14px;
-    font-weight: 600;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 12px;
-    padding: 0 5px;
-    color: #8ab4f8;
-    background: #1b1c1f;
-}
-QLabel#appTitle {
-    font-size: 20px;
-    font-weight: 700;
-    color: #f1f3f4;
-}
-QLabel#subtitle {
-    color: #8f959e;
-    font-size: 12px;
-}
-QLabel#versionBadge {
-    background: #2a3b55;
-    color: #8ab4f8;
-    border-radius: 12px;
-    font-weight: 700;
-    font-size: 12px;
-}
-QComboBox, QSpinBox, QTimeEdit, QLineEdit {
-    background: #282b30;
-    border: 1px solid #3d4148;
-    border-radius: 6px;
-    padding: 5px 8px;
-    min-height: 24px;
-    selection-background-color: #34527d;
-}
-QComboBox:hover, QSpinBox:hover, QTimeEdit:hover, QLineEdit:hover {
-    border-color: #5c626b;
-}
-QComboBox:focus, QSpinBox:focus, QTimeEdit:focus, QLineEdit:focus {
-    border-color: #8ab4f8;
-}
-QComboBox QAbstractItemView {
-    background: #282b30;
-    border: 1px solid #3d4148;
-    selection-background-color: #34527d;
-    outline: none;
-}
-QPushButton {
-    background: #33373d;
-    border: 1px solid #454a52;
-    border-radius: 6px;
-    padding: 6px 16px;
-    min-height: 26px;
-}
-QPushButton:hover {
-    background: #3e434a;
-}
-QPushButton:pressed {
-    background: #2a2e34;
-}
-QPushButton:disabled {
-    color: #6b717a;
-    background: #26292d;
-    border-color: #33373c;
-}
-QCheckBox {
-    spacing: 8px;
-    color: #dfe2e6;
-    font-weight: 600;
-}
-QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-    border: 1px solid #5a6069;
-    border-radius: 4px;
-    background: #282b30;
-}
-QCheckBox::indicator:hover {
-    border-color: #8ab4f8;
-}
-QCheckBox::indicator:checked {
-    border-color: #8ab4f8;
-    background: #34527d;
-}
-QLabel#boundLabel {
-    border: 1px solid #33373c;
-    border-radius: 6px;
-    padding: 7px 10px;
-    color: #9aa0a8;
-    background: #1d1f22;
-}
-QLabel#boundLabel[state="ok"] {
-    color: #3ddc84;
-    border-color: #2f6b4a;
-    background: #17241d;
-}
-QLabel#boundLabel[state="error"] {
-    color: #ff6b6b;
-    border-color: #5c2b2b;
-    background: #241818;
-}
-QLabel#actionText {
-    color: #d7dbe0;
-    background: #26292e;
-    border-left: 3px solid #8ab4f8;
-    border-radius: 4px;
-    padding: 8px 10px;
-}
-QLabel#muted {
-    color: #8f959e;
-}
-QLabel#hint {
-    color: #7f858e;
-    font-size: 12px;
-    padding: 2px 2px 6px 2px;
-}
-QStatusBar {
-    background: #161719;
-    border-top: 1px solid #2d3035;
-}
-QStatusBar::item {
-    border: none;
-}
-QLabel#statusLabel {
-    color: #aeb4bd;
-    padding: 3px 2px;
-}
-QLabel#roundsLabel {
-    color: #8ab4f8;
-    font-weight: 700;
-    padding: 3px 10px;
-    background: #1f2733;
-    border-radius: 8px;
-}
-QScrollArea {
-    border: none;
-    background: transparent;
-}
-QScrollArea > QWidget > QWidget {
-    background: transparent;
-}
-QTabWidget::pane {
-    border: 1px solid #303338;
-    border-radius: 8px;
-    top: -1px;
-    background: #1e1f22;
-}
-QTabBar::tab {
-    background: #24262a;
-    color: #aeb4bd;
-    padding: 8px 18px;
-    border: 1px solid #303338;
-    border-bottom: none;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    margin-right: 3px;
-    font-weight: 600;
-}
-QTabBar::tab:selected {
-    background: #2f3b4d;
-    color: #8ab4f8;
-}
-QTabBar::tab:hover {
-    background: #33373d;
-}
-QMenu {
-    background: #23262b;
-    border: 1px solid #3a3e45;
-    padding: 4px;
-}
-QMenu::item {
-    padding: 6px 24px 6px 12px;
-    border-radius: 4px;
-}
-QMenu::item:selected {
-    background: #34527d;
-}
-QMenu::item:disabled {
-    color: #6b717a;
-}
+    x, y, ww, hh = roi
+    if ww < 4 or hh < 4:
+        return ""
+    arr = np.frombuffer(data, dtype=np.uint8).reshape((h, w, 4))
+    rgb = arr[:, :, [2, 1, 0]].copy()
+    image = Image.fromarray(rgb, "RGB")
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(w, x + ww)
+    y1 = min(h, y + hh)
+    crop = image.crop((x0, y0, x1, y1))
+    if crop.width < 8 or crop.height < 8:
+        return ""
+    if crop.width <= 260:
+        scale = 4
+    elif crop.width <= 640:
+        scale = 2
+    else:
+        scale = 1
+    if scale > 1:
+        crop = crop.resize(
+            (crop.width * scale, crop.height * scale),
+            Image.Resampling.LANCZOS,
+        )
+    engine = _get_ocr_engine()
+    with _OCR_LOCK:
+        result, _elapse = engine(np.array(crop)[:, :, ::-1])
+    texts = [
+        str(item[1]).strip()
+        for item in (result or [])
+        if len(item) >= 3
+    ]
+    return " ".join(texts)
 
-/* ---- 弹窗（地图标注 / 路径编辑 / 框选区域）使用浅色主题 ---- */
-QDialog {
-    background: #f4f5f7;
-}
-QDialog QLabel,
-QDialog QCheckBox,
-QDialog QRadioButton {
-    color: #1b1c1f;
-}
-QDialog QLabel#muted {
-    color: #4b5563;
-}
-QDialog QLabel#hint {
-    color: #4b5563;
-}
-QDialog QGroupBox {
-    background: #ffffff;
-    border: 1px solid #d0d4da;
-}
-QDialog QGroupBox::title {
-    color: #1a4f8b;
-    background: #f4f5f7;
-}
-QDialog QLineEdit,
-QDialog QComboBox,
-QDialog QSpinBox,
-QDialog QDoubleSpinBox,
-QDialog QTimeEdit {
-    background: #ffffff;
-    color: #1b1c1f;
-    border: 1px solid #c3c8cf;
-    selection-background-color: #bcd2f2;
-    selection-color: #101318;
-}
-QDialog QLineEdit:focus,
-QDialog QComboBox:focus,
-QDialog QSpinBox:focus,
-QDialog QDoubleSpinBox:focus,
-QDialog QTimeEdit:focus {
-    border-color: #3b82f6;
-}
-QDialog QComboBox QAbstractItemView {
-    background: #ffffff;
-    color: #1b1c1f;
-    selection-background-color: #bcd2f2;
-    selection-color: #101318;
-}
-QDialog QPushButton {
-    background: #e9ebef;
-    color: #1b1c1f;
-    border: 1px solid #c3c8cf;
-}
-QDialog QPushButton:hover {
-    background: #dfe2e8;
-}
-QDialog QPushButton:pressed {
-    background: #d3d7de;
-}
-QDialog QPushButton:disabled {
-    color: #9aa0a8;
-    background: #f0f1f3;
-    border-color: #d8dce2;
-}
-QDialog QListWidget,
-QDialog QTableWidget,
-QDialog QPlainTextEdit {
-    background: #ffffff;
-    color: #1b1c1f;
-    border: 1px solid #c3c8cf;
-    selection-background-color: #bcd2f2;
-    selection-color: #101318;
-}
-QDialog QListWidget::item:selected,
-QDialog QTableWidget::item:selected {
-    background: #bcd2f2;
-    color: #101318;
-}
-QDialog QHeaderView::section {
-    background: #e9ebef;
-    color: #1b1c1f;
-    border: 1px solid #cfd4db;
-    padding: 4px;
-}
-QDialog QCheckBox::indicator {
-    background: #ffffff;
-    border: 1px solid #9aa0a8;
-}
-QDialog QCheckBox::indicator:checked {
-    background: #3b82f6;
-    border-color: #3b82f6;
-}
-QDialog QScrollArea {
-    background: transparent;
-}
-"""
 
-START_BUTTON_STYLES = {
-    "idle": """
-        QPushButton#startButton {
-            background: #c0392b;
-            color: #ffffff;
-            border: 1px solid #d14a3b;
-            border-radius: 8px;
-            padding: 11px 16px;
-            font-size: 15px;
-            font-weight: 700;
-        }
-        QPushButton#startButton:hover { background: #d34a3a; }
-        QPushButton#startButton:pressed { background: #a93226; }
-    """,
-    "running": """
-        QPushButton#startButton {
-            background: #8e2b20;
-            color: #ffffff;
-            border: 1px solid #a9382c;
-            border-radius: 8px;
-            padding: 11px 16px;
-            font-size: 15px;
-            font-weight: 700;
-        }
-        QPushButton#startButton:hover { background: #a3352a; }
-        QPushButton#startButton:pressed { background: #77231a; }
-    """,
-    "stopping": """
-        QPushButton#startButton {
-            background: #4a2b28;
-            color: #b9a6a3;
-            border: 1px solid #5b3531;
-            border-radius: 8px;
-            padding: 11px 16px;
-            font-size: 15px;
-            font-weight: 700;
-        }
-    """,
-}
+def parse_hp_text(text: str) -> tuple[Optional[int], Optional[int]]:
+    """从 OCR 文本里解析“当前/最大”数值。"""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    compact = (
+        compact.replace("：", ":")
+        .replace("／", "/")
+        .replace("|", "/")
+        .replace("l", "/")
+        .replace("I", "/")
+        .replace("，", ",")
+    )
+    match = re.search(r"(\d{1,9})\s*/\s*(\d{1,9})", compact)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r"\d{1,9}", compact)
+    if match:
+        return int(match.group(0)), None
+    return None, None
+
+
+def ocr_hp_from_bgra(
+    data: bytes,
+    w: int,
+    h: int,
+    roi_norm: tuple[float, float, float, float],
+) -> tuple[Optional[int], Optional[int], str]:
+    """从血量区域读取“当前/最大”血量。"""
+    roi = roi_from_norm(roi_norm, w, h)
+    try:
+        text = ocr_text_from_bgra(data, w, h, roi)
+    except Exception as exc:
+        return None, None, f"血量识别异常：{type(exc).__name__}: {exc}"
+    current, maximum = parse_hp_text(text)
+    if current is None:
+        return None, None, f"未识别到血量数字（OCR：{text[:80] or '空'}）"
+    return current, maximum, text
 
 
 # ---------------------------------------------------------------------------
@@ -1051,7 +695,6 @@ class KeySender(QThread):
         use_potion: bool = False,
         potion_interval_ms: int = DEFAULT_POTION_SECONDS * 1000,
         attack_enabled: bool = True,
-        potion_immediate: bool = False,
         use_pickup: bool = True,
         parent: Optional[QWidget] = None,
     ):
@@ -1072,11 +715,12 @@ class KeySender(QThread):
         self.use_potion = bool(use_potion)
         self.attack_enabled = bool(attack_enabled)
         self.use_pickup = bool(use_pickup)
-        self._potion_immediate = bool(potion_immediate)
         self._potion_interval_s = max(5.0, float(potion_interval_ms) / 1000.0)
         self._next_skill1 = 0.0
         self._next_skill2 = 0.0
         self._next_potion = 0.0
+        self._next_hp_potion = 0.0
+        self._potion_request = threading.Event()
 
     # -- 外部控制 ---------------------------------------------------------
     def stop(self) -> None:
@@ -1106,23 +750,26 @@ class KeySender(QThread):
         """运行中切换是否在 A 后发送空格拾取。"""
         self.use_pickup = bool(enabled)
 
+    def set_attack_enabled(self, enabled: bool) -> None:
+        """运行中暂停/恢复发平A；技能和喝药不受影响。"""
+        self.attack_enabled = bool(enabled)
+
     def set_potion_interval(self, seconds: int) -> None:
         self._potion_interval_s = max(5.0, float(seconds))
         if self.use_potion:
-            self._next_potion = min(
-                self._next_potion or (time.monotonic() + self._potion_interval_s),
-                time.monotonic() + self._potion_interval_s,
-            )
+            self._next_potion = time.monotonic() + self._potion_interval_s
+
+    def trigger_potion(self) -> None:
+        """请求立即喝药（Q + W）；实际由工作线程按冷却执行。"""
+        self._potion_request.set()
 
     # -- 线程主体 ---------------------------------------------------------
-    def run(self) -> None:  # noqa: C901 - 逻辑本身很短，保持集中便于阅读
+    def run(self) -> None:
         try:
             now = time.monotonic()
             self._next_skill1 = now
             self._next_skill2 = now
-            self._next_potion = (
-                now if self._potion_immediate else now + self._potion_interval_s
-            )
+            self._next_potion = now + self._potion_interval_s
 
             while self.is_running and not self._stop_event.is_set():
                 if not self._window_alive():
@@ -1144,8 +791,7 @@ class KeySender(QThread):
                 if self._stop_event.is_set():
                     break
 
-                # 动作：A 按下 50ms -> 松开
-                # -> 可选空格拾取
+                # 动作：A 按下 50ms -> 松开 -> 可选空格拾取
                 if not self._tap(VK_A):
                     break
                 if self.use_pickup:
@@ -1177,13 +823,40 @@ class KeySender(QThread):
     # -- 内部工具 ---------------------------------------------------------
     def _run_scheduled_actions(self) -> bool:
         """按冷却时间发送技能 1/2 和喝药 Q。返回 False 表示应结束线程。"""
+        now = time.monotonic()
+        if self._potion_request.is_set():
+            self._potion_request.clear()
+            if now >= self._next_hp_potion:
+                if not self._window_alive():
+                    self._last_error = "目标窗口已关闭（句柄失效），发送已停止。"
+                    return False
+                if not self._tap(VK_Q):
+                    return False
+                if self._stop_event.is_set():
+                    return False
+                if not self._tap(VK_W):
+                    return False
+                self._next_hp_potion = (
+                    time.monotonic() + self._potion_interval_s
+                )
+                self._next_potion = max(
+                    self._next_potion, self._next_hp_potion
+                )
+                append_debug_log(
+                    PLAYER_DEBUG_PATH,
+                    [
+                        f"[POTION] {datetime.datetime.now().strftime('%H:%M:%S')} "
+                        f"hwnd=0x{self.hwnd:X} Q+W "
+                        f"interval={self._potion_interval_s:.0f}s"
+                    ],
+                )
+
         if not (self.use_skills or self.use_potion):
             return True
         if not self._window_alive():
             self._last_error = "目标窗口已关闭（句柄失效），发送已停止。"
             return False
 
-        now = time.monotonic()
         if self.use_skills:
             if now >= self._next_skill1:
                 if not self._tap(VK_1):
@@ -1303,11 +976,7 @@ class KeySender(QThread):
         return scan
 
     def _wait(self, seconds: float) -> None:
-        """可被 stop() 立即唤醒的 sleep。
-
-        正常运行时等价于 time.sleep(seconds)；点击“停止”时能马上退出等待，
-        不会让线程多睡一个完整间隔，同时仍保证按键会被松开。
-        """
+        """可被 stop() 立即唤醒的 sleep。"""
         if seconds > 0:
             self._stop_event.wait(seconds)
 
@@ -1389,8 +1058,49 @@ class KeySender(QThread):
         return True
 
 
+
+
+class TapSender(KeySender):
+    """连续发送同一个按键（用于击杀后按空格拾取）。"""
+
+    def __init__(
+        self,
+        hwnd: int,
+        vk: int,
+        count: int,
+        gap_seconds: float = 0.18,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(
+            hwnd,
+            MIN_INTERVAL_MS,
+            use_skills=False,
+            use_potion=False,
+            use_pickup=False,
+            parent=parent,
+        )
+        self.vk = int(vk)
+        self.count = max(1, int(count))
+        self.gap = max(0.05, float(gap_seconds))
+
+    def run(self) -> None:
+        try:
+            for _ in range(self.count):
+                if self._stop_event.is_set():
+                    break
+                if not self._tap(self.vk):
+                    break
+                self._wait(self.gap)
+        except Exception as exc:
+            self._last_error = f"连续按键异常：{type(exc).__name__}: {exc}"
+        finally:
+            self.is_running = False
+            if self._last_error:
+                self.failed.emit(self._last_error)
+
+
 # ---------------------------------------------------------------------------
-# 疲劳检测线程 / 提醒弹窗
+# 前台窗口辅助（疲劳检测点击游戏时需要）
 # ---------------------------------------------------------------------------
 
 
@@ -1470,7 +1180,7 @@ def _restore_foreground_window(prev_fg: int, game_hwnd: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 键鼠输入辅助（前台发送 / 前台恢复）
+# 录制回放（前台）辅助
 # ---------------------------------------------------------------------------
 
 _ULONG_PTR = (
@@ -1499,9 +1209,7 @@ class _INPUT(ctypes.Structure):
     _fields_ = [("type", wt.DWORD), ("i", _I)]
 
 
-_USER32.SendInput.argtypes = [
-    wt.UINT, ctypes.POINTER(_INPUT), ctypes.c_int
-]
+_USER32.SendInput.argtypes = [wt.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
 _USER32.SendInput.restype = wt.UINT
 
 _MOUSEEVENTF_MOVE = 0x0001
@@ -1514,27 +1222,21 @@ _MOUSEEVENTF_MIDDLEUP = 0x0040
 _MOUSEEVENTF_XDOWN = 0x0080
 _MOUSEEVENTF_XUP = 0x0100
 _MOUSEEVENTF_WHEEL = 0x0800
-_MOUSEEVENTF_HWHEEL = 0x1000
 _MOUSEEVENTF_ABSOLUTE = 0x8000
 _MOUSEEVENTF_VIRTUALDESK = 0x4000
 
-
 _IGNORED_KEY_PARTS = (
-    "browser",
-    "www",
-    "search",
-    "mail",
-    "calculator",
-    "media",
-    "volume",
-    "play/pause",
-    "next track",
-    "previous track",
-    "launch",
-    "windows",
-    "apps",
-    "sleep",
-    "power",
+    "browser", "www", "search", "mail", "calculator", "media", "volume",
+    "play/pause", "next track", "previous track", "launch", "windows",
+    "apps", "sleep", "power",
+)
+
+_BROWSER_CLASS_PARTS = (
+    "chrome_widgetwin", "mozilla", "firefox", "cef", "webview", "edge",
+    "iexplore", "steamwebhelper", "gameoverlayui",
+)
+_BROWSER_TITLE_PARTS = (
+    "google chrome", "microsoft edge", "firefox", "browser", "浏览器",
 )
 
 
@@ -1542,26 +1244,6 @@ def _is_ignored_key_name(name: str) -> bool:
     """过滤浏览器/多媒体键，避免回放时把浏览器打开。"""
     low = str(name or "").lower()
     return any(part in low for part in _IGNORED_KEY_PARTS)
-
-
-_BROWSER_CLASS_PARTS = (
-    "chrome_widgetwin",
-    "mozilla",
-    "firefox",
-    "cef",
-    "webview",
-    "edge",
-    "iexplore",
-    "steamwebhelper",
-    "gameoverlayui",
-)
-_BROWSER_TITLE_PARTS = (
-    "google chrome",
-    "microsoft edge",
-    "firefox",
-    "browser",
-    "浏览器",
-)
 
 
 def _is_browser_window(hwnd: int) -> bool:
@@ -1652,34 +1334,14 @@ def _send_mouse_wheel(delta: int) -> None:
 
 
 _SPECIAL_VK = {
-    "esc": 0x1B,
-    "escape": 0x1B,
-    "tab": 0x09,
-    "space": 0x20,
-    "enter": 0x0D,
-    "return": 0x0D,
-    "backspace": 0x08,
-    "delete": 0x2E,
-    "insert": 0x2D,
-    "home": 0x24,
-    "end": 0x23,
-    "page up": 0x21,
-    "page down": 0x22,
-    "up": 0x26,
-    "down": 0x28,
-    "left": 0x25,
-    "right": 0x27,
-    "shift": 0x10,
-    "left shift": 0xA0,
-    "right shift": 0xA1,
-    "ctrl": 0x11,
-    "control": 0x11,
-    "left ctrl": 0xA2,
-    "right ctrl": 0xA3,
-    "alt": 0x12,
-    "left alt": 0xA4,
-    "right alt": 0xA5,
-    "caps lock": 0x14,
+    "esc": 0x1B, "escape": 0x1B, "tab": 0x09, "space": 0x20,
+    "enter": 0x0D, "return": 0x0D, "backspace": 0x08, "delete": 0x2E,
+    "insert": 0x2D, "home": 0x24, "end": 0x23, "page up": 0x21,
+    "page down": 0x22, "up": 0x26, "down": 0x28, "left": 0x25,
+    "right": 0x27, "shift": 0x10, "left shift": 0xA0,
+    "right shift": 0xA1, "ctrl": 0x11, "control": 0x11,
+    "left ctrl": 0xA2, "right ctrl": 0xA3, "alt": 0x12,
+    "left alt": 0xA4, "right alt": 0xA5, "caps lock": 0x14,
 }
 for _i in range(1, 25):
     _SPECIAL_VK[f"f{_i}"] = 0x6F + _i
@@ -1702,10 +1364,21 @@ def _vk_from_key_name(name: str) -> Optional[int]:
 
 
 def _send_key_name(name: str, down: bool) -> bool:
-    """用 keybd_event 发键；录制钩子能捕获这种按键。"""
+    """发送一个按键：优先用显式 VK 的 keybd_event。
+
+    不再优先用 keyboard.press：中文输入法/系统热键可能把它转成
+    VK_PROCESSKEY(229)，游戏收到的就不是原来的 A/D 等按键。
+    """
     vk = _vk_from_key_name(name)
-    if vk is None:
-        # 未知按键退回 keyboard 库（不影响正常回放，只是录制钩子可能捕不到）
+    if vk is not None:
+        scan = int(win32api.MapVirtualKey(vk, 0)) & 0xFF
+        flags = 0 if down else win32con.KEYEVENTF_KEYUP
+        try:
+            win32api.keybd_event(vk, scan, flags, 0)
+            return True
+        except Exception:
+            pass
+    if keyboard is not None:
         try:
             if down:
                 keyboard.press(name)
@@ -1713,22 +1386,8 @@ def _send_key_name(name: str, down: bool) -> bool:
                 keyboard.release(name)
             return True
         except Exception:
-            return False
-    scan = int(win32api.MapVirtualKey(vk, 0)) & 0xFF
-    flags = 0 if down else win32con.KEYEVENTF_KEYUP
-    try:
-        win32api.keybd_event(vk, scan, flags, 0)
-        return True
-    except Exception:
-        return False
-
-
-
-
-
-
-
-
+            pass
+    return False
 
 
 class MacroRecorder:
@@ -1752,6 +1411,9 @@ class MacroRecorder:
         # 记录当前按下的鼠标键，避免把“录制开始前已按下”的 up 录进去，
         # 也用于把 mouse 库的 double 事件还原成 down。
         self._pressed_buttons: set[str] = set()
+        self._pressed_keys: set[str] = set()
+        self._start_cursor_norm: Optional[tuple[float, float]] = None
+        self._raw_recorder: Optional[RawMouseRecorder] = None
         self._poll_thread = None
         self._poll_stop = threading.Event()
         self._screen_size: tuple[int, int] = (0, 0)
@@ -1768,6 +1430,8 @@ class MacroRecorder:
         self._last_move_time = -1.0
         self._last_move_pos = None
         self._pressed_buttons = set()
+        self._pressed_keys = set()
+        self._start_cursor_norm = None
         self._active = True
         try:
             self._game_rect = win32gui.GetWindowRect(self.game_hwnd)
@@ -1786,9 +1450,23 @@ class MacroRecorder:
             cw, ch = int(cw), int(ch)
             self._client_rect = [int(cl), int(ct), int(cl + cw), int(ct + ch)]
             self._client_size = [cw, ch]
+            try:
+                mx, my = win32api.GetCursorPos()
+                if self._inside_game(int(mx), int(my)):
+                    nx = (float(mx) - float(cl)) / max(1, cw)
+                    ny = (float(my) - float(ct)) / max(1, ch)
+                    self._start_cursor_norm = (
+                        max(0.0, min(1.0, nx)),
+                        max(0.0, min(1.0, ny)),
+                    )
+                else:
+                    self._start_cursor_norm = None
+            except Exception:
+                self._start_cursor_norm = None
         except Exception:
             self._client_rect = [0, 0, 0, 0]
             self._client_size = [0, 0]
+            self._start_cursor_norm = None
         self._mouse_hook = mouse.hook(self._on_mouse)
         try:
             if keyboard is None:
@@ -1806,9 +1484,22 @@ class MacroRecorder:
             target=self._poll_mouse_buttons, daemon=True
         )
         self._poll_thread.start()
+        # Raw Input：记录不受系统鼠标加速影响的相对位移
+        try:
+            self._raw_recorder = RawMouseRecorder(self._on_raw_delta)
+            self._raw_recorder.start()
+        except Exception:
+            self._raw_recorder = None
 
     def stop(self) -> list[dict]:
         self._active = False
+        raw = self._raw_recorder
+        self._raw_recorder = None
+        if raw is not None:
+            try:
+                raw.stop()
+            except Exception:
+                pass
         self._poll_stop.set()
         poll_thread = self._poll_thread
         self._poll_thread = None
@@ -1831,13 +1522,58 @@ class MacroRecorder:
         self._key_hook = None
         with self._lock:
             events = sorted(self._events, key=lambda e: e.get("t", 0.0))
+        self._write_debug(events)
         return events
+
+    def _write_debug(self, events: list[dict]) -> None:
+        try:
+            meta = self.meta()
+            counts: dict[str, int] = {}
+            for event in events:
+                typ = str(event.get("type", ""))
+                counts[typ] = counts.get(typ, 0) + 1
+            keys_down = sum(
+                1 for e in events if e.get("type") == "key_down"
+            )
+            keys_up = sum(1 for e in events if e.get("type") == "key_up")
+            moves = [e for e in events if e.get("type") == "move"]
+            duration = float(events[-1].get("t", 0.0)) if events else 0.0
+            gaps = [
+                float(b.get("t", 0.0)) - float(a.get("t", 0.0))
+                for a, b in zip(events, events[1:])
+            ]
+            lines = [
+                f"=== RECORD {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===",
+                f"hwnd=0x{self.game_hwnd:X} meta={meta}",
+                f"summary events={len(events)} duration={duration:.3f}s "
+                f"counts={counts} key_down={keys_down} key_up={keys_up} "
+                f"moves={len(moves)} raw_moves={counts.get('raw_move', 0)} "
+                f"max_gap={max(gaps) if gaps else 0:.3f}",
+            ]
+            for event in events:
+                lines.append(
+                    f"[REC] t={float(event.get('t', 0.0)):.6f} "
+                    f"type={event.get('type')} "
+                    f"name={event.get('name', '')} "
+                    f"button={event.get('button', '')} "
+                    f"nx={event.get('nx', '')} ny={event.get('ny', '')} "
+                    f"x={event.get('x', '')} y={event.get('y', '')} "
+                    f"delta={event.get('delta', '')}"
+                )
+            append_debug_log(RECORD_DEBUG_PATH, lines)
+        except Exception:
+            pass
 
     def meta(self) -> dict:
         return {
             "screen": [int(self._screen_size[0]), int(self._screen_size[1])],
             "client_rect": [int(v) for v in self._client_rect],
             "client_size": [int(v) for v in self._client_size],
+            "cursor0_norm": (
+                [round(float(v), 6) for v in self._start_cursor_norm]
+                if self._start_cursor_norm is not None
+                else None
+            ),
         }
 
     def _norm_point(self, x: int, y: int) -> Optional[tuple[float, float]]:
@@ -1894,6 +1630,16 @@ class MacroRecorder:
             event["t"] = max(0.0, float(timestamp) - self._start_time)
             self._events.append(event)
 
+    def _on_raw_delta(self, dx: int, dy: int) -> None:
+        if not self._active:
+            return
+        if not _foreground_is_window(self.game_hwnd):
+            return
+        self._record(
+            {"type": "raw_move", "dx": int(dx), "dy": int(dy)},
+            time.perf_counter(),
+        )
+
     def _poll_mouse_buttons(self) -> None:
         """高频轮询鼠标按键，兜底 mouse 钩子漏掉的快速点击/double。"""
         try:
@@ -1913,7 +1659,7 @@ class MacroRecorder:
             # 只要鼠标点在游戏窗口上就记录，不强制游戏必须已经在前台；
             # 这样“点击进入游戏”导致窗口刚获得焦点的那一下也能录到。
             can_record = self._active
-            now = time.time()
+            now = time.perf_counter()
             for name, vk in buttons:
                 try:
                     down = bool(win32api.GetAsyncKeyState(vk) & 0x8000)
@@ -1976,7 +1722,7 @@ class MacroRecorder:
                 x, y = int(event.x), int(event.y)
                 if not self._inside_game(x, y):
                     return
-                now = float(event.time)
+                now = time.perf_counter()
                 if self._last_move_time >= 0 and now - self._last_move_time < 0.008:
                     return
                 if self._last_move_pos is not None:
@@ -2013,7 +1759,7 @@ class MacroRecorder:
                 }
                 if norm is not None:
                     ev["nx"], ev["ny"] = norm
-                self._record(ev, float(event.time))
+                self._record(ev, time.perf_counter())
         except Exception:
             pass
 
@@ -2026,21 +1772,69 @@ class MacroRecorder:
             name = str(event.name)
             if not name or _is_ignored_key_name(name):
                 return
+            if event.event_type == "down":
+                if name in self._pressed_keys:
+                    # 系统自动重复的 key_down，不重复录制
+                    return
+                self._pressed_keys.add(name)
+                event_type = "key_down"
+            else:
+                if name not in self._pressed_keys:
+                    return
+                self._pressed_keys.discard(name)
+                event_type = "key_up"
             self._record(
-                {
-                    "type": "key_down"
-                    if event.event_type == "down"
-                    else "key_up",
-                    "name": name,
-                },
-                float(event.time),
+                {"type": event_type, "name": name},
+                time.perf_counter(),
             )
         except Exception:
             pass
 
 
+
+
+
+
+_FOREGROUND_BRIDGE = None
+
+
+class ForegroundBridge(QObject):
+    """把切前台动作转到 UI 线程执行。
+
+    Windows 的 SetForegroundWindow 在工作线程里经常失败；通过信号让
+    主线程执行，成功率更高。等待超时也不会阻塞 UI 线程。
+    """
+
+    request = Signal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._event = threading.Event()
+        self._pending = 0
+        self.request.connect(
+            self._handle, Qt.ConnectionType.QueuedConnection
+        )
+
+    @Slot(int)
+    def _handle(self, hwnd: int) -> None:
+        if int(hwnd) != int(self._pending):
+            return
+        _force_foreground_window(int(hwnd))
+        self._event.set()
+
+    def ensure(self, hwnd: int, timeout: float = 1.5) -> bool:
+        hwnd = int(hwnd)
+        if QThread.currentThread() is self.thread():
+            _force_foreground_window(hwnd)
+            return _foreground_is_window(hwnd)
+        self._pending = hwnd
+        self._event.clear()
+        self.request.emit(hwnd)
+        return self._event.wait(max(0.1, float(timeout)))
+
+
 class MacroPlayer(QThread):
-    """按录制的时间线回放鼠标/键盘。"""
+    """按录制的时间线回放鼠标/键盘（前台）。"""
 
     done = Signal(str)
     error = Signal(str, str)
@@ -2050,42 +1844,96 @@ class MacroPlayer(QThread):
         game_hwnd: int,
         stage: str,
         events: list[dict],
-        restore_foreground: bool = True,
-        restore_cursor: bool = True,
-        capture_friendly_keys: bool = False,
         meta: Optional[dict] = None,
-        scale_coords: bool = True,
         speed: float = 1.0,
-        lock_user_input: bool = True,
+        lock_user_input: bool = False,
         background: bool = False,
+        relative_mouse: bool = False,
+        keyboard_only: bool = False,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.game_hwnd = int(game_hwnd)
         self.stage = stage
         self.events = list(events)
-        self.restore_foreground = bool(restore_foreground)
-        self.restore_cursor = bool(restore_cursor)
-        self.capture_friendly_keys = bool(capture_friendly_keys)
         self.meta = dict(meta) if isinstance(meta, dict) else None
-        self.scale_coords = bool(scale_coords)
+        # 兼容旧调用方；当前回放固定走前台，后台/输入锁参数忽略。
+        self.lock_user_input = bool(lock_user_input)
+        self.keyboard_only = bool(keyboard_only)
+        self.background = bool(background) or self.keyboard_only
+        self.relative_mouse = bool(relative_mouse)
+        self._bg_last_pos: Optional[tuple[int, int]] = None
         try:
             self.speed = max(0.2, min(3.0, float(speed)))
         except (TypeError, ValueError):
             self.speed = 1.0
-        self.lock_user_input = bool(lock_user_input)
-        self.background = bool(background)
-        self._bg_last_pos: Optional[tuple[int, int]] = None
-        self._input_lock = None
         self._stop_event = threading.Event()
+        self._debug_lines: list[str] = []
+        self._late_values: list[float] = []
 
     def stop(self) -> None:
         self._stop_event.set()
 
+    def _debug(self, text: str) -> None:
+        self._debug_lines.append(text)
+
+    def _event_debug(
+        self, event: dict, target: float, actual: float
+    ) -> None:
+        late = actual - target
+        self._late_values.append(late)
+        self._debug(
+            f"[PLAY] t={target:.6f} actual={actual:.6f} "
+            f"late={late:+.6f} type={event.get('type')} "
+            f"name={event.get('name', '')} "
+            f"button={event.get('button', '')} "
+            f"nx={event.get('nx', '')} ny={event.get('ny', '')} "
+            f"delta={event.get('delta', '')}"
+        )
+
+    def _write_debug(self) -> None:
+        try:
+            late = self._late_values
+            summary = (
+                f"mode={'background' if self.background else 'foreground'} "
+                f"relative={self.relative_mouse} events={len(self.events)} "
+                f"sent={len(late)} "
+                f"max_late={max(late) if late else 0:.3f} "
+                f"avg_late={(sum(late)/len(late)) if late else 0:.3f}"
+            )
+            lines = [
+                f"=== PLAYER {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                f"stage={self.stage} ===",
+                f"hwnd=0x{self.game_hwnd:X} meta={self.meta} {summary}",
+            ]
+            lines.extend(self._debug_lines)
+            append_debug_log(PLAYER_DEBUG_PATH, lines)
+        except Exception:
+            pass
+
+    def _log(self, text: str) -> None:
+        line = (
+            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
+            f"[{self.stage}] {text}"
+        )
+        try:
+            with open(BOSS_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _fg_info() -> str:
+        try:
+            hwnd = int(win32gui.GetForegroundWindow() or 0)
+            title = win32gui.GetWindowText(hwnd)
+            cls = win32gui.GetClassName(hwnd)
+            return f"0x{hwnd:X} {cls} {title!r}"
+        except Exception:
+            return "?"
+
     def _make_point_mapper(self):
         """把录制时的屏幕坐标映射到当前游戏客户区。"""
-        if not self.scale_coords:
-            return lambda x, y: (int(round(x)), int(round(y)))
         try:
             cur_l, cur_t = win32gui.ClientToScreen(self.game_hwnd, (0, 0))
             _l, _t, cur_w, cur_h = win32gui.GetClientRect(self.game_hwnd)
@@ -2101,27 +1949,17 @@ class MacroPlayer(QThread):
         rec_l = rec_t = 0
         rec_w = rec_h = 0
         try:
-            if (
-                isinstance(rec_rect, (list, tuple))
-                and len(rec_rect) == 4
-            ):
+            if isinstance(rec_rect, (list, tuple)) and len(rec_rect) == 4:
                 rec_l, rec_t = float(rec_rect[0]), float(rec_rect[1])
-            if (
-                isinstance(rec_size, (list, tuple))
-                and len(rec_size) == 2
-            ):
+            if isinstance(rec_size, (list, tuple)) and len(rec_size) == 2:
                 rec_w, rec_h = float(rec_size[0]), float(rec_size[1])
-            elif (
-                isinstance(rec_rect, (list, tuple))
-                and len(rec_rect) == 4
-            ):
+            elif isinstance(rec_rect, (list, tuple)) and len(rec_rect) == 4:
                 rec_w = float(rec_rect[2]) - float(rec_rect[0])
                 rec_h = float(rec_rect[3]) - float(rec_rect[1])
         except (TypeError, ValueError):
             rec_w = rec_h = 0
 
         if rec_w <= 0 or rec_h <= 0:
-            # 旧录制没有保存窗口信息：按“当时全屏、当前屏幕尺寸”兼容。
             try:
                 sw = int(win32api.GetSystemMetrics(0))
                 sh = int(win32api.GetSystemMetrics(1))
@@ -2149,7 +1987,7 @@ class MacroPlayer(QThread):
         return mapper
 
     def _make_event_mapper(self):
-        """优先使用新录制保存的归一化坐标；旧录制回退到屏幕坐标换算。"""
+        """优先使用归一化坐标；旧录制回退到屏幕坐标换算。"""
         abs_map = self._make_point_mapper()
         try:
             cur_l, cur_t = win32gui.ClientToScreen(self.game_hwnd, (0, 0))
@@ -2181,35 +2019,37 @@ class MacroPlayer(QThread):
 
         return mapper
 
-    def _log(self, text: str) -> None:
-        line = (
-            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
-            f"[{self.stage}] {text}"
-        )
+    def _point_belongs_to_game(self, x: int, y: int) -> bool:
         try:
-            with open(REPLAY_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            under = int(win32gui.WindowFromPoint((int(x), int(y))) or 0)
+            if not under:
+                return False
+            root = int(win32gui.GetAncestor(under, win32con.GA_ROOT))
+            return root == int(self.game_hwnd)
         except Exception:
-            pass
+            return False
 
-    @staticmethod
-    def _fg_info() -> str:
+    # ---- 后台回放：PostMessage，不抢真实鼠标键盘 ----
+    def _bg_post(self, hwnd: int, message: int, wparam: int, lparam: int) -> bool:
         try:
-            hwnd = int(win32gui.GetForegroundWindow() or 0)
-            title = win32gui.GetWindowText(hwnd)
-            cls = win32gui.GetClassName(hwnd)
-            return f"0x{hwnd:X} {cls} {title!r}"
+            _USER32.PostMessageW(int(hwnd), int(message), int(wparam), int(lparam))
+            return True
         except Exception:
-            return "?"
+            try:
+                win32api.PostMessage(int(hwnd), int(message), int(wparam), int(lparam))
+                return True
+            except Exception:
+                return False
 
     def _bg_prime(self) -> None:
+        """让游戏以为自己有焦点/鼠标在窗口内，但不切换真实前台。"""
         try:
             fg = int(win32gui.GetForegroundWindow() or 0)
             if fg != self.game_hwnd:
-                win32api.PostMessage(self.game_hwnd, WM_ACTIVATEAPP, 1, 0)
-                win32api.PostMessage(self.game_hwnd, WM_NCACTIVATE, 1, 0)
-                win32api.PostMessage(self.game_hwnd, WM_ACTIVATE, WA_ACTIVE, fg)
-                win32api.PostMessage(self.game_hwnd, WM_SETFOCUS, fg, 0)
+                self._bg_post(self.game_hwnd, WM_ACTIVATEAPP, 1, 0)
+                self._bg_post(self.game_hwnd, WM_NCACTIVATE, 1, 0)
+                self._bg_post(self.game_hwnd, WM_ACTIVATE, WA_ACTIVE, fg)
+                self._bg_post(self.game_hwnd, WM_SETFOCUS, fg, 0)
         except Exception:
             pass
 
@@ -2219,20 +2059,19 @@ class MacroPlayer(QThread):
             return False
         try:
             scan = int(win32api.MapVirtualKey(vk, 0)) & 0xFF
-            lparam = 1 | (scan << 16)
-            if not down:
-                lparam |= 0xC0000000
-            win32api.PostMessage(
-                self.game_hwnd,
-                win32con.WM_KEYDOWN if down else win32con.WM_KEYUP,
-                vk,
-                lparam,
-            )
-            return True
         except Exception:
             return False
+        lparam = 1 | (scan << 16)
+        if not down:
+            lparam |= 0xC0000000
+        return self._bg_post(
+            self.game_hwnd,
+            WM_KEYDOWN if down else WM_KEYUP,
+            vk,
+            lparam,
+        )
 
-    def _bg_client_point(self, event: dict, map_event):
+    def _bg_client_point(self, event: dict, map_event) -> tuple[int, int]:
         _l, _t, cw, ch = win32gui.GetClientRect(self.game_hwnd)
         cw, ch = int(cw), int(ch)
         if cw <= 0 or ch <= 0:
@@ -2256,45 +2095,45 @@ class MacroPlayer(QThread):
         lparam = (x & 0xFFFF) | ((y & 0xFFFF) << 16)
         try:
             if typ == "move":
-                win32api.PostMessage(
-                    self.game_hwnd, win32con.WM_MOUSEMOVE, 0, lparam
-                )
+                self._bg_post(self.game_hwnd, WM_MOUSEMOVE, 0, lparam)
             elif typ in ("down", "up"):
                 button = str(event.get("button", "left")).lower()
-                win32api.PostMessage(
-                    self.game_hwnd, win32con.WM_MOUSEMOVE, 0, lparam
-                )
+                self._bg_post(self.game_hwnd, WM_MOUSEMOVE, 0, lparam)
                 if button == "right":
-                    msg = (
+                    message = (
                         win32con.WM_RBUTTONDOWN
                         if typ == "down"
                         else win32con.WM_RBUTTONUP
                     )
-                    wp = win32con.MK_RBUTTON if typ == "down" else 0
+                    wparam = win32con.MK_RBUTTON if typ == "down" else 0
                 elif button == "middle":
-                    msg = (
+                    message = (
                         win32con.WM_MBUTTONDOWN
                         if typ == "down"
                         else win32con.WM_MBUTTONUP
                     )
-                    wp = win32con.MK_MBUTTON if typ == "down" else 0
+                    wparam = win32con.MK_MBUTTON if typ == "down" else 0
+                elif button in ("x", "x1", "x2"):
+                    message = 0x020B if typ == "down" else 0x020C
+                    button_id = 1 if button != "x2" else 2
+                    wparam = button_id << 16
                 else:
-                    msg = (
+                    message = (
                         win32con.WM_LBUTTONDOWN
                         if typ == "down"
                         else win32con.WM_LBUTTONUP
                     )
-                    wp = win32con.MK_LBUTTON if typ == "down" else 0
-                win32api.PostMessage(self.game_hwnd, msg, wp, lparam)
+                    wparam = win32con.MK_LBUTTON if typ == "down" else 0
+                self._bg_post(self.game_hwnd, message, wparam, lparam)
             elif typ == "wheel":
                 delta = int(event.get("delta", 0))
-                sx, sy = win32gui.ClientToScreen(
-                    self.game_hwnd, (x, y)
-                )
-                wp = (delta & 0xFFFF) << 16
+                if delta == 0:
+                    return
+                sx, sy = win32gui.ClientToScreen(self.game_hwnd, (x, y))
+                wparam = (delta & 0xFFFF) << 16
                 lp = (int(sx) & 0xFFFF) | ((int(sy) & 0xFFFF) << 16)
-                win32api.PostMessage(
-                    self.game_hwnd, win32con.WM_MOUSEWHEEL, wp, lp
+                self._bg_post(
+                    self.game_hwnd, win32con.WM_MOUSEWHEEL, wparam, lp
                 )
         except Exception:
             pass
@@ -2305,29 +2144,167 @@ class MacroPlayer(QThread):
         x, y = self._bg_last_pos
         lparam = (x & 0xFFFF) | ((y & 0xFFFF) << 16)
         for button in list(buttons):
-            if button == "right":
-                msg, wp = win32con.WM_RBUTTONUP, 0
-            elif button == "middle":
-                msg, wp = win32con.WM_MBUTTONUP, 0
-            else:
-                msg, wp = win32con.WM_LBUTTONUP, 0
             try:
-                win32api.PostMessage(self.game_hwnd, msg, wp, lparam)
+                if button == "right":
+                    message, wparam = win32con.WM_RBUTTONUP, 0
+                elif button == "middle":
+                    message, wparam = win32con.WM_MBUTTONUP, 0
+                elif button in ("x", "x1", "x2"):
+                    message = 0x020C
+                    wparam = (1 if button != "x2" else 2) << 16
+                else:
+                    message, wparam = win32con.WM_LBUTTONUP, 0
+                self._bg_post(self.game_hwnd, message, wparam, lparam)
             except Exception:
                 pass
 
-    def _point_belongs_to_game(self, x: int, y: int) -> bool:
-        """鼠标目标点最上层是不是游戏窗口（防止点到浏览器/桌面）。"""
+    def _send_mouse_relative(self, dx: int, dy: int) -> None:
+        if dx == 0 and dy == 0:
+            return
+        _send_mouse_input(_MOUSEEVENTF_MOVE, int(dx), int(dy))
+
+    def _keyboard_guard(self, prev_fg: int) -> None:
+        """键盘模式防抢夺：游戏若自己抢到前台且鼠标不在游戏内，切回用户窗口。"""
+        if not self.keyboard_only or not prev_fg:
+            return
         try:
-            under = int(win32gui.WindowFromPoint((int(x), int(y))) or 0)
-            if not under:
-                return False
-            root = int(win32gui.GetAncestor(under, win32con.GA_ROOT))
-            return root == int(self.game_hwnd)
+            if not win32gui.IsWindow(prev_fg):
+                return
+            if int(win32gui.GetForegroundWindow() or 0) != self.game_hwnd:
+                return
+            # 鼠标在游戏窗口内，可能是用户自己点进来的，不抢回去
+            x, y = win32api.GetCursorPos()
+            cx, cy = win32gui.ScreenToClient(self.game_hwnd, (x, y))
+            _l, _t, cw, ch = win32gui.GetClientRect(self.game_hwnd)
+            if 0 <= cx < int(cw) and 0 <= cy < int(ch):
+                return
+            bridge = _FOREGROUND_BRIDGE
+            if bridge is not None:
+                bridge.ensure(prev_fg, 0.3)
+            else:
+                _force_foreground_window(prev_fg)
+            self._debug(
+                f"GUARD restored foreground 0x{prev_fg:X} "
+                f"from game 0x{self.game_hwnd:X}"
+            )
         except Exception:
-            return False
+            pass
+
+    def _run_background(self) -> None:
+        """后台回放：只向游戏窗口 PostMessage，不移动真实鼠标/键盘。"""
+        error_msg = ""
+        pressed_keys: set[str] = set()
+        pressed_buttons: set[str] = set()
+        try:
+            if not self.events:
+                raise RuntimeError("没有录制内容。")
+            if not win32gui.IsWindow(self.game_hwnd):
+                raise RuntimeError("游戏窗口已关闭，回放已取消。")
+            prev_fg = 0
+            try:
+                prev_fg = int(win32gui.GetForegroundWindow() or 0)
+            except Exception:
+                pass
+            self._bg_prime()
+            self._log(
+                f"后台回放 hwnd=0x{self.game_hwnd:X} events={len(self.events)} "
+                f"keyboard_only={self.keyboard_only}（不抢鼠标键盘）"
+            )
+            self._debug(
+                f"START background hwnd=0x{self.game_hwnd:X} "
+                f"events={len(self.events)} speed={self.speed} "
+                f"keyboard_only={self.keyboard_only} meta={self.meta}"
+            )
+            map_event = self._make_event_mapper()
+            start = time.perf_counter()
+            for event in self.events:
+                if self._stop_event.is_set():
+                    break
+                target = max(0.0, float(event.get("t", 0.0))) / self.speed
+                last_guard = time.perf_counter()
+                while True:
+                    remaining = target - (time.perf_counter() - start)
+                    if remaining <= 0:
+                        break
+                    if self._stop_event.wait(min(max(remaining, 0.0), 0.005)):
+                        break
+                    if self.keyboard_only:
+                        now = time.perf_counter()
+                        if now - last_guard >= 0.25:
+                            self._keyboard_guard(prev_fg)
+                            self._bg_prime()
+                            last_guard = now
+                if self._stop_event.is_set():
+                    break
+
+                typ = str(event.get("type", ""))
+                actual = time.perf_counter() - start
+                self._event_debug(event, target, actual)
+                if typ in ("key_down", "key_up"):
+                    name = str(event.get("name", ""))
+                    if not name or _is_ignored_key_name(name):
+                        continue
+                    if typ == "key_down":
+                        self._bg_prime()
+                        if self._bg_key(name, True):
+                            pressed_keys.add(name)
+                    else:
+                        self._bg_key(name, False)
+                        pressed_keys.discard(name)
+                elif typ in ("move", "down", "up", "wheel"):
+                    if self.keyboard_only:
+                        continue
+                    self._bg_prime()
+                    self._bg_mouse(event, map_event)
+                    if typ == "down":
+                        pressed_buttons.add(
+                            str(event.get("button", "left")).lower()
+                        )
+                    elif typ == "up":
+                        pressed_buttons.discard(
+                            str(event.get("button", "left")).lower()
+                        )
+        except Exception as exc:
+            error_msg = f"{type(exc).__name__}: {exc}"
+            self._log(f"后台回放失败：{error_msg}")
+            self._debug(f"ERROR {error_msg}")
+        finally:
+            self._write_debug()
+            for key in list(pressed_keys):
+                try:
+                    self._bg_key(key, False)
+                except Exception:
+                    pass
+            self._bg_release_buttons(pressed_buttons)
+            if error_msg:
+                self.error.emit(self.stage, error_msg)
+            else:
+                self._log("后台回放完成")
+                self.done.emit(self.stage)
+
+    def _ensure_foreground(self) -> None:
+        bridge = _FOREGROUND_BRIDGE
+        if bridge is not None:
+            try:
+                if bridge.ensure(self.game_hwnd, 1.5) and _foreground_is_window(
+                    self.game_hwnd
+                ):
+                    return
+            except Exception:
+                pass
+        _force_foreground_window(self.game_hwnd)
+        for _ in range(20):
+            if _foreground_is_window(self.game_hwnd):
+                return
+            time.sleep(0.05)
+        raise RuntimeError(
+            "游戏窗口不在前台，回放已停止，避免按键发到其它窗口。"
+        )
 
     def run(self) -> None:
+        if self.background:
+            self._run_background()
+            return
         error_msg = ""
         prev_cursor = None
         prev_fg = 0
@@ -2338,51 +2315,47 @@ class MacroPlayer(QThread):
                 raise RuntimeError("没有录制内容。")
             if not win32gui.IsWindow(self.game_hwnd):
                 raise RuntimeError("游戏窗口已关闭，回放已取消。")
-            if mouse is None:
-                raise RuntimeError(
-                    f"缺少 mouse 库：{MOUSE_IMPORT_ERROR or '未安装'}"
-                )
             try:
                 prev_cursor = win32api.GetCursorPos()
                 prev_fg = int(win32gui.GetForegroundWindow() or 0)
             except Exception:
                 pass
 
-            if self.background:
-                self._bg_prime()
-                self._log(
-                    "后台回放模式：PostMessage，不抢真实鼠标键盘"
-                )
-            else:
-                if self.lock_user_input:
-                    try:
-                        from input_lock import InputLock
-
-                        self._input_lock = InputLock()
-                        if not self._input_lock.start(2.0):
-                            self._input_lock = None
-                            self._log(
-                                "输入锁启动失败，继续回放（可能被用户操作干扰）"
-                            )
-                        else:
-                            self._log("已锁定用户鼠标键盘，Ctrl+Alt+F8 可停止")
-                    except Exception as exc:
-                        self._input_lock = None
-                        self._log(f"输入锁不可用：{exc}")
-
-                _force_foreground_window(self.game_hwnd)
-                time.sleep(0.15)
-                if not _foreground_is_window(self.game_hwnd):
-                    raise RuntimeError("无法把游戏窗口切到前台，回放已取消。")
-
+            self._ensure_foreground()
+            time.sleep(0.15)
             map_event = self._make_event_mapper()
+            relative = bool(self.relative_mouse)
+            has_raw = any(
+                e.get("type") == "raw_move" for e in self.events
+            )
+            rel_last: Optional[tuple[int, int]] = None
+            if relative:
+                try:
+                    _l, _t, cur_w, cur_h = win32gui.GetClientRect(
+                        self.game_hwnd
+                    )
+                    cl, ct = win32gui.ClientToScreen(self.game_hwnd, (0, 0))
+                    meta = self.meta or {}
+                    c0 = meta.get("cursor0_norm")
+                    if isinstance(c0, (list, tuple)) and len(c0) == 2:
+                        rel_last = (
+                            int(round(float(cl) + float(c0[0]) * int(cur_w))),
+                            int(round(float(ct) + float(c0[1]) * int(cur_h))),
+                        )
+                except Exception:
+                    rel_last = None
             self._log(
                 f"开始回放 hwnd=0x{self.game_hwnd:X} events={len(self.events)} "
-                f"fg={self._fg_info()}"
+                f"relative={relative} fg={self._fg_info()}"
+            )
+            self._debug(
+                f"START foreground hwnd=0x{self.game_hwnd:X} "
+                f"events={len(self.events)} speed={self.speed} "
+                f"relative={relative} has_raw={has_raw} meta={self.meta}"
             )
 
-            if not self.background:
-                # 先无副作用地把光标放到录制起点，避免第一帧产生巨大的 raw input 位移
+            # 绝对坐标模式才预先把光标放到录制起点；相对模式从当前位置开始
+            if not relative:
                 for event in self.events:
                     if ("x" in event and "y" in event) or (
                         "nx" in event and "ny" in event
@@ -2403,54 +2376,18 @@ class MacroPlayer(QThread):
                     remaining = target - (time.perf_counter() - start)
                     if remaining <= 0:
                         break
-                    if self._stop_event.wait(min(max(remaining, 0.0), 0.02)):
+                    if self._stop_event.wait(min(max(remaining, 0.0), 0.005)):
                         break
                 if self._stop_event.is_set():
                     break
 
                 typ = str(event.get("type", ""))
-                if typ in ("down", "up", "key_down", "key_up", "wheel"):
-                    coord = ""
-                    if typ in ("down", "up", "wheel"):
-                        coord = (
-                            f" nx={event.get('nx')} ny={event.get('ny')}"
-                            f" x={event.get('x')} y={event.get('y')}"
-                        )
-                    self._log(
-                        f"事件 {typ} t={float(event.get('t', 0)):.2f} "
-                        f"key={event.get('name', '')} "
-                        f"button={event.get('button', '')}{coord} "
-                        f"fg={self._fg_info()}"
-                    )
-                if self.background:
-                    if typ in ("key_down", "key_up"):
-                        name = str(event.get("name", ""))
-                        if not name or _is_ignored_key_name(name):
-                            continue
-                        if typ == "key_down":
-                            self._bg_prime()
-                            if self._bg_key(name, True):
-                                pressed_keys.add(name)
-                        else:
-                            self._bg_key(name, False)
-                            pressed_keys.discard(name)
-                    elif typ in ("move", "down", "up", "wheel"):
-                        self._bg_prime()
-                        self._bg_mouse(event, map_event)
-                        if typ == "down":
-                            button = str(
-                                event.get("button", "left")
-                            ).lower()
-                            pressed_buttons.add(button)
-                        elif typ == "up":
-                            button = str(
-                                event.get("button", "left")
-                            ).lower()
-                            pressed_buttons.discard(button)
-                    continue
-
-                # 每个键鼠事件前确认游戏仍在前台，避免按键发到浏览器/其它窗口。
-                if typ in ("move", "down", "up", "wheel", "key_down", "key_up"):
+                actual = time.perf_counter() - start
+                self._event_debug(event, target, actual)
+                if typ in (
+                    "move", "raw_move", "down", "up", "wheel",
+                    "key_down", "key_up",
+                ):
                     if not win32gui.IsWindow(self.game_hwnd):
                         raise RuntimeError("游戏窗口已关闭，回放已停止。")
                     if not _foreground_is_window(self.game_hwnd):
@@ -2463,18 +2400,38 @@ class MacroPlayer(QThread):
                                 "检测到浏览器窗口，已停止回放，"
                                 "避免按键发到浏览器。"
                             )
-                        _force_foreground_window(self.game_hwnd)
-                        for _ in range(20):
-                            if _foreground_is_window(self.game_hwnd):
-                                break
-                            time.sleep(0.05)
-                        if not _foreground_is_window(self.game_hwnd):
-                            raise RuntimeError(
-                                "游戏窗口不在前台，已停止回放，"
-                                "避免按键发到其它窗口。"
-                            )
+                        self._ensure_foreground()
+
+                if typ == "raw_move":
+                    if not relative:
+                        continue
+                    dx = int(event.get("dx", 0))
+                    dy = int(event.get("dy", 0))
+                    self._debug(f"  -> raw dx={dx} dy={dy}")
+                    self._send_mouse_relative(dx, dy)
+                    continue
+
                 if typ == "move":
                     px, py = map_event(event)
+                    if relative and has_raw:
+                        # 有 Raw Input 位移时，镜头交给 raw_move；
+                        # 绝对 move 只用于旧的绝对模式，避免重复移动
+                        continue
+                    if relative:
+                        if rel_last is None:
+                            rel_last = (int(px), int(py))
+                            self._debug(
+                                f"  -> rel init px={px} py={py}"
+                            )
+                        else:
+                            dx = int(round(px - rel_last[0]))
+                            dy = int(round(py - rel_last[1]))
+                            self._debug(
+                                f"  -> rel dx={dx} dy={dy} px={px} py={py}"
+                            )
+                            self._send_mouse_relative(dx, dy)
+                            rel_last = (int(px), int(py))
+                        continue
                     if not self._point_belongs_to_game(px, py):
                         _force_foreground_window(self.game_hwnd)
                         time.sleep(0.1)
@@ -2483,6 +2440,7 @@ class MacroPlayer(QThread):
                             "鼠标目标点被其它窗口覆盖，已停止回放，"
                             "避免点到浏览器/桌面。"
                         )
+                    self._debug(f"  -> abs px={px} py={py}")
                     _send_mouse_move_to(px, py)
                 elif typ in ("down", "up"):
                     button = str(event.get("button", "left")).lower()
@@ -2495,7 +2453,11 @@ class MacroPlayer(QThread):
                             "鼠标目标点被其它窗口覆盖，已停止回放，"
                             "避免点到浏览器/桌面。"
                         )
+                    self._debug(
+                        f"  -> click {button} {typ} px={px} py={py}"
+                    )
                     _send_mouse_move_to(px, py)
+                    rel_last = (int(px), int(py))
                     _send_mouse_button(button, typ == "down")
                     if typ == "down":
                         pressed_buttons.add(button)
@@ -2511,76 +2473,165 @@ class MacroPlayer(QThread):
                             "鼠标目标点被其它窗口覆盖，已停止回放，"
                             "避免点到浏览器/桌面。"
                         )
+                    self._debug(f"  -> wheel px={px} py={py}")
                     _send_mouse_move_to(px, py)
+                    rel_last = (int(px), int(py))
                     _send_mouse_wheel(int(event.get("delta", 0)))
                 elif typ in ("key_down", "key_up"):
                     name = str(event.get("name", ""))
                     if not name or _is_ignored_key_name(name):
                         continue
+                    _send_key_name(name, typ == "key_down")
                     if typ == "key_down":
-                        if self.capture_friendly_keys:
-                            _send_key_name(name, True)
-                        else:
-                            keyboard.press(name)
                         pressed_keys.add(name)
                     else:
-                        if self.capture_friendly_keys:
-                            _send_key_name(name, False)
-                        else:
-                            keyboard.release(name)
                         pressed_keys.discard(name)
 
-            if self._stop_event.is_set():
-                # 停止时也视为正常结束，但不再继续后续阶段
-                pass
         except Exception as exc:
             error_msg = f"{type(exc).__name__}: {exc}"
             self._log(f"回放失败：{error_msg}")
+            self._debug(f"ERROR {error_msg}")
         finally:
-            if self.background:
-                for key in list(pressed_keys):
-                    try:
-                        self._bg_key(key, False)
-                    except Exception:
-                        pass
-                self._bg_release_buttons(pressed_buttons)
-            else:
-                # 释放所有仍按下的键/鼠标键，避免卡键
-                for key in list(pressed_keys):
-                    try:
-                        if self.capture_friendly_keys:
-                            _send_key_name(key, False)
-                        else:
-                            keyboard.release(key)
-                    except Exception:
-                        pass
-                for button in list(pressed_buttons):
-                    try:
-                        _send_mouse_button(button, False)
-                    except Exception:
-                        pass
+            for key in list(pressed_keys):
+                try:
+                    _send_key_name(key, False)
+                except Exception:
+                    pass
+            for button in list(pressed_buttons):
+                try:
+                    _send_mouse_button(button, False)
+                except Exception:
+                    pass
+            if not self._stop_event.is_set():
+                _restore_foreground_window(prev_fg, self.game_hwnd)
+            # 相对鼠标回放不要恢复光标：SetCursorPos 可能被游戏当成一次镜头转动
+            if prev_cursor is not None and not self.relative_mouse:
+                try:
+                    time.sleep(0.02)
+                    win32api.SetCursorPos(prev_cursor)
+                except Exception:
+                    pass
 
-                if self.restore_foreground:
-                    _restore_foreground_window(prev_fg, self.game_hwnd)
-                if self.restore_cursor and prev_cursor is not None:
-                    try:
-                        time.sleep(0.02)
-                        win32api.SetCursorPos(prev_cursor)
-                    except Exception:
-                        pass
-
-                if self._input_lock is not None:
-                    try:
-                        self._input_lock.stop()
-                    except Exception:
-                        pass
-                    self._input_lock = None
-
+            self._write_debug()
             if error_msg:
                 self.error.emit(self.stage, error_msg)
             else:
                 self._log("回放完成")
                 self.done.emit(self.stage)
+
+
+class BossWatcher(QThread):
+    """回放/战斗期间定时识别 BOSS 区域，判断 BOSS 是否已经死亡。"""
+
+    update = Signal(str)
+    gone = Signal(str)
+
+    def __init__(
+        self,
+        hwnd: int,
+        roi_norm: tuple[float, float, float, float],
+        detect_mode: str = "hp",
+        kill_hp: int = 0,
+        miss_limit: int = 2,
+        interval_seconds: float = 1.5,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.hwnd = int(hwnd)
+        self.roi_norm = roi_norm
+        self.detect_mode = detect_mode if detect_mode in ("hp", "text") else "hp"
+        self.kill_hp = max(0, int(kill_hp))
+        self.miss_limit = max(1, int(miss_limit))
+        self.interval = max(0.5, float(interval_seconds))
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _finish(self, reason: str) -> None:
+        if not self._stop_event.is_set():
+            self.gone.emit(reason)
+
+    def run(self) -> None:
+        if not win32gui.IsWindow(self.hwnd):
+            self._finish("游戏窗口已关闭")
+            return
+
+        misses = 0
+        while not self._stop_event.is_set():
+            if not win32gui.IsWindow(self.hwnd):
+                self._finish("游戏窗口已关闭")
+                return
+            if win32gui.IsIconic(self.hwnd):
+                self.update.emit("窗口已最小化，暂停BOSS识别")
+                misses = 0
+                if self._stop_event.wait(self.interval):
+                    break
+                continue
+            cap, err = capture_client_bgra(self.hwnd)
+            if cap is None:
+                misses += 1
+                self.update.emit(err or "BOSS 区域截图失败")
+                if misses >= self.miss_limit:
+                    self._finish(f"连续截图失败：{err or '未知原因'}")
+                    return
+            else:
+                w, h, data = cap
+                roi = roi_from_norm(self.roi_norm, w, h)
+                try:
+                    text = ocr_text_from_bgra(data, w, h, roi)
+                except Exception as exc:
+                    text = ""
+                    self.update.emit(
+                        f"BOSS 识别异常：{type(exc).__name__}: {exc}"
+                    )
+                if self.detect_mode == "hp":
+                    current, maximum = parse_hp_text(text)
+                    if current is None:
+                        misses += 1
+                        self.update.emit("未识别到 BOSS 血量")
+                        if misses >= self.miss_limit:
+                            self._finish(
+                                f"连续 {misses} 次未识别到 BOSS 血量"
+                            )
+                            return
+                    else:
+                        misses = 0
+                        if maximum is not None:
+                            self.update.emit(
+                                f"BOSS 血量 {current}/{maximum}"
+                            )
+                        else:
+                            self.update.emit(f"BOSS 血量 {current}")
+                        if current <= self.kill_hp:
+                            self._finish(
+                                f"BOSS 血量 {current} ≤ {self.kill_hp}"
+                            )
+                            return
+                else:
+                    compact = "".join(
+                        ch for ch in str(text) if ch.isalnum()
+                        or "\u4e00" <= ch <= "\u9fff"
+                    )
+                    if not compact:
+                        misses += 1
+                        self.update.emit("未识别到 BOSS 文字")
+                        if misses >= self.miss_limit:
+                            self._finish(
+                                f"连续 {misses} 次未识别到 BOSS"
+                            )
+                            return
+                    else:
+                        misses = 0
+                        self.update.emit(f"检测到：{text[:48]}")
+
+            if self._stop_event.wait(self.interval):
+                break
+
+
+# ---------------------------------------------------------------------------
+# 疲劳检测线程 / 提醒弹窗
+# ---------------------------------------------------------------------------
 
 
 class FatigueMonitor(QThread):
@@ -2602,6 +2653,7 @@ class FatigueMonitor(QThread):
         one_shot: bool = False,
         alert_below: Optional[float] = None,
         alert_above: Optional[float] = None,
+        background: bool = False,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
@@ -2609,6 +2661,7 @@ class FatigueMonitor(QThread):
         self.roi_norm = roi_norm
         self.alert_below = alert_below
         self.alert_above = alert_above
+        self.background = bool(background)
         self.interval = max(5.0, float(interval_seconds))
         self._one_shot = bool(one_shot)
         self._stop_event = threading.Event()
@@ -2649,6 +2702,9 @@ class FatigueMonitor(QThread):
         if self.roi_norm is None:
             self.result.emit(None, None, "尚未框选疲劳提示区域，请先点“框选区域”。")
             return
+        if self.background:
+            self._check_once_background()
+            return
 
         # 用户正在按鼠标时不要抢鼠标
         try:
@@ -2668,10 +2724,6 @@ class FatigueMonitor(QThread):
                 self.result.emit(None, None, "客户区尺寸无效，跳过疲劳检测。")
                 return
             roi = roi_from_norm(self.roi_norm, cw, ch)
-            roi_left, roi_top = win32gui.ClientToScreen(self.hwnd, (roi[0], roi[1]))
-            roi_right, roi_bottom = win32gui.ClientToScreen(
-                self.hwnd, (roi[0] + roi[2], roi[1] + roi[3])
-            )
         except Exception as exc:
             self.result.emit(None, None, f"疲劳区域无效：{type(exc).__name__}: {exc}")
             return
@@ -2686,7 +2738,6 @@ class FatigueMonitor(QThread):
         cap = None
         cap_err = ""
         anchor_pos = None
-        user_moved = False
         moved_to_anchor = False
         try:
             # 先把游戏切到前台，避免游戏被别的窗口挡住时点到别的窗口
@@ -2731,23 +2782,7 @@ class FatigueMonitor(QThread):
         except Exception as exc:
             cap_err = f"疲劳检测异常：{type(exc).__name__}: {exc}"
         finally:
-            if moved_to_anchor:
-                try:
-                    cur = win32api.GetCursorPos()
-                    # 游戏可能把鼠标轻微吸附到图标中心，所以用“是否还在框选区域附近”
-                    # 来判断用户是否自己接管了鼠标，而不是用几像素的误差。
-                    margin = 30
-                    user_moved = not (
-                        roi_left - margin <= cur[0] <= roi_right + margin
-                        and roi_top - margin <= cur[1] <= roi_bottom + margin
-                    )
-                except Exception:
-                    pass
-            else:
-                user_moved = False
-
             # 检测只有约 1 秒，结束后始终把前台窗口和鼠标还给用户。
-            # （游戏可能自己吸附/移动光标，所以不能因为光标偏离就放弃恢复。）
             _restore_foreground_window(prev_fg, self.hwnd)
             if moved_to_anchor and saved_pos is not None:
                 try:
@@ -2759,6 +2794,61 @@ class FatigueMonitor(QThread):
                 except Exception:
                     pass
 
+        self._process_capture(cap, cap_err)
+
+
+    def _bg_click(self, client_x: int, client_y: int) -> None:
+        """后台点击：只向游戏窗口 PostMessage，不移动真实鼠标。"""
+        try:
+            fg = int(win32gui.GetForegroundWindow() or 0)
+            if fg != self.hwnd:
+                _USER32.PostMessageW(self.hwnd, WM_ACTIVATEAPP, 1, 0)
+                _USER32.PostMessageW(self.hwnd, WM_NCACTIVATE, 1, 0)
+                _USER32.PostMessageW(self.hwnd, WM_ACTIVATE, WA_ACTIVE, fg)
+                _USER32.PostMessageW(self.hwnd, WM_SETFOCUS, fg, 0)
+            lparam = (client_x & 0xFFFF) | ((client_y & 0xFFFF) << 16)
+            _USER32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, lparam)
+            _USER32.PostMessageW(
+                self.hwnd,
+                win32con.WM_LBUTTONDOWN,
+                win32con.MK_LBUTTON,
+                lparam,
+            )
+            _USER32.PostMessageW(
+                self.hwnd, win32con.WM_LBUTTONUP, 0, lparam
+            )
+        except Exception:
+            pass
+
+    def _check_once_background(self) -> None:
+        if self.roi_norm is None:
+            return
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            cw, ch = int(right - left), int(bottom - top)
+            if cw <= 0 or ch <= 0:
+                self.result.emit(
+                    None, None, "客户区尺寸无效，跳过疲劳检测。"
+                )
+                return
+            roi = roi_from_norm(self.roi_norm, cw, ch)
+        except Exception as exc:
+            self.result.emit(
+                None,
+                None,
+                f"疲劳区域无效：{type(exc).__name__}: {exc}",
+            )
+            return
+
+        client_x = max(1, min(cw - 2, roi[0] + roi[2] // 2))
+        client_y = max(1, min(ch - 2, roi[1] + roi[3] // 2))
+        self._bg_click(client_x, client_y)
+        if self._stop_event.wait(1.0):
+            return
+        cap, cap_err = capture_client_bgra(self.hwnd)
+        self._process_capture(cap, cap_err)
+
+    def _process_capture(self, cap, cap_err: str) -> None:
         if self._stop_event.is_set():
             return
         if cap is None:
@@ -2795,6 +2885,100 @@ class FatigueMonitor(QThread):
             if now - self._last_alert_at >= 60.0:
                 self._last_alert_at = now
                 self.alert.emit(alert_message)
+
+
+class HpMonitor(QThread):
+    """定时截取血量区域并 OCR。"""
+
+    result = Signal(object, object, str)  # current, maximum, message
+
+    def __init__(
+        self,
+        hwnd: int,
+        roi_norm: tuple[float, float, float, float],
+        interval_seconds: float = 1.0,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.hwnd = int(hwnd)
+        self.roi_norm = roi_norm
+        self.interval = max(0.5, float(interval_seconds))
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            if not win32gui.IsWindow(self.hwnd):
+                self.result.emit(None, None, "目标窗口已关闭。")
+                break
+            if win32gui.IsIconic(self.hwnd):
+                self.result.emit(None, None, "窗口已最小化")
+                if self._stop_event.wait(self.interval):
+                    break
+                continue
+            cap, err = capture_client_bgra(self.hwnd)
+            if cap is None:
+                self.result.emit(None, None, err or "血量截图失败。")
+            else:
+                w, h, data = cap
+                current, maximum, message = ocr_hp_from_bgra(
+                    data, w, h, self.roi_norm
+                )
+                self.result.emit(current, maximum, message)
+            if self._stop_event.wait(self.interval):
+                break
+
+
+class NameReader(QThread):
+    """一次性读取窗口角色名区域。"""
+
+    result = Signal(str, str)  # name, message
+
+    def __init__(
+        self,
+        hwnd: int,
+        roi_norm: tuple[float, float, float, float],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.hwnd = int(hwnd)
+        self.roi_norm = roi_norm
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        if self._stop_event.is_set():
+            return
+        if not win32gui.IsWindow(self.hwnd):
+            self.result.emit("", "游戏窗口已关闭")
+            return
+        if win32gui.IsIconic(self.hwnd):
+            self.result.emit("", "窗口已最小化")
+            return
+        cap, err = capture_client_bgra(self.hwnd)
+        if cap is None:
+            self.result.emit("", err or "角色名截图失败")
+            return
+        w, h, data = cap
+        roi = roi_from_norm(self.roi_norm, w, h)
+        try:
+            text = ocr_text_from_bgra(data, w, h, roi)
+        except Exception as exc:
+            self.result.emit(
+                "",
+                f"角色名识别异常：{type(exc).__name__}: {exc}",
+            )
+            return
+        name = " ".join(str(text or "").split())
+        name = name[:60]
+        if not name:
+            self.result.emit("", "未识别到角色名")
+            return
+        self.result.emit(name, "ok")
 
 
 class NoticePopup(QWidget):
@@ -3062,12 +3246,14 @@ class RegionSelectDialog(QDialog):
         layout.setSpacing(10)
 
         title = QLabel(title_text)
-        title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f1f3f4;")
+        title.setStyleSheet(
+            "font-size: 15px; font-weight: 700; color: #1b1c1f;"
+        )
         layout.addWidget(title)
 
         info = QLabel(info_text)
         info.setWordWrap(True)
-        info.setStyleSheet("color: #aeb4bd;")
+        info.setStyleSheet("color: #4b5563;")
         layout.addWidget(info)
 
         self.canvas = _RegionCanvas(image, initial_roi, self)
@@ -3075,7 +3261,7 @@ class RegionSelectDialog(QDialog):
         layout.addWidget(self.canvas, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.lbl_selection = QLabel("区域: 尚未框选")
-        self.lbl_selection.setStyleSheet("color: #8ab4f8;")
+        self.lbl_selection.setStyleSheet("color: #1a4f8b;")
         layout.addWidget(self.lbl_selection)
 
         buttons = QHBoxLayout()
@@ -3132,141 +3318,337 @@ class RegionSelectDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# 主窗口
+# 样式
 # ---------------------------------------------------------------------------
 
+APP_STYLE = """
+* {
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
+}
+QMainWindow, QWidget#central {
+    background: #1b1c1f;
+}
+QWidget {
+    color: #e4e6e9;
+    font-size: 13px;
+}
+QGroupBox {
+    background: #202226;
+    border: 1px solid #303338;
+    border-radius: 10px;
+    margin-top: 14px;
+    padding: 16px 14px 14px 14px;
+    font-weight: 600;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0 5px;
+    color: #8ab4f8;
+    background: #1b1c1f;
+}
+QLabel#appTitle {
+    font-size: 20px;
+    font-weight: 700;
+    color: #f1f3f4;
+}
+QLabel#subtitle {
+    color: #b8bcc2;
+    font-size: 12px;
+}
+QLabel#versionBadge {
+    background: #2a3b55;
+    color: #8ab4f8;
+    border-radius: 12px;
+    font-weight: 700;
+    font-size: 12px;
+}
+QComboBox, QSpinBox, QTimeEdit, QLineEdit {
+    background: #282b30;
+    border: 1px solid #3d4148;
+    border-radius: 6px;
+    padding: 5px 8px;
+    min-height: 24px;
+    selection-background-color: #34527d;
+}
+QComboBox:hover, QSpinBox:hover, QTimeEdit:hover, QLineEdit:hover {
+    border-color: #5c626b;
+}
+QComboBox:focus, QSpinBox:focus, QTimeEdit:focus, QLineEdit:focus {
+    border-color: #8ab4f8;
+}
+QComboBox QAbstractItemView {
+    background: #282b30;
+    border: 1px solid #3d4148;
+    selection-background-color: #34527d;
+    outline: none;
+}
+QPushButton {
+    background: #33373d;
+    border: 1px solid #454a52;
+    border-radius: 6px;
+    padding: 6px 16px;
+    min-height: 26px;
+}
+QPushButton:hover {
+    background: #3e434a;
+}
+QPushButton:pressed {
+    background: #2a2e34;
+}
+QPushButton:disabled {
+    color: #6b717a;
+    background: #26292d;
+    border-color: #33373c;
+}
+QCheckBox {
+    spacing: 8px;
+    color: #dfe2e6;
+    font-weight: 600;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #5a6069;
+    border-radius: 4px;
+    background: #282b30;
+}
+QCheckBox::indicator:hover {
+    border-color: #8ab4f8;
+}
+QCheckBox::indicator:checked {
+    border-color: #8ab4f8;
+    background: #34527d;
+}
+QLabel#boundLabel {
+    border: 1px solid #33373c;
+    border-radius: 6px;
+    padding: 7px 10px;
+    color: #9aa0a8;
+    background: #1d1f22;
+}
+QLabel#boundLabel[state="ok"] {
+    color: #3ddc84;
+    border-color: #2f6b4a;
+    background: #17241d;
+}
+QLabel#boundLabel[state="error"] {
+    color: #ff6b6b;
+    border-color: #5c2b2b;
+    background: #241818;
+}
+QLabel#actionText {
+    color: #d7dbe0;
+    background: #26292e;
+    border-left: 3px solid #8ab4f8;
+    border-radius: 4px;
+    padding: 8px 10px;
+}
+QLabel#muted {
+    color: #b8bcc2;
+}
+QLabel#hint {
+    color: #a8aeb6;
+    font-size: 12px;
+    padding: 2px 2px 6px 2px;
+}
+QToolTip {
+    background: #2a2e34;
+    color: #f1f3f4;
+    border: 1px solid #5c626b;
+    padding: 5px 7px;
+}
+QStatusBar {
+    background: #161719;
+    border-top: 1px solid #2d3035;
+}
+QStatusBar::item {
+    border: none;
+}
+QLabel#statusLabel {
+    color: #aeb4bd;
+    padding: 3px 2px;
+}
+QLabel#roundsLabel {
+    color: #8ab4f8;
+    font-weight: 700;
+    padding: 3px 10px;
+    background: #1f2733;
+    border-radius: 8px;
+}
+QScrollArea {
+    border: none;
+    background: #1b1c1f;
+}
+QScrollArea > QWidget#qt_scrollarea_viewport {
+    background: #1b1c1f;
+}
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+QScrollBar:vertical,
+QScrollBar:horizontal {
+    background: #161719;
+    border: none;
+    margin: 0;
+}
+QScrollBar:vertical { width: 11px; }
+QScrollBar:horizontal { height: 11px; }
+QScrollBar::handle:vertical,
+QScrollBar::handle:horizontal {
+    background: #3d4148;
+    border-radius: 5px;
+    min-height: 24px;
+    min-width: 24px;
+}
+QScrollBar::handle:vertical:hover,
+QScrollBar::handle:horizontal:hover {
+    background: #5c626b;
+}
+QScrollBar::add-line,
+QScrollBar::sub-line,
+QScrollBar::add-page,
+QScrollBar::sub-page {
+    background: transparent;
+    border: none;
+    width: 0;
+    height: 0;
+}
+QMenu {
+    background: #23262b;
+    border: 1px solid #3a3e45;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 6px 24px 6px 12px;
+    border-radius: 4px;
+}
+QMenu::item:selected {
+    background: #34527d;
+}
+QMenu::item:disabled {
+    color: #6b717a;
+}
 
-class ComboEditDialog(QDialog):
-    """新建 / 编辑“路径 + 副本录制”组合。"""
+/* ---- 框选区域对话框使用浅色主题 ---- */
+QDialog {
+    background: #f4f5f7;
+}
+QDialog QLabel,
+QDialog QCheckBox,
+QDialog QRadioButton {
+    color: #1b1c1f;
+}
+QDialog QLabel#muted {
+    color: #4b5563;
+}
+QDialog QLabel#hint {
+    color: #4b5563;
+}
+QDialog QGroupBox {
+    background: #ffffff;
+    border: 1px solid #d0d4da;
+}
+QDialog QGroupBox::title {
+    color: #1a4f8b;
+    background: #f4f5f7;
+}
+QDialog QLineEdit,
+QDialog QComboBox,
+QDialog QSpinBox,
+QDialog QTimeEdit {
+    background: #ffffff;
+    color: #1b1c1f;
+    border: 1px solid #c3c8cf;
+    selection-background-color: #bcd2f2;
+    selection-color: #101318;
+}
+QDialog QLineEdit:focus,
+QDialog QComboBox:focus,
+QDialog QSpinBox:focus,
+QDialog QTimeEdit:focus {
+    border-color: #3b82f6;
+}
+QDialog QComboBox QAbstractItemView {
+    background: #ffffff;
+    color: #1b1c1f;
+    selection-background-color: #bcd2f2;
+    selection-color: #101318;
+}
+QDialog QPushButton {
+    background: #e9ebef;
+    color: #1b1c1f;
+    border: 1px solid #c3c8cf;
+}
+QDialog QPushButton:hover {
+    background: #dfe2e8;
+}
+QDialog QPushButton:pressed {
+    background: #d3d7de;
+}
+QDialog QPushButton:disabled {
+    color: #9aa0a8;
+    background: #f0f1f3;
+    border-color: #d8dce2;
+}
+QDialog QCheckBox::indicator {
+    background: #ffffff;
+    border: 1px solid #9aa0a8;
+}
+QDialog QCheckBox::indicator:checked {
+    background: #3b82f6;
+    border-color: #3b82f6;
+}
+QDialog QScrollArea {
+    background: transparent;
+}
+"""
 
-    def __init__(
-        self,
-        paths: list[dict],
-        records: list[dict],
-        combo: Optional[dict] = None,
-        parent: Optional[QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("组合挂机设置")
-        self.resize(620, 340)
-        self._paths = [p for p in paths if isinstance(p, dict)]
-        self._records = [r for r in records if isinstance(r, dict)]
-        self._original = dict(combo) if isinstance(combo, dict) else None
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
-        form = QFormLayout()
-
-        self.edit_name = QLineEdit()
-        self.edit_name.setPlaceholderText("例如：打BOSS循环")
-        form.addRow("组合名称", self.edit_name)
-
-        self.combo_path = QComboBox()
-        self.combo_path.addItem("（不使用路径）", "")
-        for path in self._paths:
-            self.combo_path.addItem(str(path.get("name", "未命名")), str(path.get("name", "")))
-        form.addRow("路径", self.combo_path)
-
-        self.combo_record = QComboBox()
-        self.combo_record.addItem("（不使用录制）", "")
-        for record in self._records:
-            self.combo_record.addItem(
-                str(record.get("name", "未命名")), str(record.get("name", ""))
-            )
-        form.addRow("副本录制", self.combo_record)
-
-        self.spin_repeat = QSpinBox()
-        self.spin_repeat.setRange(0, 9999)
-        self.spin_repeat.setValue(1)
-        self.spin_repeat.setSpecialValueText("无限循环")
-        self.spin_repeat.setSuffix(" 次")
-        form.addRow("重复次数", self.spin_repeat)
-
-        self.spin_interval = QSpinBox()
-        self.spin_interval.setRange(0, 600)
-        self.spin_interval.setValue(3)
-        self.spin_interval.setSuffix(" 秒")
-        form.addRow("每轮间隔", self.spin_interval)
-
-        self.spin_speed = QSpinBox()
-        self.spin_speed.setRange(50, 200)
-        self.spin_speed.setSingleStep(10)
-        self.spin_speed.setValue(100)
-        self.spin_speed.setSuffix(" %")
-        form.addRow("录制回放速度", self.spin_speed)
-        root.addLayout(form)
-
-        hint = QLabel(
-            "每轮：先执行选中路径（走到副本入口），再回放副本录制。"
-            "路径或录制可以只选一个。重复次数 0 = 无限循环。"
-        )
-        hint.setWordWrap(True)
-        hint.setObjectName("muted")
-        root.addWidget(hint)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.btn_cancel = QPushButton("取消")
-        self.btn_save = QPushButton("保存")
-        self.btn_cancel.clicked.connect(self.reject)
-        self.btn_save.clicked.connect(self._on_save)
-        buttons.addWidget(self.btn_cancel)
-        buttons.addWidget(self.btn_save)
-        root.addLayout(buttons)
-
-        if self._original is not None:
-            self.edit_name.setText(str(self._original.get("name", "")))
-            self._select_text(self.combo_path, str(self._original.get("path", "")))
-            self._select_text(
-                self.combo_record, str(self._original.get("record", ""))
-            )
-            try:
-                self.spin_repeat.setValue(int(self._original.get("repeat", 1)))
-            except (TypeError, ValueError):
-                self.spin_repeat.setValue(1)
-            try:
-                self.spin_interval.setValue(
-                    int(float(self._original.get("interval", 3)))
-                )
-            except (TypeError, ValueError):
-                self.spin_interval.setValue(3)
-            try:
-                self.spin_speed.setValue(
-                    int(round(float(self._original.get("speed", 1.0)) * 100))
-                )
-            except (TypeError, ValueError):
-                self.spin_speed.setValue(100)
-
-    @staticmethod
-    def _select_text(combo: QComboBox, text: str) -> None:
-        idx = combo.findData(text)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-
-    def _on_save(self) -> None:
-        name = self.edit_name.text().strip()
-        if not name:
-            QMessageBox.warning(self, "缺少名称", "请填写组合名称。")
-            return
-        if not self.combo_path.currentData() and not self.combo_record.currentData():
-            QMessageBox.warning(
-                self, "没有动作", "路径和副本录制至少要选一个。"
-            )
-            return
-        self.accept()
-
-    def combo_data(self) -> dict:
-        return {
-            "name": self.edit_name.text().strip(),
-            "path": str(self.combo_path.currentData() or ""),
-            "record": str(self.combo_record.currentData() or ""),
-            "repeat": int(self.spin_repeat.value()),
-            "interval": float(self.spin_interval.value()),
-            "speed": max(
-                0.5, min(2.0, float(self.spin_speed.value()) / 100.0)
-            ),
+START_BUTTON_STYLES = {
+    "idle": """
+        QPushButton#startButton {
+            background: #c0392b;
+            color: #ffffff;
+            border: 1px solid #d14a3b;
+            border-radius: 8px;
+            padding: 11px 16px;
+            font-size: 15px;
+            font-weight: 700;
         }
+        QPushButton#startButton:hover { background: #d34a3a; }
+        QPushButton#startButton:pressed { background: #a93226; }
+    """,
+    "running": """
+        QPushButton#startButton {
+            background: #8e2b20;
+            color: #ffffff;
+            border: 1px solid #a9382c;
+            border-radius: 8px;
+            padding: 11px 16px;
+            font-size: 15px;
+            font-weight: 700;
+        }
+        QPushButton#startButton:hover { background: #a3352a; }
+        QPushButton#startButton:pressed { background: #77231a; }
+    """,
+    "stopping": """
+        QPushButton#startButton {
+            background: #4a2b28;
+            color: #b9a6a3;
+            border: 1px solid #5b3531;
+            border-radius: 8px;
+            padding: 11px 16px;
+            font-size: 15px;
+            font-weight: 700;
+        }
+    """,
+}
+
+
+# ---------------------------------------------------------------------------
+# 主窗口
+# ---------------------------------------------------------------------------
 
 
 class MainWindow(QMainWindow):
@@ -3298,10 +3680,14 @@ class MainWindow(QMainWindow):
 
         self._fatigue_monitor: Optional[FatigueMonitor] = None
         self._test_monitor: Optional[FatigueMonitor] = None
+        self._single_hp_monitor: Optional[HpMonitor] = None
         self._fatigue_roi_norm: Optional[tuple[float, float, float, float]] = (
             load_fatigue_roi_norm()
         )
         self._settings = QSettings("CreatureCurios", "CreatureCuriosKeyer")
+        global _FOREGROUND_BRIDGE
+        self._foreground_bridge = ForegroundBridge(self)
+        _FOREGROUND_BRIDGE = self._foreground_bridge
         try:
             threshold = int(
                 self._settings.value(
@@ -3314,59 +3700,69 @@ class MainWindow(QMainWindow):
         self._timer_next_mono: Optional[float] = None
         self._timer_next_dt: Optional[datetime.datetime] = None
 
-        # BOOS 挂机：地图按键 / 路线编辑 / 地图寻路 / 路径执行 / 副本整段录制
-        self._macro_cfg = load_macro_config()
-        self._route_editor = None
-        self._map_runner = None
-        self._path_runner = None
-        self._dungeon_records = load_records()
-        self._dungeon_recorder: Optional[MacroRecorder] = None
-        self._dungeon_player: Optional[MacroPlayer] = None
-        self._dungeon_recording_pending = False
-        self._dungeon_running = False
-        self._dungeon_done_count = 0
-        self._dungeon_total = 1
-        self._dungeon_speed = 1.0
-        self._dungeon_interval = 0.0
-        self._dungeon_pending_timer: Optional[QTimer] = None
-        self._combos = load_combos()
-        self._combo_running = False
-        self._combo_total = 1
-        self._combo_done_count = 0
-        self._combo_name = ""
-        self._combo_cfg: dict = {}
-        self._combo_path_runner = None
-        self._combo_player: Optional[MacroPlayer] = None
-        self._combo_pending_timer: Optional[QTimer] = None
-        self._fatigue_loop_running = False
-        self._fatigue_loop_state = "idle"
-        self._fatigue_loop_cfg: dict = {}
-        self._fatigue_loop_worker: Optional[KeySender] = None
-        self._fatigue_loop_monitor: Optional[FatigueMonitor] = None
-        self._fatigue_loop_path_runner = None
-        self._fatigue_loop_path_kind = ""
-        self._fatigue_loop_player: Optional[MacroPlayer] = None
-        self._fatigue_loop_timer: Optional[QTimer] = None
-        self._fatigue_loop_rounds = 0
-        self._fl_map_open = False
+        # ---- 自动打BOSS ----
+        self._boss_records = load_boss_records()
+        self._boss_recorder: Optional[MacroRecorder] = None
+        self._boss_record_pending = False
+        self._boss_player: Optional[MacroPlayer] = None
+        self._boss_fighter: Optional[KeySender] = None
+        self._boss_watcher: Optional[BossWatcher] = None
+        self._boss_looter: Optional[TapSender] = None
+        self._boss_running = False
+        self._boss_preview = False
+        self._boss_preview_resume = False
+        self._boss_kind = "replay"
+        self._boss_done = 0
+        self._boss_total = 1
+        self._boss_interval = 0.0
+        self._boss_resume_farm = False
+        self._boss_origin = "manual"
+        self._boss_stage = ""
+        self._boss_detect_roi_norm: Optional[
+            tuple[float, float, float, float]
+        ] = None
+        self._boss_last_error = ""
+        self._boss_loading = False
+
+        # ---- 多开 / 血量 / 角色名 ----
+        self._heal_records = load_heal_records()
+        self._hp_roi_norm: Optional[tuple[float, float, float, float]] = None
+        self._name_roi_norm: Optional[tuple[float, float, float, float]] = None
+        self._heal_recorder: Optional[MacroRecorder] = None
+        self._heal_record_pending = False
+        self._heal_record_index: Optional[int] = None
+        self._heal_test_player: Optional[MacroPlayer] = None
+        self._heal_test_index: Optional[int] = None
+        self._name_readers: list[Optional[NameReader]] = [None, None, None, None]
         self._multi_runners: list[Optional[SlotRunner]] = [None, None, None, None]
         self._multi_state_text = "未运行"
+        self._multi_loading = False
+        self._multi_saved_hwnds: list[Optional[int]] = [None, None, None, None]
+
+        self._boss_gap_timer = QTimer(self)
+        self._boss_gap_timer.setSingleShot(True)
+        self._boss_gap_timer.timeout.connect(self._boss_run_iteration)
+        self._boss_fight_timer = QTimer(self)
+        self._boss_fight_timer.setSingleShot(True)
+        self._boss_fight_timer.timeout.connect(self._boss_detect_on_timeout)
+        self._boss_trigger_timer = QTimer(self)
+        self._boss_trigger_timer.setSingleShot(True)
+        self._boss_trigger_timer.timeout.connect(self._on_boss_timer_fire)
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(self._make_icon())
-        self.setMinimumSize(860, 750)
-        self.resize(920, 800)
+        self.setMinimumSize(820, 700)
+        self.resize(880, 760)
 
         self._build_ui()
+        self._refresh_boss_records()
+        self._load_boss_settings()
+        self._refresh_multi_records()
+        self._load_multi_settings()
         self._refresh_fatigue_roi_label()
         self._refresh_threshold_labels()
-        self._refresh_map_profiles()
-        self._refresh_paths()
-        self._refresh_dungeon_records()
-        self._refresh_combos()
-        self._refresh_fatigue_loop_options()
-        self._refresh_multi_records()
-        self._refresh_multi_windows()
+        self._update_boss_controls()
+        self._schedule_boss_timer()
         self._popup = NoticePopup()
         self._setup_tray()
         self._install_hotkey()
@@ -3404,25 +3800,23 @@ class MainWindow(QMainWindow):
         title_col.setSpacing(1)
         title = QLabel("CreatureCurios 后台按键器")
         title.setObjectName("appTitle")
-        subtitle = QLabel("后台 PostMessage 投递 · 不抢焦点 · 全局热键控制")
+        subtitle = QLabel("单开/多开挂机 · 自动打BOSS · 角色名识别 · 后台 PostMessage")
         subtitle.setObjectName("subtitle")
         title_col.addWidget(title)
         title_col.addWidget(subtitle)
         header.addLayout(title_col)
         header.addStretch(1)
 
-        badge = QLabel("v2")
+        badge = QLabel("v3.6")
         badge.setObjectName("versionBadge")
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setFixedSize(38, 24)
+        badge.setFixedSize(48, 24)
         header.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
         root.addLayout(header)
 
-        self.tabs = QTabWidget()
-        self.tabs.setObjectName("mainTabs")
-        self.tab_basic_container = QWidget()
-        basic_root = QVBoxLayout(self.tab_basic_container)
+        container = QWidget()
+        basic_root = QVBoxLayout(container)
         basic_root.setContentsMargins(12, 12, 12, 12)
         basic_root.setSpacing(10)
 
@@ -3635,28 +4029,102 @@ class MainWindow(QMainWindow):
         aux.addWidget(self.chk_timer, 4, 0)
         aux.addWidget(timer_wrap, 4, 1, 1, 3)
 
+        self.chk_background_mode = QCheckBox("后台模式（不抢鼠标键盘）")
+        self.chk_background_mode.setChecked(True)
+        self.chk_background_mode.setToolTip(
+            "疲劳检测、BOSS/导航/返回回放都改用 PostMessage 发送，"
+            "不移动真实鼠标、不抢前台，可以边挂机边用电脑。"
+            "部分游戏不处理后鼠标消息，建议先“试放一次”验证；"
+            "无效时取消勾选，会恢复前台真实鼠标键盘回放。"
+        )
+        self.chk_background_mode.toggled.connect(
+            self._on_background_mode_toggled
+        )
+        aux.addWidget(self.chk_background_mode, 5, 0, 1, 2)
+
+        self.chk_relative_mouse = QCheckBox("前台相对鼠标（会抢鼠标）")
+        self.chk_relative_mouse.setChecked(False)
+        self.chk_relative_mouse.setToolTip(
+            "镜头更准，但会移动真实鼠标并占用前台，无法边用电脑边挂机。"
+            "需要边学习边挂机请用后台模式；后台模式不抢鼠标，"
+            "但游戏可能不处理后鼠标消息。"
+        )
+        self.chk_relative_mouse.toggled.connect(
+            self._on_relative_mouse_toggled
+        )
+        aux.addWidget(self.chk_relative_mouse, 5, 2, 1, 2)
+
+        self.chk_keyboard_only = QCheckBox(
+            "静止鼠标 / 仅键盘（防抢）"
+        )
+        self.chk_keyboard_only.setChecked(False)
+        self.chk_keyboard_only.setToolTip(
+            "只回放键盘事件，完全跳过鼠标移动/点击，不移动真实鼠标、"
+            "不抢前台；游戏若自己抢到前台，会尝试把前台还给用户窗口。"
+            "适合不需要鼠标的录制；需要鼠标菜单/转镜头的录制请用其它模式。"
+        )
+        self.chk_keyboard_only.toggled.connect(
+            self._on_keyboard_only_toggled
+        )
+        aux.addWidget(self.chk_keyboard_only, 6, 0, 1, 4)
+
+        self.chk_single_hp_potion = QCheckBox(
+            "血量低于阈值自动吃药（Q+W）"
+        )
+        self.chk_single_hp_potion.setToolTip(
+            "启用后不再按固定间隔喝药；血量低于阈值时，"
+            "按「喝药间隔」持续发送 Q 和 W，直到血量高于阈值。"
+            "使用下方框选的血量区域。"
+        )
+        self.chk_single_hp_potion.toggled.connect(
+            self._on_single_hp_potion_toggled
+        )
+        aux.addWidget(self.chk_single_hp_potion, 7, 0, 1, 2)
+        aux.addWidget(QLabel("血量阈值"), 7, 2)
+        self.spin_single_hp_potion_threshold = QSpinBox()
+        self.spin_single_hp_potion_threshold.setRange(1, 100000)
+        self.spin_single_hp_potion_threshold.setValue(1600)
+        self.spin_single_hp_potion_threshold.setSingleStep(10)
+        self.spin_single_hp_potion_threshold.setSuffix(" 点")
+        self.spin_single_hp_potion_threshold.setFixedWidth(110)
+        self.spin_single_hp_potion_threshold.valueChanged.connect(
+            lambda _=0: self._save_boss_settings()
+        )
+        aux.addWidget(self.spin_single_hp_potion_threshold, 7, 3)
+
+        self.btn_single_hp_roi = QPushButton("框选血量区域")
+        self.btn_single_hp_roi.setFixedWidth(110)
+        self.btn_single_hp_roi.clicked.connect(self._select_hp_roi)
+        self.lbl_single_hp_roi = QLabel("未设置")
+        self.lbl_single_hp_roi.setObjectName("muted")
+        self.lbl_single_hp_value = QLabel("血量: --")
+        self.lbl_single_hp_value.setObjectName("muted")
+        aux.addWidget(self.btn_single_hp_roi, 8, 0)
+        aux.addWidget(self.lbl_single_hp_roi, 8, 1)
+        aux.addWidget(self.lbl_single_hp_value, 8, 2, 1, 2)
+
         aux_note = QLabel(
             "技能 / 喝药在“开始发送”后生效；疲劳检测会在你框选的区域短暂点击并读取提示；"
             "定时提醒独立生效，最小化到托盘也会弹窗。"
+            "游戏窗口最小化时只继续后台按键，疲劳检测会暂停。"
         )
         aux_note.setObjectName("muted")
         aux_note.setWordWrap(True)
-        aux.addWidget(aux_note, 5, 0, 1, 4)
+        aux.addWidget(aux_note, 9, 0, 1, 4)
 
         basic_root.addWidget(box_aux)
+        basic_root.addWidget(self._build_boss_group())
         basic_root.addStretch(1)
 
-        self.tab_basic = QScrollArea()
-        self.tab_basic.setWidgetResizable(True)
-        self.tab_basic.setFrameShape(QFrame.Shape.NoFrame)
-        self.tab_basic.setWidget(self.tab_basic_container)
-        self.tabs.addTab(self.tab_basic, "基础挂机")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(container)
 
-        self.tab_boss = self._build_boss_tab()
-        self.tabs.addTab(self.tab_boss, "BOOS挂机")
-
-        self.tab_multi = self._build_multi_tab()
-        self.tabs.addTab(self.tab_multi, "多开挂机")
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
+        self.tabs.addTab(scroll, "单开挂机")
+        self.tabs.addTab(self._build_multi_tab(), "多开挂机")
         root.addWidget(self.tabs, 1)
 
         self.hint_label = QLabel(
@@ -3677,338 +4145,1425 @@ class MainWindow(QMainWindow):
         status_bar.addPermanentWidget(self.rounds_label)
         self.setStatusBar(status_bar)
 
-    def _build_boss_tab(self) -> QWidget:
-        tab = QWidget()
-        root = QVBoxLayout(tab)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+    # -- 自动打BOSS：界面 ------------------------------------------------
+    def _build_boss_group(self) -> QWidget:
+        box = QGroupBox("4 · 自动打BOSS")
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
 
-        # ---- 地图按键 / 路线编辑 ----
-        box_setup = QGroupBox("1 · 地图按键 / 路线")
-        sg = QGridLayout(box_setup)
-        sg.setHorizontalSpacing(10)
-        sg.setVerticalSpacing(8)
-        sg.setColumnStretch(3, 1)
-
-        self.edit_map_key = QLineEdit(str(self._macro_cfg.get("map_key", "m")))
-        self.edit_map_key.setMaxLength(20)
-        self.edit_map_key.setFixedWidth(80)
-        self.edit_map_key.setToolTip("打开地图的按键名，例如 m / tab")
-        self.edit_map_key.editingFinished.connect(self._save_macro_settings)
-
-        self.edit_close_key = QLineEdit(
-            str(self._macro_cfg.get("close_map_key", "esc"))
+        self.chk_boss_fatigue = QCheckBox("疲劳低于阈值时自动打BOSS")
+        self.chk_boss_fatigue.setToolTip(
+            "需要先勾选基础页的“疲劳检测”。疲劳低于 -阈值 时，"
+            "暂停打怪并执行一次 / 一轮 BOSS 方案，完成后自动恢复打怪。"
         )
-        self.edit_close_key.setMaxLength(20)
-        self.edit_close_key.setFixedWidth(80)
-        self.edit_close_key.setToolTip("关闭地图的按键名，例如 esc / m")
-        self.edit_close_key.editingFinished.connect(self._save_macro_settings)
+        grid.addWidget(self.chk_boss_fatigue, 0, 0, 1, 2)
 
-        self.edit_mount_key = QLineEdit(str(self._macro_cfg.get("mount_key", "f")))
-        self.edit_mount_key.setMaxLength(20)
-        self.edit_mount_key.setFixedWidth(80)
-        self.edit_mount_key.setToolTip(
-            "执行路径前按这个键骑乘；留空表示不按。默认 f"
+        timer_wrap = QWidget()
+        timer_row = QHBoxLayout(timer_wrap)
+        timer_row.setContentsMargins(0, 0, 0, 0)
+        timer_row.setSpacing(8)
+        self.chk_boss_timer = QCheckBox("定时打BOSS")
+        self.spin_boss_timer = QSpinBox()
+        self.spin_boss_timer.setRange(1, 1440)
+        self.spin_boss_timer.setValue(60)
+        self.spin_boss_timer.setSuffix(" 分钟")
+        self.spin_boss_timer.setFixedWidth(110)
+        self.spin_boss_timer.setToolTip("每隔多少分钟执行一次 BOSS 方案")
+        self.chk_boss_timer.toggled.connect(self._on_boss_timer_toggled)
+        self.spin_boss_timer.valueChanged.connect(self._on_boss_timer_toggled)
+        timer_row.addWidget(self.chk_boss_timer)
+        timer_row.addWidget(self.spin_boss_timer)
+        timer_row.addStretch(1)
+        grid.addWidget(timer_wrap, 0, 2, 1, 2)
+
+        # 录制管理 / 整段录制
+        rec_wrap = QWidget()
+        rec_row = QHBoxLayout(rec_wrap)
+        rec_row.setContentsMargins(0, 0, 0, 0)
+        rec_row.setSpacing(8)
+        self.combo_boss_record = QComboBox()
+        self.combo_boss_record.setMinimumWidth(240)
+        self.combo_boss_record.setToolTip(
+            "整段录制回放使用这里选中的录制；也可以试放 / 删除"
         )
-        self.edit_mount_key.editingFinished.connect(self._save_macro_settings)
-
-        self.btn_route_editor = QPushButton("录制 / 管理打怪路线（窗口相对坐标）")
-        self.btn_route_editor.setMinimumHeight(32)
-        self.btn_route_editor.setToolTip(
-            "在同一个 exe 里打开路线编辑器：记录地图入口、路径点、等待和说明。"
-            "所有坐标以游戏窗口客户区左上角为基准。"
+        self.btn_boss_record = QPushButton("录制新脚本")
+        self.btn_boss_record.setToolTip(
+            "3 秒内切到游戏，完整录制一遍打BOSS流程，"
+            "切回本窗口再点一次停止并保存"
         )
-        self.btn_route_editor.clicked.connect(self._open_route_editor)
+        self.btn_boss_record.clicked.connect(self._toggle_boss_record)
+        self.btn_boss_test = QPushButton("试放")
+        self.btn_boss_test.clicked.connect(self._test_boss_record)
+        self.btn_boss_delete = QPushButton("删除")
+        self.btn_boss_delete.clicked.connect(self._delete_boss_record)
+        rec_row.addWidget(self.combo_boss_record, 1)
+        rec_row.addWidget(self.btn_boss_record)
+        rec_row.addWidget(self.btn_boss_test)
+        rec_row.addWidget(self.btn_boss_delete)
+        grid.addWidget(QLabel("录制"), 1, 0)
+        grid.addWidget(rec_wrap, 1, 1, 1, 3)
 
-        sg.addWidget(QLabel("地图键"), 0, 0)
-        sg.addWidget(self.edit_map_key, 0, 1)
-        sg.addWidget(QLabel("关闭键"), 0, 2)
-        sg.addWidget(self.edit_close_key, 0, 3)
-        sg.addWidget(QLabel("骑乘键"), 1, 0)
-        sg.addWidget(self.edit_mount_key, 1, 1)
-        sg.addWidget(self.btn_route_editor, 2, 0, 1, 4)
-        setup_hint = QLabel(
-            "地图键 / 关闭键用于下面的地图寻路与路径执行；骑乘键在每次执行路径前按一次；"
-            "路线编辑器只记录窗口相对坐标，不发送任何输入。"
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+        mode_row.addWidget(QLabel("打BOSS方式"))
+        self.combo_boss_mode = QComboBox()
+        self.combo_boss_mode.addItem("整段录制回放", "replay")
+        self.combo_boss_mode.addItem("识别战斗（导航+自动打+返回）", "detect")
+        self.combo_boss_mode.setMinimumWidth(240)
+        self.combo_boss_mode.currentIndexChanged.connect(
+            self._on_boss_mode_changed
         )
-        setup_hint.setObjectName("muted")
-        setup_hint.setWordWrap(True)
-        sg.addWidget(setup_hint, 3, 0, 1, 4)
-        root.addWidget(box_setup)
-
-        # ---- 地图标注寻路（人工坐标） ----
-        box_map = QGroupBox("2 · 地图标注寻路（人工坐标）")
-        mg = QGridLayout(box_map)
-        mg.setHorizontalSpacing(8)
-        mg.setVerticalSpacing(8)
-        mg.setColumnStretch(1, 1)
-        mg.addWidget(QLabel("地图"), 0, 0)
-        self.combo_map_profile = QComboBox()
-        self.combo_map_profile.setMinimumWidth(260)
-        mg.addWidget(self.combo_map_profile, 0, 1, 1, 2)
-        mg.addWidget(QLabel("目标"), 0, 3)
-        self.combo_map_target = QComboBox()
-        self.combo_map_target.setMinimumWidth(220)
-        mg.addWidget(self.combo_map_target, 0, 4, 1, 2)
-        mg.addWidget(QLabel("寻路等待"), 1, 0)
-        self.spin_map_travel_wait = QSpinBox()
-        self.spin_map_travel_wait.setRange(3, 180)
-        self.spin_map_travel_wait.setValue(20)
-        self.spin_map_travel_wait.setSuffix(" 秒")
-        self.spin_map_travel_wait.setFixedWidth(100)
-        self.spin_map_travel_wait.setToolTip("点击地图标注并关闭地图后，等待自动寻路的时间")
-        mg.addWidget(self.spin_map_travel_wait, 1, 1)
-        self.btn_map_learn = QPushButton("标注 / 编辑地图（人工）")
-        self.btn_map_learn.setToolTip(
-            "先打开游戏地图，再点这里截图；人工标定地图范围并点选打怪/BOSS坐标，可载入旧地图修改"
+        mode_row.addWidget(self.combo_boss_mode)
+        mode_row.addWidget(
+            QLabel("整段回放：录一遍完整流程；识别战斗：录导航/返回，战斗自动识别"),
+            1,
         )
-        self.btn_map_learn.clicked.connect(self._open_map_learner)
-        mg.addWidget(self.btn_map_learn, 1, 2)
-        self.btn_map_test = QPushButton("测试前往目标")
-        self.btn_map_test.setToolTip("按 M 打开地图 → OCR 找目标文字 → 点击 → Esc → 等待自动寻路")
-        self.btn_map_test.clicked.connect(self._toggle_map_test)
-        mg.addWidget(self.btn_map_test, 1, 3)
-        self.lbl_map_state = QLabel("未运行")
-        self.lbl_map_state.setObjectName("muted")
-        mg.addWidget(self.lbl_map_state, 1, 4, 1, 2)
-        map_note = QLabel(
-            "流程：打开地图 → 点“标注/编辑地图（人工）” → 标定地图零点/范围 → "
-            "手动点选打怪点/BOSS点 → 保存。可载入已保存地图修改后重新保存。"
-            "运行时不依赖 OCR，直接用窗口坐标 + 地图内坐标点击。"
+        grid.addLayout(mode_row, 2, 0, 1, 4)
+
+        # ---- 整段录制回放 ----
+        self._boss_replay_panel = QWidget()
+        rp = QGridLayout(self._boss_replay_panel)
+        rp.setContentsMargins(0, 0, 0, 0)
+        rp.setHorizontalSpacing(10)
+        rp.setVerticalSpacing(8)
+        rp.setColumnStretch(1, 1)
+        rp.addWidget(QLabel("回放速度"), 0, 0)
+        self.spin_boss_speed = QSpinBox()
+        self.spin_boss_speed.setRange(50, 200)
+        self.spin_boss_speed.setSingleStep(10)
+        self.spin_boss_speed.setValue(100)
+        self.spin_boss_speed.setSuffix(" %")
+        self.spin_boss_speed.setFixedWidth(100)
+        rp.addWidget(self.spin_boss_speed, 0, 1)
+        rp.addWidget(QLabel("重复"), 0, 2)
+        self.spin_boss_repeat = QSpinBox()
+        self.spin_boss_repeat.setRange(0, 9999)
+        self.spin_boss_repeat.setValue(1)
+        self.spin_boss_repeat.setSuffix(" 次")
+        self.spin_boss_repeat.setFixedWidth(100)
+        self.spin_boss_repeat.setToolTip("0 = 无限循环")
+        rp.addWidget(self.spin_boss_repeat, 0, 3)
+        rp.addWidget(QLabel("每轮间隔"), 0, 4)
+        self.spin_boss_gap = QSpinBox()
+        self.spin_boss_gap.setRange(0, 3600)
+        self.spin_boss_gap.setValue(5)
+        self.spin_boss_gap.setSuffix(" 秒")
+        self.spin_boss_gap.setFixedWidth(100)
+        rp.addWidget(self.spin_boss_gap, 0, 5)
+        rp.addWidget(
+            QLabel(
+                "回放会切到游戏前台并接管鼠标键盘；"
+                "按 Ctrl+Alt+F8 或“停止BOSS”可随时停止"
+            ),
+            1, 0, 1, 6,
         )
-        map_note.setObjectName("muted")
-        map_note.setWordWrap(True)
-        mg.addWidget(map_note, 2, 0, 1, 6)
-        self.combo_map_profile.currentIndexChanged.connect(self._refresh_map_targets)
-        root.addWidget(box_map)
+        grid.addWidget(self._boss_replay_panel, 3, 0, 1, 4)
 
-        # ---- 路径执行 ----
-        box_path = QGroupBox("3 · 路径执行（地图标注）")
-        pg2 = QGridLayout(box_path)
-        pg2.setHorizontalSpacing(8)
-        pg2.setVerticalSpacing(8)
-        pg2.setColumnStretch(1, 1)
-        pg2.addWidget(QLabel("路径"), 0, 0)
-        self.combo_path = QComboBox()
-        self.combo_path.setMinimumWidth(300)
-        pg2.addWidget(self.combo_path, 0, 1, 1, 2)
-        self.btn_path_edit = QPushButton("编辑路径")
-        self.btn_path_edit.clicked.connect(self._open_path_editor)
-        pg2.addWidget(self.btn_path_edit, 0, 3)
-        self.btn_path_run = QPushButton("执行路径")
-        self.btn_path_run.clicked.connect(self._toggle_path_run)
-        pg2.addWidget(self.btn_path_run, 1, 0, 1, 2)
-        self.lbl_path_state = QLabel("未运行")
-        self.lbl_path_state.setObjectName("muted")
-        self.lbl_path_state.setWordWrap(True)
-        pg2.addWidget(self.lbl_path_state, 1, 2, 1, 2)
-        path_note = QLabel(
-            "路径 = 地图 + 已标注入口 + 等待。运行时不 OCR 识别地图名，"
-            "靠场景切换动画判断是否进入下一张地图；点到物体/没动会自动再点一次。"
+        # ---- 识别战斗 ----
+        self._boss_detect_panel = QWidget()
+        dp = QGridLayout(self._boss_detect_panel)
+        dp.setContentsMargins(0, 0, 0, 0)
+        dp.setHorizontalSpacing(10)
+        dp.setVerticalSpacing(8)
+        dp.setColumnStretch(1, 1)
+
+        dp.addWidget(QLabel("前往BOSS录制"), 0, 0)
+        self.combo_boss_approach = QComboBox()
+        self.combo_boss_approach.setMinimumWidth(180)
+        self.combo_boss_approach.setToolTip(
+            "可选：从打怪点走到 BOSS 的录制；留空表示已经站在 BOSS 前"
         )
-        path_note.setObjectName("muted")
-        path_note.setWordWrap(True)
-        pg2.addWidget(path_note, 2, 0, 1, 4)
-        root.addWidget(box_path)
-
-        # ---- 副本整段录制 / 回放 ----
-        box_dungeon = QGroupBox("4 · 副本整段录制 / 回放")
-        dg = QGridLayout(box_dungeon)
-        dg.setHorizontalSpacing(8)
-        dg.setVerticalSpacing(8)
-        dg.setColumnStretch(1, 1)
-
-        dg.addWidget(QLabel("录制"), 0, 0)
-        self.combo_dungeon_record = QComboBox()
-        self.combo_dungeon_record.setMinimumWidth(260)
-        dg.addWidget(self.combo_dungeon_record, 0, 1, 1, 2)
-        self.btn_dungeon_record = QPushButton("开始录制")
-        self.btn_dungeon_record.clicked.connect(self._toggle_dungeon_record)
-        dg.addWidget(self.btn_dungeon_record, 0, 3)
-        self.btn_dungeon_rename = QPushButton("重命名")
-        self.btn_dungeon_rename.clicked.connect(self._rename_dungeon_record)
-        dg.addWidget(self.btn_dungeon_rename, 0, 4)
-        self.btn_dungeon_delete = QPushButton("删除")
-        self.btn_dungeon_delete.clicked.connect(self._delete_dungeon_record)
-        dg.addWidget(self.btn_dungeon_delete, 0, 5)
-
-        dg.addWidget(QLabel("重复"), 1, 0)
-        self.spin_dungeon_repeat = QSpinBox()
-        self.spin_dungeon_repeat.setRange(0, 9999)
-        self.spin_dungeon_repeat.setValue(1)
-        self.spin_dungeon_repeat.setSpecialValueText("无限循环")
-        self.spin_dungeon_repeat.setSuffix(" 次")
-        self.spin_dungeon_repeat.setFixedWidth(110)
-        self.spin_dungeon_repeat.setToolTip("0 = 无限循环，直到手动停止")
-        dg.addWidget(self.spin_dungeon_repeat, 1, 1)
-        dg.addWidget(QLabel("间隔"), 1, 2)
-        self.spin_dungeon_interval = QSpinBox()
-        self.spin_dungeon_interval.setRange(0, 600)
-        self.spin_dungeon_interval.setValue(3)
-        self.spin_dungeon_interval.setSuffix(" 秒")
-        self.spin_dungeon_interval.setFixedWidth(100)
-        self.spin_dungeon_interval.setToolTip("两次回放之间的等待时间")
-        dg.addWidget(self.spin_dungeon_interval, 1, 3)
-        dg.addWidget(QLabel("速度"), 1, 4)
-        self.spin_dungeon_speed = QSpinBox()
-        self.spin_dungeon_speed.setRange(50, 200)
-        self.spin_dungeon_speed.setSingleStep(10)
-        self.spin_dungeon_speed.setValue(100)
-        self.spin_dungeon_speed.setSuffix(" %")
-        self.spin_dungeon_speed.setFixedWidth(90)
-        dg.addWidget(self.spin_dungeon_speed, 1, 5)
-
-        self.btn_dungeon_test = QPushButton("试放一次")
-        self.btn_dungeon_test.clicked.connect(self._play_dungeon_once_test)
-        dg.addWidget(self.btn_dungeon_test, 2, 0, 1, 2)
-        self.btn_dungeon_run = QPushButton("开始副本")
-        self.btn_dungeon_run.clicked.connect(self._toggle_dungeon_run)
-        dg.addWidget(self.btn_dungeon_run, 2, 2, 1, 2)
-        self.lbl_dungeon_state = QLabel("未运行")
-        self.lbl_dungeon_state.setObjectName("muted")
-        self.lbl_dungeon_state.setWordWrap(True)
-        dg.addWidget(self.lbl_dungeon_state, 2, 4, 1, 2)
-
-        self.chk_lock_input = QCheckBox(
-            "回放时锁定鼠标键盘（Ctrl+Alt+F8 停止）"
+        dp.addWidget(self.combo_boss_approach, 0, 1)
+        dp.addWidget(QLabel("返回打怪点录制"), 0, 2)
+        self.combo_boss_return = QComboBox()
+        self.combo_boss_return.setMinimumWidth(180)
+        self.combo_boss_return.setToolTip(
+            "可选：击杀后拾取/返回打怪点的录制；留空表示留在原地"
         )
-        self.chk_lock_input.setChecked(True)
-        self.chk_lock_input.setToolTip(
-            "回放期间拦截你的物理鼠标/键盘，避免点开浏览器/计算器；"
-            "脚本自己发出的键鼠不受影响。停止请按 Ctrl+Alt+F8。"
+        dp.addWidget(self.combo_boss_return, 0, 3)
+
+        dp.addWidget(QLabel("BOSS检测区域"), 1, 0)
+        roi_wrap = QWidget()
+        roi_row = QHBoxLayout(roi_wrap)
+        roi_row.setContentsMargins(0, 0, 0, 0)
+        roi_row.setSpacing(8)
+        self.btn_boss_detect_roi = QPushButton("框选区域")
+        self.btn_boss_detect_roi.setFixedWidth(92)
+        self.btn_boss_detect_roi.clicked.connect(
+            self._select_boss_detect_region
         )
-        dg.addWidget(self.chk_lock_input, 3, 0, 1, 6)
+        self.lbl_boss_detect_roi = QLabel("未设置")
+        self.lbl_boss_detect_roi.setObjectName("muted")
+        roi_row.addWidget(self.btn_boss_detect_roi)
+        roi_row.addWidget(self.lbl_boss_detect_roi, 1)
+        dp.addWidget(roi_wrap, 1, 1)
+        dp.addWidget(QLabel("检测方式"), 1, 2)
+        self.combo_boss_detect_mode = QComboBox()
+        self.combo_boss_detect_mode.addItem("血量数字", "hp")
+        self.combo_boss_detect_mode.addItem("BOSS 文字/名称", "text")
+        self.combo_boss_detect_mode.setFixedWidth(150)
+        dp.addWidget(self.combo_boss_detect_mode, 1, 3)
 
-        self.chk_background_replay = QCheckBox(
-            "后台回放（PostMessage，不抢鼠标键盘，部分游戏可能无效）"
+        dp.addWidget(QLabel("击杀血量 ≤"), 2, 0)
+        self.spin_boss_kill_hp = QSpinBox()
+        self.spin_boss_kill_hp.setRange(0, 9_999_999)
+        self.spin_boss_kill_hp.setValue(0)
+        self.spin_boss_kill_hp.setFixedWidth(110)
+        self.spin_boss_kill_hp.setToolTip(
+            "血条识别时：当前血量小于等于这个值就认为 BOSS 已死亡"
         )
-        self.chk_background_replay.setChecked(False)
-        self.chk_background_replay.setToolTip(
-            "用后台消息回放录制，不移动真实鼠标、不抢前台；"
-            "这样可以边办公边挂机。部分游戏不处理后台鼠标消息，"
-            "建议先“试放一次”验证。"
+        dp.addWidget(self.spin_boss_kill_hp, 2, 1)
+        dp.addWidget(QLabel("连续未识别"), 2, 2)
+        miss_wrap = QWidget()
+        miss_row = QHBoxLayout(miss_wrap)
+        miss_row.setContentsMargins(0, 0, 0, 0)
+        miss_row.setSpacing(6)
+        self.spin_boss_miss = QSpinBox()
+        self.spin_boss_miss.setRange(1, 10)
+        self.spin_boss_miss.setValue(2)
+        self.spin_boss_miss.setFixedWidth(60)
+        self.spin_boss_miss.setToolTip(
+            "连续多少次识别不到血量/文字，就认为 BOSS 已死亡"
         )
-        dg.addWidget(self.chk_background_replay, 4, 0, 1, 6)
+        miss_row.addWidget(self.spin_boss_miss)
+        miss_row.addWidget(QLabel("次"))
+        miss_row.addWidget(QLabel("战斗上限"))
+        self.spin_boss_max_fight = QSpinBox()
+        self.spin_boss_max_fight.setRange(10, 3600)
+        self.spin_boss_max_fight.setValue(180)
+        self.spin_boss_max_fight.setSuffix(" 秒")
+        self.spin_boss_max_fight.setFixedWidth(100)
+        miss_row.addWidget(self.spin_boss_max_fight)
+        miss_row.addWidget(QLabel("拾取"))
+        self.spin_boss_pickup = QSpinBox()
+        self.spin_boss_pickup.setRange(0, 50)
+        self.spin_boss_pickup.setValue(3)
+        self.spin_boss_pickup.setSuffix(" 次")
+        self.spin_boss_pickup.setFixedWidth(90)
+        miss_row.addWidget(self.spin_boss_pickup)
+        miss_row.addWidget(QLabel("空格"))
+        miss_row.addStretch(1)
+        dp.addWidget(miss_wrap, 2, 3)
 
-        dungeon_note = QLabel(
-            "把“进副本 → 打BOSS → 拾取掉落 → 退出副本”完整录成一段，回放时按时间线原样执行。"
-            "录制开始前先站到固定起点；点“开始录制”后 3 秒内切到游戏操作，"
-            "完成后切回本窗口点“停止录制”。重复次数 0 = 无限循环。"
+        dp.addWidget(
+            QLabel(
+                "战斗沿用基础页的 A / 空格 / 技能 / 喝药设置；"
+                "识别不到时可在状态栏查看 OCR 结果，或改用“文字/名称”方式"
+            ),
+            3, 0, 1, 4,
         )
-        dungeon_note.setObjectName("muted")
-        dungeon_note.setWordWrap(True)
-        dg.addWidget(dungeon_note, 5, 0, 1, 6)
-        root.addWidget(box_dungeon)
+        grid.addWidget(self._boss_detect_panel, 3, 0, 1, 4)
 
-        # ---- 组合挂机：路径 + 副本录制 ----
-        box_combo = QGroupBox("5 · 组合挂机（路径 + 副本录制）")
-        cg = QGridLayout(box_combo)
-        cg.setHorizontalSpacing(8)
-        cg.setVerticalSpacing(8)
-        cg.setColumnStretch(1, 1)
+        # ---- 操作按钮 ----
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.btn_boss_once = QPushButton("打一次BOSS")
+        self.btn_boss_once.clicked.connect(self._boss_start_once)
+        self.btn_boss_loop = QPushButton("开始BOSS循环")
+        self.btn_boss_loop.clicked.connect(self._boss_start_loop)
+        self.btn_boss_stop = QPushButton("停止BOSS")
+        self.btn_boss_stop.clicked.connect(self._boss_stop_clicked)
+        self.lbl_boss_state = QLabel("未运行")
+        self.lbl_boss_state.setObjectName("muted")
+        self.lbl_boss_state.setWordWrap(True)
+        btn_row.addWidget(self.btn_boss_once)
+        btn_row.addWidget(self.btn_boss_loop)
+        btn_row.addWidget(self.btn_boss_stop)
+        btn_row.addWidget(self.lbl_boss_state, 1)
+        grid.addLayout(btn_row, 4, 0, 1, 4)
 
-        cg.addWidget(QLabel("组合"), 0, 0)
-        self.combo_combo = QComboBox()
-        self.combo_combo.setMinimumWidth(260)
-        cg.addWidget(self.combo_combo, 0, 1, 1, 2)
-        self.btn_combo_new = QPushButton("新建组合")
-        self.btn_combo_new.clicked.connect(self._new_combo)
-        cg.addWidget(self.btn_combo_new, 0, 3)
-        self.btn_combo_edit = QPushButton("编辑/重命名")
-        self.btn_combo_edit.clicked.connect(self._edit_combo)
-        cg.addWidget(self.btn_combo_edit, 0, 4)
-        self.btn_combo_delete = QPushButton("删除")
-        self.btn_combo_delete.clicked.connect(self._delete_combo)
-        cg.addWidget(self.btn_combo_delete, 0, 5)
+        return box
 
-        self.btn_combo_run = QPushButton("开始组合")
-        self.btn_combo_run.clicked.connect(self._toggle_combo)
-        cg.addWidget(self.btn_combo_run, 1, 0, 1, 2)
-        self.lbl_combo_state = QLabel("未运行")
-        self.lbl_combo_state.setObjectName("muted")
-        self.lbl_combo_state.setWordWrap(True)
-        cg.addWidget(self.lbl_combo_state, 1, 2, 1, 4)
-
-        combo_note = QLabel(
-            "组合 = 一条路径 + 一段副本录制。运行时每轮先执行路径，再回放录制；"
-            "重复次数 0 = 无限循环。选择组合后点“开始组合”即可挂机。"
-        )
-        combo_note.setObjectName("muted")
-        combo_note.setWordWrap(True)
-        cg.addWidget(combo_note, 2, 0, 1, 6)
-        root.addWidget(box_combo)
-
-        # ---- 疲劳循环：打怪 ↔ BOSS ----
-        box_fatigue_loop = QGroupBox("6 · 疲劳循环（挂机 ↔ 录制）")
-        fg = QGridLayout(box_fatigue_loop)
-        fg.setHorizontalSpacing(8)
-        fg.setVerticalSpacing(8)
-        fg.setColumnStretch(1, 1)
-
-        fg.addWidget(QLabel("BOSS 录制"), 0, 0)
-        self.combo_fl_record = QComboBox()
-        self.combo_fl_record.setMinimumWidth(300)
-        fg.addWidget(self.combo_fl_record, 0, 1, 1, 3)
-        self.btn_fl_record = QPushButton("录制新脚本")
-        self.btn_fl_record.setFixedWidth(100)
-        self.btn_fl_record.clicked.connect(self._toggle_dungeon_record)
-        fg.addWidget(self.btn_fl_record, 0, 4)
-        self.btn_fl_test = QPushButton("试放")
-        self.btn_fl_test.setFixedWidth(60)
-        self.btn_fl_test.clicked.connect(self._play_fl_record_test)
-        fg.addWidget(self.btn_fl_test, 0, 5)
-        self.btn_fl_delete_record = QPushButton("删除录制")
-        self.btn_fl_delete_record.setFixedWidth(92)
-        self.btn_fl_delete_record.clicked.connect(self._delete_fl_record)
-        fg.addWidget(self.btn_fl_delete_record, 0, 6)
-
-        fg.addWidget(QLabel("疲劳阈值 ±"), 1, 0)
-        self.spin_fl_threshold = QSpinBox()
-        self.spin_fl_threshold.setRange(50, 1000)
-        self.spin_fl_threshold.setSingleStep(10)
-        self.spin_fl_threshold.setValue(int(self._fatigue_threshold))
-        self.spin_fl_threshold.setSuffix(" 点")
-        self.spin_fl_threshold.setFixedWidth(110)
-        self.spin_fl_threshold.valueChanged.connect(self._on_threshold_changed)
-        fg.addWidget(self.spin_fl_threshold, 1, 1)
-        fg.addWidget(QLabel("检查间隔"), 1, 2)
-        self.spin_fl_interval = QSpinBox()
-        self.spin_fl_interval.setRange(5, 600)
-        self.spin_fl_interval.setValue(30)
-        self.spin_fl_interval.setSuffix(" 秒")
-        self.spin_fl_interval.setFixedWidth(100)
-        fg.addWidget(self.spin_fl_interval, 1, 3)
-
-        self.combo_fl_record.currentIndexChanged.connect(
-            lambda _=0: self._update_fatigue_loop_controls()
+    # -- 自动打BOSS：设置与状态 -----------------------------------------
+    def _boss_busy(self) -> bool:
+        return bool(
+            self._boss_running
+            or self._boss_recorder is not None
+            or self._boss_record_pending
+            or self._boss_player is not None
+            or self._boss_fighter is not None
+            or self._boss_watcher is not None
+            or self._boss_looter is not None
         )
 
-        self.btn_fl_run = QPushButton("开始疲劳循环")
-        self.btn_fl_run.clicked.connect(self._toggle_fatigue_loop)
-        fg.addWidget(self.btn_fl_run, 2, 0, 1, 2)
-        self.lbl_fl_state = QLabel("未运行")
-        self.lbl_fl_state.setObjectName("muted")
-        self.lbl_fl_state.setWordWrap(True)
-        fg.addWidget(self.lbl_fl_state, 2, 2, 1, 2)
-
-        fl_note = QLabel(
-            "挂机打怪 → 每隔 N 秒检测疲劳 → 疲劳 < -阈值 → 回放 BOSS 整段录制 "
-            "→ 播放完自动恢复打怪。录制里要包含去BOSS、进副本、打BOSS、拾取、"
-            "退出、回打怪点的全部操作。"
+    @staticmethod
+    def _record_move_count(record: Optional[dict]) -> int:
+        if not record:
+            return 0
+        return sum(
+            1 for event in (record.get("events") or [])
+            if event.get("type") == "move"
         )
-        fl_note.setObjectName("muted")
-        fl_note.setWordWrap(True)
-        fg.addWidget(fl_note, 3, 0, 1, 4)
-        root.addWidget(box_fatigue_loop)
 
-        root.addStretch(1)
+    def _boss_record_by_name(self, name) -> Optional[dict]:
+        if not name:
+            return None
+        for record in self._boss_records:
+            if record.get("name") == name:
+                return record
+        return None
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(tab)
-        return scroll
+    def _combo_record(self, combo: QComboBox) -> Optional[dict]:
+        return self._boss_record_by_name(combo.currentData())
 
+    @staticmethod
+    def _fill_record_combo(
+        combo: QComboBox, records: list[dict], include_none: bool
+    ) -> None:
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        if include_none:
+            combo.addItem("（不使用）", None)
+        for record in records:
+            combo.addItem(str(record.get("name") or ""), record.get("name"))
+        index = combo.findData(current)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _refresh_boss_records(self) -> None:
+        self._fill_record_combo(self.combo_boss_record, self._boss_records, False)
+        self._fill_record_combo(
+            self.combo_boss_approach, self._boss_records, True
+        )
+        self._fill_record_combo(
+            self.combo_boss_return, self._boss_records, True
+        )
+        self._update_boss_controls()
+        if hasattr(self, "combo_multi_records"):
+            self._refresh_multi_records()
+
+    def _on_boss_mode_changed(self, _index: int) -> None:
+        if self._boss_loading:
+            return
+        self._update_boss_panels()
+        self._update_boss_controls()
+        self._save_boss_settings()
+
+    def _update_boss_panels(self) -> None:
+        if not hasattr(self, "_boss_replay_panel"):
+            return
+        mode = self.combo_boss_mode.currentData()
+        replay = mode != "detect"
+        self._boss_replay_panel.setVisible(replay)
+        self._boss_detect_panel.setVisible(not replay)
+        self._boss_kind = "replay" if replay else "detect"
+
+    def _update_boss_controls(self) -> None:
+        if not hasattr(self, "btn_boss_record"):
+            return
+        busy = self._boss_busy() or self._multi_busy()
+        recording = self._boss_recorder is not None
+        pending = self._boss_record_pending
+        farm_running = self._worker is not None
+
+        self.btn_boss_record.setText(
+            "停止录制"
+            if recording
+            else ("取消录制" if pending else "录制新脚本")
+        )
+        self.btn_boss_record.setEnabled(
+            recording or pending or (not busy and not farm_running)
+        )
+        has_record = self.combo_boss_record.currentData() is not None
+        self.btn_boss_test.setEnabled(has_record and not busy)
+        self.btn_boss_delete.setEnabled(has_record and not busy)
+
+        for widget in (
+            self.chk_boss_fatigue,
+            self.chk_boss_timer,
+            self.spin_boss_timer,
+            self.combo_boss_mode,
+            self.combo_boss_record,
+            self.combo_boss_approach,
+            self.combo_boss_return,
+            self.combo_boss_detect_mode,
+            self.spin_boss_speed,
+            self.spin_boss_repeat,
+            self.spin_boss_gap,
+            self.spin_boss_kill_hp,
+            self.spin_boss_miss,
+            self.spin_boss_max_fight,
+            self.spin_boss_pickup,
+            self.btn_boss_detect_roi,
+        ):
+            widget.setEnabled(not busy)
+
+        self.btn_boss_once.setEnabled(not busy)
+        self.btn_boss_loop.setEnabled(not busy)
+        self.btn_boss_stop.setEnabled(busy)
+        self._update_boss_panels()
+        self._update_boss_roi_label()
+        self._update_bind_button_state()
+
+    def _update_boss_roi_label(self) -> None:
+        if not hasattr(self, "lbl_boss_detect_roi"):
+            return
+        if self._boss_detect_roi_norm is None:
+            self.lbl_boss_detect_roi.setText("未设置")
+            self.lbl_boss_detect_roi.setStyleSheet(
+                "color: #ffb454; padding: 0;"
+            )
+            self.btn_boss_detect_roi.setText("框选区域")
+            return
+        self.btn_boss_detect_roi.setText("重选区域")
+        roi = None
+        if self.target_hwnd is not None and self._window_alive(self.target_hwnd):
+            try:
+                _l, _t, cw, ch = win32gui.GetClientRect(self.target_hwnd)
+                roi = roi_from_norm(
+                    self._boss_detect_roi_norm, int(cw), int(ch)
+                )
+            except Exception:
+                roi = None
+        if roi is not None:
+            self.lbl_boss_detect_roi.setText(
+                f"x={roi[0]}, y={roi[1]}, 宽={roi[2]}, 高={roi[3]}"
+            )
+        else:
+            self.lbl_boss_detect_roi.setText("已设置（绑定窗口后显示坐标）")
+        self.lbl_boss_detect_roi.setStyleSheet(
+            "color: #3ddc84; padding: 0;"
+        )
+
+    @staticmethod
+    def _bool_setting(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _load_boss_settings(self) -> None:
+        self._boss_loading = True
+        try:
+            self._load_boss_settings_inner()
+        finally:
+            self._boss_loading = False
+
+    def _load_boss_settings_inner(self) -> None:
+        s = self._settings
+        self.chk_single_hp_potion.setChecked(
+            self._bool_setting(s.value("single_hp_potion", False))
+        )
+        try:
+            self.spin_single_hp_potion_threshold.setValue(
+                max(
+                    1,
+                    min(
+                        100000,
+                        int(
+                            s.value(
+                                "single_hp_potion_threshold", 1600
+                            )
+                        ),
+                    ),
+                )
+            )
+        except (TypeError, ValueError):
+            pass
+        self.chk_keyboard_only.setChecked(
+            self._bool_setting(s.value("keyboard_only", False))
+        )
+        self.chk_relative_mouse.setChecked(
+            self._bool_setting(s.value("relative_mouse", False))
+        )
+        self.chk_background_mode.setChecked(
+            self._bool_setting(s.value("background_mode", True))
+        )
+        if self.chk_keyboard_only.isChecked():
+            self.chk_background_mode.blockSignals(True)
+            self.chk_background_mode.setChecked(True)
+            self.chk_background_mode.blockSignals(False)
+            self.chk_relative_mouse.blockSignals(True)
+            self.chk_relative_mouse.setChecked(False)
+            self.chk_relative_mouse.blockSignals(False)
+        elif (
+            self.chk_background_mode.isChecked()
+            and self.chk_relative_mouse.isChecked()
+        ):
+            self.chk_relative_mouse.blockSignals(True)
+            self.chk_relative_mouse.setChecked(False)
+            self.chk_relative_mouse.blockSignals(False)
+        mode = str(s.value("boss/mode", "replay"))
+        index = self.combo_boss_mode.findData(mode)
+        if index >= 0:
+            self.combo_boss_mode.setCurrentIndex(index)
+
+        self.chk_boss_fatigue.setChecked(
+            self._bool_setting(s.value("boss/fatigue_trigger", False))
+        )
+        self.chk_boss_timer.setChecked(
+            self._bool_setting(s.value("boss/timer_trigger", False))
+        )
+        try:
+            self.spin_boss_timer.setValue(
+                max(1, min(1440, int(s.value("boss/timer_minutes", 60))))
+            )
+        except (TypeError, ValueError):
+            pass
+
+        def set_int(spin: QSpinBox, key: str, default: int) -> None:
+            try:
+                value = int(s.value(key, default))
+            except (TypeError, ValueError):
+                value = default
+            spin.setValue(max(spin.minimum(), min(spin.maximum(), value)))
+
+        set_int(self.spin_boss_speed, "boss/speed", 100)
+        set_int(self.spin_boss_repeat, "boss/repeat", 1)
+        set_int(self.spin_boss_gap, "boss/gap", 5)
+        set_int(self.spin_boss_kill_hp, "boss/kill_hp", 0)
+        set_int(self.spin_boss_miss, "boss/miss", 2)
+        set_int(self.spin_boss_max_fight, "boss/max_fight", 180)
+        set_int(self.spin_boss_pickup, "boss/pickup", 3)
+
+        detect_mode = str(s.value("boss/detect_mode", "hp"))
+        index = self.combo_boss_detect_mode.findData(detect_mode)
+        if index >= 0:
+            self.combo_boss_detect_mode.setCurrentIndex(index)
+
+        roi = s.value("boss/detect_roi_norm")
+        if isinstance(roi, str):
+            roi = [
+                part
+                for part in roi.replace("[", "").replace("]", "").split(",")
+                if part
+            ]
+        try:
+            if isinstance(roi, (list, tuple)) and len(roi) == 4:
+                values = tuple(float(v) for v in roi)
+                if (
+                    0.0 <= values[0] <= 1.0
+                    and 0.0 <= values[1] <= 1.0
+                    and values[2] > 0
+                    and values[3] > 0
+                ):
+                    self._boss_detect_roi_norm = values  # type: ignore[assignment]
+        except (TypeError, ValueError):
+            pass
+
+        for combo, key in (
+            (self.combo_boss_record, "boss/record"),
+            (self.combo_boss_approach, "boss/approach"),
+            (self.combo_boss_return, "boss/return"),
+        ):
+            name = str(s.value(key, ""))
+            index = combo.findData(name)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
+    def _save_boss_settings(self) -> None:
+        if self._boss_loading or not hasattr(self, "combo_boss_mode"):
+            return
+        s = self._settings
+        s.setValue(
+            "background_mode", self.chk_background_mode.isChecked()
+        )
+        s.setValue(
+            "relative_mouse", self.chk_relative_mouse.isChecked()
+        )
+        s.setValue(
+            "keyboard_only", self.chk_keyboard_only.isChecked()
+        )
+        s.setValue(
+            "single_hp_potion", self.chk_single_hp_potion.isChecked()
+        )
+        s.setValue(
+            "single_hp_potion_threshold",
+            int(self.spin_single_hp_potion_threshold.value()),
+        )
+        s.setValue("boss/mode", self.combo_boss_mode.currentData() or "replay")
+        s.setValue("boss/fatigue_trigger", self.chk_boss_fatigue.isChecked())
+        s.setValue("boss/timer_trigger", self.chk_boss_timer.isChecked())
+        s.setValue("boss/timer_minutes", int(self.spin_boss_timer.value()))
+        s.setValue("boss/speed", int(self.spin_boss_speed.value()))
+        s.setValue("boss/repeat", int(self.spin_boss_repeat.value()))
+        s.setValue("boss/gap", int(self.spin_boss_gap.value()))
+        s.setValue("boss/kill_hp", int(self.spin_boss_kill_hp.value()))
+        s.setValue("boss/miss", int(self.spin_boss_miss.value()))
+        s.setValue(
+            "boss/max_fight", int(self.spin_boss_max_fight.value())
+        )
+        s.setValue("boss/pickup", int(self.spin_boss_pickup.value()))
+        s.setValue(
+            "boss/detect_mode",
+            self.combo_boss_detect_mode.currentData() or "hp",
+        )
+        if self._boss_detect_roi_norm is not None:
+            s.setValue(
+                "boss/detect_roi_norm",
+                [round(float(v), 6) for v in self._boss_detect_roi_norm],
+            )
+        else:
+            s.remove("boss/detect_roi_norm")
+        s.setValue("boss/record", self.combo_boss_record.currentData() or "")
+        s.setValue("boss/approach", self.combo_boss_approach.currentData() or "")
+        s.setValue("boss/return", self.combo_boss_return.currentData() or "")
+
+    # -- 自动打BOSS：录制 ------------------------------------------------
+    def _toggle_boss_record(self) -> None:
+        if self._boss_recorder is not None:
+            self._stop_boss_record()
+            return
+        if self._boss_record_pending:
+            self._boss_record_pending = False
+            self._set_boss_state("已取消录制", "warn")
+            self._update_boss_controls()
+            return
+        if self._boss_busy() or self._multi_busy():
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._notify(
+                "尚未绑定窗口",
+                "请先绑定 CreatureCurios 窗口，再录制 BOSS 脚本。",
+            )
+            return
+        self._boss_record_pending = True
+        self._set_boss_state("3 秒后开始录制，请切到游戏…", "warn")
+        self._update_boss_controls()
+        QTimer.singleShot(3000, self._begin_boss_record)
+
+    def _begin_boss_record(self) -> None:
+        if not self._boss_record_pending or self._quitting:
+            return
+        self._boss_record_pending = False
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._set_boss_state("目标窗口已关闭，录制取消", "error")
+            self._update_boss_controls()
+            return
+        try:
+            recorder = MacroRecorder(self.target_hwnd)
+            recorder.start()
+        except Exception as exc:
+            self._set_boss_state(f"录制启动失败：{exc}", "error")
+            self._notify("录制启动失败", str(exc))
+            self._update_boss_controls()
+            return
+        self._boss_recorder = recorder
+        self._set_boss_state("录制中… 操作完切回本窗口点“停止录制”", "warn")
+        self._update_boss_controls()
+
+    def _stop_boss_record(self) -> None:
+        recorder = self._boss_recorder
+        self._boss_recorder = None
+        if recorder is None:
+            return
+        try:
+            events = strip_hotkey_tail(recorder.stop())
+            meta = recorder.meta()
+        except Exception as exc:
+            self._set_boss_state(f"停止录制失败：{exc}", "error")
+            self._update_boss_controls()
+            return
+        self._update_boss_controls()
+        if not events:
+            self._set_boss_state("没有录到任何操作，未保存", "warn")
+            self._notify(
+                "没有录到操作",
+                "录制时游戏必须在前台，并且鼠标要位于游戏窗口内。"
+                "请切到游戏后再操作，结束时切回本窗口点“停止录制”。",
+            )
+            return
+
+        default_name = f"BOSS录制 {len(self._boss_records) + 1}"
+        name, ok = QInputDialog.getText(
+            self, "保存录制", "给这段 BOSS 录制起个名字：", text=default_name
+        )
+        if not ok:
+            self._set_boss_state("已放弃保存", "warn")
+            return
+        name = str(name or "").strip() or default_name
+        existing = {str(r.get("name")) for r in self._boss_records}
+        base = name
+        suffix = 2
+        while name in existing:
+            name = f"{base} ({suffix})"
+            suffix += 1
+
+        self._boss_records.append(
+            {
+                "name": name,
+                "created": datetime.datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "events": events,
+                "meta": meta,
+            }
+        )
+        saved = save_boss_records(self._boss_records)
+        self._refresh_boss_records()
+        index = self.combo_boss_record.findData(name)
+        if index >= 0:
+            self.combo_boss_record.setCurrentIndex(index)
+        self._save_boss_settings()
+        move_count = sum(1 for e in events if e.get("type") == "move")
+        duration = float(events[-1].get("t", 0.0)) if events else 0.0
+        if move_count < 5 and duration > 3.0:
+            move_note = "；鼠标移动很少，游戏可能锁定了鼠标，镜头可能无法复刻"
+        else:
+            move_note = f"；鼠标移动 {move_count} 次"
+        self._set_boss_state(
+            (
+                f"已保存录制“{name}”（{len(events)} 个动作{move_note}）"
+                if saved
+                else f"录制“{name}”已生效，但写入文件失败（本次运行有效）{move_note}"
+            ),
+            "ok" if saved else "warn",
+        )
+
+    def _test_boss_record(self) -> None:
+        record = self._combo_record(self.combo_boss_record)
+        if record is None:
+            self._notify("没有选择录制", "请先选择一段 BOSS 录制。")
+            return
+        if self._boss_busy() or self._multi_busy():
+            return
+        hwnd = self.target_hwnd
+        if hwnd is None or not self._window_alive(hwnd):
+            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
+            return
+        self._save_boss_settings()
+        if (
+            self.chk_background_mode.isChecked()
+            and self._record_move_count(record) > 20
+        ):
+            self._set_status(
+                "提示：该录制含大量鼠标移动，后台回放可能走偏；"
+                "可关闭后台模式并勾选“相对鼠标移动”再试放",
+                "warn",
+            )
+        was_farm = self._worker is not None
+        if was_farm:
+            self._halt_farm_for_boss()
+        self._boss_preview = True
+        self._boss_preview_resume = was_farm
+        self._boss_running = True
+        self._boss_kind = "replay"
+        self._boss_stage = "试放"
+        self._start_boss_player(
+            record,
+            stage="试放",
+            speed=1.0,
+            on_done=self._on_boss_player_done,
+            on_error=self._on_boss_player_error,
+        )
+        self._set_boss_state(f"试放“{record.get('name')}”…", "warn")
+        self._update_boss_controls()
+
+    def _delete_boss_record(self) -> None:
+        record = self._combo_record(self.combo_boss_record)
+        if record is None:
+            return
+        if self._boss_busy():
+            return
+        name = str(record.get("name") or "")
+        answer = QMessageBox.question(
+            self,
+            "删除录制",
+            f"确定删除录制“{name}”吗？此操作不可恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._boss_records = [
+            item for item in self._boss_records if item is not record
+        ]
+        save_boss_records(self._boss_records)
+        self._refresh_boss_records()
+        self._save_boss_settings()
+        self._set_boss_state(f"已删除录制“{name}”", "ok")
+
+    # -- 自动打BOSS：识别区域 --------------------------------------------
+    def _capture_game_image(self) -> Optional[QImage]:
+        """只截取游戏客户区，不移动鼠标。
+
+        优先用单开页绑定的窗口；没有绑定时退回第一个有效的多开窗口，
+        方便直接在多开页框选血量/角色名区域。
+        """
+        hwnd = self.target_hwnd
+        if hwnd is None or not self._window_alive(hwnd):
+            hwnd = None
+            for index in range(4):
+                candidate = self._multi_slot_hwnd(index)
+                if candidate is not None and self._window_alive(candidate):
+                    hwnd = candidate
+                    break
+        if hwnd is None:
+            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
+            return None
+        cap, err = capture_client_bgra(hwnd)
+        if cap is None:
+            self._notify("截图失败", err or "无法截取游戏画面。")
+            return None
+        w, h, data = cap
+        return QImage(
+            bytes(data), w, h, w * 4, QImage.Format.Format_RGB32
+        ).copy()
+
+    def _select_boss_detect_region(self) -> None:
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._notify(
+                "尚未绑定窗口",
+                "请先绑定 CreatureCurios 窗口，再框选 BOSS 检测区域。",
+            )
+            return
+        image = self._capture_game_image()
+        if image is None or image.isNull():
+            return
+        current = None
+        if self._boss_detect_roi_norm is not None:
+            try:
+                current = roi_from_norm(
+                    self._boss_detect_roi_norm,
+                    image.width(),
+                    image.height(),
+                )
+            except Exception:
+                current = None
+        dialog = RegionSelectDialog(
+            image,
+            current,
+            self._capture_game_image,
+            self,
+            title_text="框选 BOSS 检测区域",
+            info_text=(
+                "框住能判断 BOSS 是否死亡的区域："
+                "BOSS 血条上的数字（例如 12345/50000），"
+                "或 BOSS 名称/血条文字。区域越小，识别越快越准。"
+                "如果游戏里的血条没有数字，请把“检测方式”改成“BOSS 文字/名称”。"
+            ),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        roi = dialog.selected_roi()
+        if roi is None:
+            return
+        cw, ch = image.width(), image.height()
+        if cw <= 0 or ch <= 0:
+            return
+        self._boss_detect_roi_norm = (
+            roi[0] / cw,
+            roi[1] / ch,
+            roi[2] / cw,
+            roi[3] / ch,
+        )
+        self._save_boss_settings()
+        self._update_boss_roi_label()
+        self._set_boss_state("BOSS 检测区域已保存", "ok")
+
+    # -- 自动打BOSS：定时触发 --------------------------------------------
+    def _on_boss_timer_toggled(self, *_args) -> None:
+        if self._boss_loading:
+            return
+        self._save_boss_settings()
+        self._schedule_boss_timer()
+
+    def _schedule_boss_timer(self) -> None:
+        if not hasattr(self, "chk_boss_timer"):
+            return
+        self._boss_trigger_timer.stop()
+        if (
+            self._quitting
+            or not self.chk_boss_timer.isChecked()
+            or self._boss_busy()
+        ):
+            return
+        minutes = max(1, int(self.spin_boss_timer.value()))
+        self._boss_trigger_timer.start(minutes * 60 * 1000)
+
+    def _on_boss_timer_fire(self) -> None:
+        if self._quitting:
+            return
+        if self._boss_busy():
+            self._schedule_boss_timer()
+            return
+        if not self._boss_config_ready(silent=True):
+            self._set_boss_state(
+                "定时打BOSS：方案未配置完整（录制/检测区域）", "warn"
+            )
+            self._schedule_boss_timer()
+            return
+        self._boss_start(origin="timer", repeat_override=1)
+
+    # -- 自动打BOSS：运行 ------------------------------------------------
+    def _set_boss_state(self, text: str, level: str = "normal") -> None:
+        if not hasattr(self, "lbl_boss_state"):
+            return
+        colors = {
+            "normal": "#aeb4bd",
+            "ok": "#3ddc84",
+            "warn": "#ffb454",
+            "error": "#ff6b6b",
+        }
+        self.lbl_boss_state.setText(text)
+        self.lbl_boss_state.setStyleSheet(
+            f"color: {colors.get(level, colors['normal'])}; padding: 0;"
+        )
+
+    def _boss_config_ready(self, silent: bool = False) -> bool:
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            if not silent:
+                self._notify(
+                    "尚未绑定窗口", "请先绑定 CreatureCurios 窗口。"
+                )
+            return False
+        mode = self.combo_boss_mode.currentData()
+        if mode == "replay":
+            record = self._combo_record(self.combo_boss_record)
+            if record is None or not record.get("events"):
+                if not silent:
+                    self._notify(
+                        "没有整段录制",
+                        "请先在“录制”里选择或录制一段完整的 BOSS 流程。",
+                    )
+                return False
+            return True
+        if self._boss_detect_roi_norm is None:
+            if not silent:
+                self._notify(
+                    "尚未框选 BOSS 检测区域",
+                    "识别战斗需要先框选 BOSS 血条数字或 BOSS 名称区域。",
+                )
+            return False
+        return True
+
+    def _boss_start_once(self) -> None:
+        self._boss_start(origin="manual", repeat_override=1)
+
+    def _boss_start_loop(self) -> None:
+        self._boss_start(origin="manual", repeat_override=None)
+
+    def _boss_start(
+        self, origin: str = "manual", repeat_override: Optional[int] = None
+    ) -> None:
+        if self._quitting or self._boss_busy():
+            return
+        if self._multi_busy():
+            self._notify(
+                "多开正在运行",
+                "请先停止多开挂机/回血录制，再启动自动BOSS。",
+            )
+            return
+        if not self._boss_config_ready(silent=False):
+            return
+        if origin in ("fatigue", "timer"):
+            hwnd = self.target_hwnd
+            if (
+                hwnd is not None
+                and self._window_alive(hwnd)
+                and win32gui.IsIconic(hwnd)
+            ):
+                self._set_boss_state(
+                    "游戏窗口已最小化，跳过自动BOSS", "warn"
+                )
+                self._schedule_boss_timer()
+                return
+        self._save_boss_settings()
+        if (
+            self.combo_boss_mode.currentData() != "detect"
+            and self.chk_background_mode.isChecked()
+            and self._record_move_count(
+                self._combo_record(self.combo_boss_record)
+            ) > 20
+        ):
+            self._set_status(
+                "提示：该录制含大量鼠标移动，后台回放可能走偏；"
+                "可关闭后台模式并勾选“相对鼠标移动”",
+                "warn",
+            )
+        was_farm = self._worker is not None
+        if was_farm:
+            self._halt_farm_for_boss()
+
+        self._boss_kind = (
+            "detect"
+            if self.combo_boss_mode.currentData() == "detect"
+            else "replay"
+        )
+        self._boss_origin = origin
+        self._boss_resume_farm = was_farm or origin == "fatigue"
+        self._boss_total = (
+            int(self.spin_boss_repeat.value())
+            if repeat_override is None
+            else max(1, int(repeat_override))
+        )
+        self._boss_done = 0
+        self._boss_interval = max(0.0, float(self.spin_boss_gap.value()))
+        self._boss_last_error = ""
+        self._boss_trigger_timer.stop()
+        self._boss_running = True
+        self._boss_preview = False
+        self._boss_stage = ""
+        self._update_boss_controls()
+        self._set_boss_state("开始执行 BOSS 方案…", "ok")
+        self._boss_run_iteration()
+
+    def _boss_run_iteration(self) -> None:
+        if not self._boss_running:
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._boss_finish("游戏窗口已关闭", "error")
+            return
+        self._boss_stage = ""
+        if self._boss_kind == "detect":
+            self._boss_detect_start()
+        else:
+            self._boss_replay_once()
+
+    def _boss_replay_once(self) -> None:
+        record = self._combo_record(self.combo_boss_record)
+        if record is None or not record.get("events"):
+            self._boss_finish("没有可回放的整段录制", "error")
+            return
+        speed = max(0.2, float(self.spin_boss_speed.value()) / 100.0)
+        self._start_boss_player(
+            record,
+            stage="整段回放",
+            speed=speed,
+            on_done=self._on_boss_player_done,
+            on_error=self._on_boss_player_error,
+        )
+        self._set_boss_state(
+            f"整段回放“{record.get('name')}”…", "warn"
+        )
+        self._update_boss_controls()
+
+    def _start_boss_player(
+        self,
+        record: dict,
+        stage: str,
+        speed: float,
+        on_done,
+        on_error,
+    ) -> None:
+        player = MacroPlayer(
+            int(self.target_hwnd),
+            stage,
+            list(record.get("events") or []),
+            meta=record.get("meta"),
+            speed=speed,
+            background=(
+                self.chk_background_mode.isChecked()
+                or self.chk_keyboard_only.isChecked()
+            ),
+            relative_mouse=self.chk_relative_mouse.isChecked(),
+            keyboard_only=self.chk_keyboard_only.isChecked(),
+            parent=self,
+        )
+        player.done.connect(on_done)
+        player.error.connect(on_error)
+        self._boss_player = player
+        player.start()
+
+    def _on_boss_player_done(self, _stage: str) -> None:
+        player = self.sender()
+        if player is not self._boss_player:
+            return
+        self._boss_player = None
+        if player is not None:
+            try:
+                player.wait(500)
+            except Exception:
+                pass
+            player.deleteLater()
+        if self._boss_preview:
+            self._finish_boss_preview("试放完成")
+            return
+        if not self._boss_running:
+            return
+        self._boss_after_iteration()
+
+    def _on_boss_player_error(self, _stage: str, message: str) -> None:
+        player = self.sender()
+        if player is not self._boss_player:
+            return
+        self._boss_player = None
+        if player is not None:
+            try:
+                player.wait(500)
+            except Exception:
+                pass
+            player.deleteLater()
+        if self._boss_preview:
+            self._finish_boss_preview(f"试放失败：{message}", "error")
+            return
+        self._boss_finish(f"回放失败：{message}", "error")
+
+    def _finish_boss_preview(
+        self, message: str, level: str = "ok"
+    ) -> None:
+        self._boss_preview = False
+        self._boss_running = False
+        self._set_boss_state(message, level)
+        resume = self._boss_preview_resume
+        self._boss_preview_resume = False
+        self._update_boss_controls()
+        if resume and not self._quitting:
+            QTimer.singleShot(300, self._resume_farm_after_boss)
+
+    # ---- 识别战斗 ----
+    def _boss_detect_start(self) -> None:
+        approach = self._combo_record(self.combo_boss_approach)
+        if approach is not None and approach.get("events"):
+            self._boss_stage = "approach"
+            self._start_boss_player(
+                approach,
+                stage="前往BOSS",
+                speed=1.0,
+                on_done=self._on_boss_approach_done,
+                on_error=self._on_boss_player_error,
+            )
+            self._set_boss_state(
+                f"前往BOSS：回放“{approach.get('name')}”…", "warn"
+            )
+            self._update_boss_controls()
+            return
+        self._boss_detect_start_fight()
+
+    def _on_boss_approach_done(self, _stage: str) -> None:
+        player = self.sender()
+        if player is not self._boss_player:
+            return
+        self._boss_player = None
+        if player is not None:
+            try:
+                player.wait(500)
+            except Exception:
+                pass
+            player.deleteLater()
+        if not self._boss_running:
+            return
+        self._boss_detect_start_fight()
+
+    def _boss_detect_start_fight(self) -> None:
+        if not self._boss_running:
+            return
+        if self._boss_detect_roi_norm is None:
+            self._boss_finish("尚未框选 BOSS 检测区域", "error")
+            return
+        hwnd = self.target_hwnd
+        if hwnd is None or not self._window_alive(hwnd):
+            self._boss_finish("游戏窗口已关闭", "error")
+            return
+
+        self._boss_stage = "fight"
+        fighter = KeySender(
+            int(hwnd),
+            self.spin_interval.value(),
+            use_skills=self.chk_skills.isChecked(),
+            use_potion=self.chk_potion.isChecked(),
+            potion_interval_ms=self.spin_potion.value() * 1000,
+            use_pickup=False,
+            parent=self,
+        )
+        fighter.failed.connect(self._on_boss_fighter_failed)
+        self._boss_fighter = fighter
+        fighter.start()
+
+        watcher = BossWatcher(
+            int(hwnd),
+            self._boss_detect_roi_norm,
+            detect_mode=str(
+                self.combo_boss_detect_mode.currentData() or "hp"
+            ),
+            kill_hp=int(self.spin_boss_kill_hp.value()),
+            miss_limit=int(self.spin_boss_miss.value()),
+            interval_seconds=1.5,
+            parent=self,
+        )
+        watcher.update.connect(self._on_boss_watcher_update)
+        watcher.gone.connect(self._on_boss_watcher_gone)
+        self._boss_watcher = watcher
+        watcher.start()
+
+        limit = max(10, int(self.spin_boss_max_fight.value()))
+        self._boss_fight_timer.start(limit * 1000)
+        self._set_boss_state("BOSS 战斗中，等待识别击杀…", "warn")
+        self._update_boss_controls()
+
+    def _on_boss_watcher_update(self, text: str) -> None:
+        if self._boss_running:
+            self._set_boss_state(f"BOSS 战斗中：{text}", "warn")
+
+    def _on_boss_watcher_gone(self, reason: str) -> None:
+        watcher = self.sender()
+        if watcher is not self._boss_watcher:
+            return
+        self._boss_watcher = None
+        if watcher is not None:
+            try:
+                watcher.wait(1500)
+            except Exception:
+                pass
+            watcher.deleteLater()
+        self._boss_fight_timer.stop()
+        self._stop_boss_fighter()
+        if not self._boss_running:
+            return
+        self._boss_stage = "loot"
+        pickup = int(self.spin_boss_pickup.value())
+        self._set_boss_state(
+            f"BOSS 已击杀（{reason}），拾取 {pickup} 次…", "ok"
+        )
+        if pickup <= 0:
+            self._boss_detect_start_return()
+            return
+        looter = TapSender(
+            int(self.target_hwnd),
+            VK_SPACE,
+            pickup,
+            gap_seconds=0.18,
+            parent=self,
+        )
+        looter.failed.connect(self._on_boss_looter_failed)
+        looter.finished.connect(self._on_boss_loot_done)
+        self._boss_looter = looter
+        looter.start()
+        self._update_boss_controls()
+
+    def _on_boss_loot_done(self) -> None:
+        looter = self.sender()
+        if looter is not self._boss_looter:
+            return
+        self._boss_looter = None
+        if looter is not None:
+            try:
+                looter.wait(1000)
+            except Exception:
+                pass
+            looter.deleteLater()
+        if not self._boss_running:
+            return
+        self._boss_detect_start_return()
+
+    def _boss_detect_start_return(self) -> None:
+        if not self._boss_running:
+            return
+        self._boss_stage = "return"
+        ret = self._combo_record(self.combo_boss_return)
+        if ret is None or not ret.get("events"):
+            self._boss_after_iteration()
+            return
+        self._start_boss_player(
+            ret,
+            stage="返回打怪点",
+            speed=1.0,
+            on_done=self._on_boss_return_done,
+            on_error=self._on_boss_player_error,
+        )
+        self._set_boss_state(
+            f"返回打怪点：回放“{ret.get('name')}”…", "warn"
+        )
+        self._update_boss_controls()
+
+    def _on_boss_return_done(self, _stage: str) -> None:
+        player = self.sender()
+        if player is not self._boss_player:
+            return
+        self._boss_player = None
+        if player is not None:
+            try:
+                player.wait(500)
+            except Exception:
+                pass
+            player.deleteLater()
+        if not self._boss_running:
+            return
+        self._boss_after_iteration()
+
+    def _boss_detect_on_timeout(self) -> None:
+        if not self._boss_running or self._boss_stage != "fight":
+            return
+        self._stop_boss_watcher()
+        self._stop_boss_fighter()
+        self._set_boss_state(
+            "战斗达到上限，未识别到 BOSS 死亡；继续拾取/返回",
+            "warn",
+        )
+        self._boss_stage = "loot"
+        pickup = int(self.spin_boss_pickup.value())
+        if pickup <= 0:
+            self._boss_detect_start_return()
+            return
+        looter = TapSender(
+            int(self.target_hwnd),
+            VK_SPACE,
+            pickup,
+            gap_seconds=0.18,
+            parent=self,
+        )
+        looter.failed.connect(self._on_boss_looter_failed)
+        looter.finished.connect(self._on_boss_loot_done)
+        self._boss_looter = looter
+        looter.start()
+
+    def _on_boss_fighter_failed(self, message: str) -> None:
+        if not self._boss_running:
+            return
+        self._boss_finish(f"战斗线程停止：{message}", "error")
+
+    def _on_boss_looter_failed(self, message: str) -> None:
+        if not self._boss_running:
+            return
+        self._boss_finish(f"拾取失败：{message}", "error")
+
+    def _stop_boss_fighter(self) -> None:
+        fighter = self._boss_fighter
+        self._boss_fighter = None
+        if fighter is not None:
+            try:
+                fighter.failed.disconnect(self._on_boss_fighter_failed)
+            except Exception:
+                pass
+            try:
+                fighter.stop()
+                if not fighter.wait(2500):
+                    fighter.terminate()
+                    fighter.wait(500)
+            except Exception:
+                pass
+            fighter.deleteLater()
+
+    def _stop_boss_watcher(self) -> None:
+        watcher = self._boss_watcher
+        self._boss_watcher = None
+        if watcher is not None:
+            try:
+                watcher.stop()
+                if not watcher.wait(2000):
+                    watcher.terminate()
+                    watcher.wait(500)
+            except Exception:
+                pass
+            watcher.deleteLater()
+
+    def _stop_boss_looter(self) -> None:
+        looter = self._boss_looter
+        self._boss_looter = None
+        if looter is not None:
+            try:
+                looter.stop()
+                if not looter.wait(1500):
+                    looter.terminate()
+                    looter.wait(500)
+            except Exception:
+                pass
+            looter.deleteLater()
+
+    def _boss_after_iteration(self) -> None:
+        if not self._boss_running:
+            return
+        self._boss_done += 1
+        if self._boss_total > 0 and self._boss_done >= self._boss_total:
+            self._boss_finish(
+                f"BOSS 完成：共 {self._boss_done} 次", "ok"
+            )
+            return
+        label = (
+            f"{self._boss_done}/{self._boss_total}"
+            if self._boss_total > 0
+            else f"{self._boss_done}（无限）"
+        )
+        self._set_boss_state(f"BOSS 完成 {label}，等待下一轮…", "ok")
+        self._boss_stage = ""
+        self._boss_gap_timer.start(int(self._boss_interval * 1000))
+
+    def _boss_stop_clicked(self) -> None:
+        if self._boss_recorder is not None or self._boss_record_pending:
+            self._toggle_boss_record()
+            return
+        self._stop_boss("已停止 BOSS", "warn")
+
+    def _stop_boss(self, message: str, level: str = "warn") -> None:
+        self._boss_running = False
+        self._boss_preview = False
+        self._boss_preview_resume = False
+        self._boss_resume_farm = False
+        self._boss_gap_timer.stop()
+        self._boss_fight_timer.stop()
+        self._boss_player_stop()
+        self._stop_boss_watcher()
+        self._stop_boss_fighter()
+        self._stop_boss_looter()
+        self._set_boss_state(message, level)
+        self._update_boss_controls()
+        self._schedule_boss_timer()
+
+    def _boss_finish(self, message: str, level: str = "ok") -> None:
+        resume = self._boss_resume_farm
+        self._boss_resume_farm = False
+        self._boss_stop_common()
+        self._set_boss_state(message, level)
+        self._update_boss_controls()
+        self._schedule_boss_timer()
+        if resume and not self._quitting:
+            QTimer.singleShot(300, self._resume_farm_after_boss)
+
+    def _boss_stop_common(self) -> None:
+        self._boss_running = False
+        self._boss_gap_timer.stop()
+        self._boss_fight_timer.stop()
+        self._boss_player_stop()
+        self._stop_boss_watcher()
+        self._stop_boss_fighter()
+        self._stop_boss_looter()
+
+    def _boss_player_stop(self) -> None:
+        player = self._boss_player
+        self._boss_player = None
+        if player is not None:
+            try:
+                player.stop()
+                if not player.wait(3000):
+                    player.terminate()
+                    player.wait(500)
+            except Exception:
+                pass
+            player.deleteLater()
+
+    def _halt_farm_for_boss(self) -> None:
+        worker = self._worker
+        if worker is None:
+            self._stop_fatigue_monitor()
+            return
+        self._worker = None
+        for signal, slot in (
+            (worker.finished, self._on_worker_finished),
+            (worker.failed, self._on_worker_failed),
+            (worker.cycle_done, self._on_cycle_done),
+        ):
+            try:
+                signal.disconnect(slot)
+            except Exception:
+                pass
+        try:
+            worker.stop()
+            if not worker.wait(3000):
+                worker.terminate()
+                worker.wait(500)
+        except Exception:
+            pass
+        worker.deleteLater()
+        self._stop_fatigue_monitor()
+        self._stopping = False
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("开始发送")
+        self.btn_start.setStyleSheet(START_BUTTON_STYLES["idle"])
+        self._set_running_controls(False)
+
+    def _resume_farm_after_boss(self) -> None:
+        if self._quitting or self._worker is not None:
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            self._set_boss_state("BOSS 已完成，但游戏窗口已关闭", "warn")
+            return
+        self._start_sending()
+        self._set_boss_state("BOSS 完成，已恢复挂机", "ok")
+
+    # -- 多开挂机：界面 ------------------------------------------------
     def _build_multi_tab(self) -> QWidget:
         tab = QWidget()
         root = QVBoxLayout(tab)
@@ -4019,43 +5574,184 @@ class MainWindow(QMainWindow):
         cg = QGridLayout(box_cfg)
         cg.setHorizontalSpacing(8)
         cg.setVerticalSpacing(8)
-        cg.setColumnStretch(3, 1)
-
-        cg.addWidget(QLabel("检查间隔"), 0, 0)
+        cg.setColumnStretch(1, 1)
+        cg.addWidget(QLabel("疲劳检查间隔"), 0, 0)
         self.spin_multi_interval = QSpinBox()
         self.spin_multi_interval.setRange(5, 600)
         self.spin_multi_interval.setValue(30)
         self.spin_multi_interval.setSuffix(" 秒")
         self.spin_multi_interval.setFixedWidth(100)
+        self.spin_multi_interval.setToolTip("4 个窗口共用的疲劳检测间隔")
         cg.addWidget(self.spin_multi_interval, 0, 1)
 
         self.btn_multi_refresh = QPushButton("刷新窗口")
         self.btn_multi_refresh.clicked.connect(self._refresh_multi_windows)
-        cg.addWidget(self.btn_multi_refresh, 1, 0)
         self.btn_multi_start_all = QPushButton("全部开始")
         self.btn_multi_start_all.clicked.connect(self._start_all_multi)
-        cg.addWidget(self.btn_multi_start_all, 1, 1)
         self.btn_multi_stop_all = QPushButton("全部停止")
         self.btn_multi_stop_all.clicked.connect(self._stop_all_multi)
-        cg.addWidget(self.btn_multi_stop_all, 1, 2)
+        self.btn_multi_read_names = QPushButton("读取全部名字")
+        self.btn_multi_read_names.clicked.connect(self._read_all_names)
+        cg.addWidget(self.btn_multi_refresh, 0, 2)
+        cg.addWidget(self.btn_multi_start_all, 0, 3)
+        cg.addWidget(self.btn_multi_stop_all, 0, 4)
+        cg.addWidget(self.btn_multi_read_names, 0, 5)
         self.lbl_multi_state = QLabel("未运行")
         self.lbl_multi_state.setObjectName("muted")
         self.lbl_multi_state.setWordWrap(True)
-        cg.addWidget(self.lbl_multi_state, 1, 3)
+        cg.addWidget(self.lbl_multi_state, 0, 6, 1, 2)
+
+        self.chk_multi_background = QCheckBox(
+            "后台回放（不抢鼠标键盘）"
+        )
+        self.chk_multi_background.setChecked(True)
+        self.chk_multi_background.setToolTip(
+            "多开的疲劳检测、BOSS/回血回放都改用 PostMessage 发送，"
+            "不抢前台、不移动真实鼠标键盘。"
+            "部分游戏不处理后鼠标消息，建议先“试放”验证。"
+        )
+        self.chk_multi_background.toggled.connect(
+            self._on_multi_background_toggled
+        )
+        cg.addWidget(self.chk_multi_background, 1, 0, 1, 4)
+
+        self.chk_multi_relative_mouse = QCheckBox(
+            "前台相对鼠标（会抢鼠标）"
+        )
+        self.chk_multi_relative_mouse.setChecked(False)
+        self.chk_multi_relative_mouse.setToolTip(
+            "镜头更准，但会移动真实鼠标并占用前台，无法边用电脑边挂机。"
+            "需要边学习边挂机请用后台模式。"
+        )
+        self.chk_multi_relative_mouse.toggled.connect(
+            self._on_multi_relative_mouse_toggled
+        )
+        cg.addWidget(self.chk_multi_relative_mouse, 1, 4, 1, 4)
+
+        self.chk_multi_keyboard_only = QCheckBox(
+            "静止鼠标 / 仅键盘（防抢）"
+        )
+        self.chk_multi_keyboard_only.setChecked(False)
+        self.chk_multi_keyboard_only.setToolTip(
+            "只回放键盘事件，完全跳过鼠标移动/点击，不移动真实鼠标、"
+            "不抢前台；游戏若自己抢到前台，会尝试把前台还给用户窗口。"
+        )
+        self.chk_multi_keyboard_only.toggled.connect(
+            self._on_multi_keyboard_only_toggled
+        )
+        cg.addWidget(self.chk_multi_keyboard_only, 2, 0, 1, 8)
 
         multi_note = QLabel(
-            "每个槽位绑定一个游戏窗口，并可以分别选择不同的 BOSS 录制；"
-            "勾选“本地挂机”则只后台打怪，不检测疲劳、不播录制。"
-            "疲劳阈值、喝药间隔每个窗口独立设置；检查间隔共用；"
-            "打怪参数沿用基础挂机页的 A / 空格 / 技能 / 喝药设置。"
+            "每个槽位绑定一个游戏窗口，可分别选择 BOSS 录制、回血录制、"
+            "疲劳阈值、喝药间隔和优先级。打怪参数沿用「单开挂机」页的 "
+            "A / 空格 / 技能 / 喝药设置。"
+            "游戏最小化会暂停，后台模式请保持游戏窗口不最小化、放在其它窗口后面。"
         )
         multi_note.setObjectName("muted")
         multi_note.setWordWrap(True)
-        cg.addWidget(multi_note, 2, 0, 1, 4)
+        cg.addWidget(multi_note, 3, 0, 1, 8)
         root.addWidget(box_cfg)
+
+        box_aux = QGroupBox("血量保护 / 角色名")
+        ag = QGridLayout(box_aux)
+        ag.setHorizontalSpacing(8)
+        ag.setVerticalSpacing(8)
+        ag.setColumnStretch(1, 1)
+
+        self.chk_hp_guard = QCheckBox("启用血量保护")
+        self.chk_hp_guard.setToolTip(
+            "低血时优先回血：回血红线（高）触发回血，"
+            "停平A红线（低）只暂停发 A，技能/喝药继续。"
+        )
+        self.chk_hp_guard.toggled.connect(self._update_multi_controls)
+        self.chk_hp_need_heal = QCheckBox("需要回血脚本（可选）")
+        self.chk_hp_need_heal.setToolTip(
+            "勾选：每个窗口必须选择/录制回血脚本；"
+            "取消：低血只按停平A红线停手，不播放回血。"
+        )
+        self.chk_hp_need_heal.toggled.connect(self._update_multi_controls)
+        ag.addWidget(self.chk_hp_guard, 0, 0)
+        ag.addWidget(self.chk_hp_need_heal, 0, 1)
+
+        ag.addWidget(QLabel("回血红线"), 0, 2)
+        self.spin_hp_threshold = QSpinBox()
+        self.spin_hp_threshold.setRange(HP_RED_LINE, 100000)
+        self.spin_hp_threshold.setValue(600)
+        self.spin_hp_threshold.setSingleStep(10)
+        self.spin_hp_threshold.setFixedWidth(100)
+        self.spin_hp_threshold.valueChanged.connect(self._on_hp_line_changed)
+        ag.addWidget(self.spin_hp_threshold, 0, 3)
+
+        ag.addWidget(QLabel("停平A红线"), 0, 4)
+        self.spin_hp_pause_line = QSpinBox()
+        self.spin_hp_pause_line.setRange(HP_RED_LINE, 100000)
+        self.spin_hp_pause_line.setValue(HP_RED_LINE)
+        self.spin_hp_pause_line.setSingleStep(10)
+        self.spin_hp_pause_line.setFixedWidth(100)
+        self.spin_hp_pause_line.valueChanged.connect(self._on_hp_line_changed)
+        ag.addWidget(self.spin_hp_pause_line, 0, 5)
+
+        ag.addWidget(QLabel("血量检测"), 0, 6)
+        self.spin_hp_interval = QSpinBox()
+        self.spin_hp_interval.setRange(1, 30)
+        self.spin_hp_interval.setValue(1)
+        self.spin_hp_interval.setSuffix(" 秒")
+        self.spin_hp_interval.setFixedWidth(90)
+        ag.addWidget(self.spin_hp_interval, 0, 7)
+
+        self.chk_hp_potion = QCheckBox("血量低于阈值自动吃药（Q+W）")
+        self.chk_hp_potion.setToolTip(
+            "血量低于阈值时，按「喝药间隔」持续发送 Q 和 W，"
+            "直到血量高于阈值；启用后不再按固定间隔自动喝药。"
+            "使用下面框选的血量区域。"
+        )
+        self.chk_hp_potion.toggled.connect(self._update_multi_controls)
+        ag.addWidget(self.chk_hp_potion, 1, 0, 1, 3)
+        ag.addWidget(QLabel("吃药阈值"), 1, 3)
+        self.spin_hp_potion_threshold = QSpinBox()
+        self.spin_hp_potion_threshold.setRange(1, 100000)
+        self.spin_hp_potion_threshold.setValue(1600)
+        self.spin_hp_potion_threshold.setSingleStep(10)
+        self.spin_hp_potion_threshold.setSuffix(" 点")
+        self.spin_hp_potion_threshold.setFixedWidth(110)
+        ag.addWidget(self.spin_hp_potion_threshold, 1, 4)
+        ag.addWidget(
+            QLabel("低于阈值后按 Q 间隔发送 Q + W"), 1, 5, 1, 3
+        )
+
+        self.btn_hp_roi = QPushButton("框选血量区域")
+        self.btn_hp_roi.setFixedWidth(110)
+        self.btn_hp_roi.clicked.connect(self._select_hp_roi)
+        self.lbl_hp_roi = QLabel("未设置")
+        self.lbl_hp_roi.setObjectName("muted")
+        ag.addWidget(self.btn_hp_roi, 2, 0)
+        ag.addWidget(self.lbl_hp_roi, 2, 1, 1, 3)
+
+        self.btn_name_roi = QPushButton("框选角色名区域")
+        self.btn_name_roi.setFixedWidth(126)
+        self.btn_name_roi.clicked.connect(self._select_name_roi)
+        self.lbl_name_roi = QLabel("未设置")
+        self.lbl_name_roi.setObjectName("muted")
+        ag.addWidget(self.btn_name_roi, 2, 4)
+        ag.addWidget(self.lbl_name_roi, 2, 5, 1, 3)
+
+        aux_note = QLabel(
+            "血量区域框住头像旁的当前血量数字（如 1725/1780）；"
+            "角色名区域框住窗口里显示的角色名。"
+            "角色名在绑定/刷新窗口时自动读取，也可以点“读取全部名字”。"
+            "窗口最小化时 OCR 会暂停，恢复窗口后自动继续。"
+        )
+        aux_note.setObjectName("muted")
+        aux_note.setWordWrap(True)
+        ag.addWidget(aux_note, 3, 0, 1, 8)
+        root.addWidget(box_aux)
 
         self.combo_multi_windows: list[QComboBox] = []
         self.combo_multi_records: list[QComboBox] = []
+        self.combo_multi_heal_records: list[QComboBox] = []
+        self.lbl_multi_names: list[QLabel] = []
+        self.lbl_multi_hps: list[QLabel] = []
+        self.lbl_multi_heal_labels: list[QLabel] = []
         self.lbl_multi_slots: list[QLabel] = []
         self.spin_multi_thresholds: list[QSpinBox] = []
         self.spin_multi_potions: list[QSpinBox] = []
@@ -4064,6 +5760,9 @@ class MainWindow(QMainWindow):
         self.btn_multi_tests: list[QPushButton] = []
         self.btn_multi_starts: list[QPushButton] = []
         self.btn_multi_stops: list[QPushButton] = []
+        self.btn_multi_heal_records: list[QPushButton] = []
+        self.btn_multi_heal_tests: list[QPushButton] = []
+        self.btn_multi_heal_deletes: list[QPushButton] = []
 
         for index in range(4):
             box = QGroupBox(f"窗口 {index + 1}")
@@ -4071,18 +5770,30 @@ class MainWindow(QMainWindow):
             sg.setHorizontalSpacing(8)
             sg.setVerticalSpacing(8)
             sg.setColumnStretch(1, 1)
-            sg.setColumnStretch(4, 1)
+            sg.setColumnStretch(5, 1)
+
             sg.addWidget(QLabel("游戏窗口"), 0, 0)
             window_combo = QComboBox()
-            window_combo.setMinimumWidth(280)
+            window_combo.setMinimumWidth(260)
+            window_combo.currentIndexChanged.connect(
+                lambda _=0, i=index: self._on_multi_window_changed(i)
+            )
             sg.addWidget(window_combo, 0, 1, 1, 2)
-            sg.addWidget(QLabel("BOSS 录制"), 0, 3)
+
+            name_label = QLabel("角色: --")
+            name_label.setObjectName("muted")
+            name_label.setMinimumWidth(150)
+            name_label.setToolTip("自动 OCR 读取的角色名")
+            sg.addWidget(name_label, 0, 3)
+
+            sg.addWidget(QLabel("BOSS 录制"), 0, 4)
             record_combo = QComboBox()
-            record_combo.setMinimumWidth(240)
+            record_combo.setMinimumWidth(200)
             record_combo.currentIndexChanged.connect(
                 lambda _=0: self._update_multi_controls()
             )
-            sg.addWidget(record_combo, 0, 4, 1, 2)
+            sg.addWidget(record_combo, 0, 5, 1, 2)
+
             chk_farm = QCheckBox("本地挂机")
             chk_farm.setToolTip(
                 "只在本窗口后台打怪，不检测疲劳、不播放录制；"
@@ -4091,23 +5802,24 @@ class MainWindow(QMainWindow):
             chk_farm.toggled.connect(
                 lambda _=False: self._update_multi_controls()
             )
-            sg.addWidget(chk_farm, 0, 6)
+            sg.addWidget(chk_farm, 0, 7)
+
             btn_test = QPushButton("试放")
-            btn_test.clicked.connect(
-                lambda _=False, i=index: self._test_multi_slot(i)
-            )
             btn_start = QPushButton("开始")
             btn_stop = QPushButton("停止")
             btn_stop.setEnabled(False)
+            btn_test.clicked.connect(
+                lambda _=False, i=index: self._test_multi_slot(i)
+            )
             btn_start.clicked.connect(
                 lambda _=False, i=index: self._start_multi_slot(i)
             )
             btn_stop.clicked.connect(
                 lambda _=False, i=index: self._stop_multi_slot(i)
             )
-            sg.addWidget(btn_test, 0, 7)
-            sg.addWidget(btn_start, 0, 8)
-            sg.addWidget(btn_stop, 0, 9)
+            sg.addWidget(btn_test, 0, 8)
+            sg.addWidget(btn_start, 0, 9)
+            sg.addWidget(btn_stop, 0, 10)
 
             sg.addWidget(QLabel("疲劳阈值 ±"), 1, 0)
             spin_threshold = QSpinBox()
@@ -4118,88 +5830,142 @@ class MainWindow(QMainWindow):
             spin_threshold.setFixedWidth(110)
             spin_threshold.setToolTip("这个窗口单独使用的疲劳阈值")
             sg.addWidget(spin_threshold, 1, 1)
+
             sg.addWidget(QLabel("喝药间隔"), 1, 2)
             spin_potion = QSpinBox()
             spin_potion.setRange(5, 3600)
             spin_potion.setSingleStep(5)
             spin_potion.setValue(int(self.spin_potion.value()))
             spin_potion.setSuffix(" 秒")
-            spin_potion.setFixedWidth(110)
+            spin_potion.setFixedWidth(100)
             spin_potion.setToolTip(
-                "这个窗口单独使用的喝药间隔；是否喝药仍由基础页“自动喝药 Q”控制"
+                "这个窗口单独使用的喝药间隔；是否喝药仍由单开页“自动喝药 Q”控制"
             )
             sg.addWidget(spin_potion, 1, 3)
+
             sg.addWidget(QLabel("优先级"), 1, 4)
             spin_priority = QSpinBox()
-            spin_priority.setRange(1, 4)
+            spin_priority.setRange(1, 99)
             spin_priority.setValue(index + 1)
             spin_priority.setFixedWidth(70)
             spin_priority.setToolTip(
                 "1 最高。多个窗口同时要打 BOSS 时，按优先级从小到大排队。"
             )
             sg.addWidget(spin_priority, 1, 5)
+
             status = QLabel("未开始")
             status.setObjectName("muted")
             status.setWordWrap(True)
-            sg.addWidget(status, 1, 6, 1, 4)
+            sg.addWidget(status, 1, 6, 1, 5)
+
+            sg.addWidget(QLabel("血量"), 2, 0)
+            hp_label = QLabel("血量: --")
+            hp_label.setObjectName("muted")
+            hp_label.setMinimumWidth(160)
+            sg.addWidget(hp_label, 2, 1, 1, 2)
+
+            heal_label = QLabel("回血录制")
+            sg.addWidget(heal_label, 2, 3)
+            heal_combo = QComboBox()
+            heal_combo.setMinimumWidth(180)
+            heal_combo.currentIndexChanged.connect(
+                lambda _=0: self._update_multi_controls()
+            )
+            sg.addWidget(heal_combo, 2, 4, 1, 2)
+
+            heal_btn = QPushButton("录制回血")
+            heal_btn.clicked.connect(
+                lambda _=False, i=index: self._toggle_multi_heal_record(i)
+            )
+            heal_test = QPushButton("试放")
+            heal_test.clicked.connect(
+                lambda _=False, i=index: self._test_multi_heal(i)
+            )
+            heal_delete = QPushButton("删除")
+            heal_delete.clicked.connect(
+                lambda _=False, i=index: self._delete_multi_heal(i)
+            )
+            sg.addWidget(heal_btn, 2, 6)
+            sg.addWidget(heal_test, 2, 7)
+            sg.addWidget(heal_delete, 2, 8)
+
             root.addWidget(box)
             self.combo_multi_windows.append(window_combo)
             self.combo_multi_records.append(record_combo)
+            self.combo_multi_heal_records.append(heal_combo)
+            self.lbl_multi_names.append(name_label)
+            self.lbl_multi_hps.append(hp_label)
+            self.lbl_multi_heal_labels.append(heal_label)
+            self.lbl_multi_slots.append(status)
             self.spin_multi_thresholds.append(spin_threshold)
             self.spin_multi_potions.append(spin_potion)
             self.spin_multi_priorities.append(spin_priority)
-            self.lbl_multi_slots.append(status)
             self.chk_multi_farm_only.append(chk_farm)
             self.btn_multi_tests.append(btn_test)
             self.btn_multi_starts.append(btn_start)
             self.btn_multi_stops.append(btn_stop)
+            self.btn_multi_heal_records.append(heal_btn)
+            self.btn_multi_heal_tests.append(heal_test)
+            self.btn_multi_heal_deletes.append(heal_delete)
 
         root.addStretch(1)
-        wholesale = QScrollArea()
-        wholesale.setWidgetResizable(True)
-        wholesale.setFrameShape(QFrame.Shape.NoFrame)
-        wholesale.setWidget(tab)
-        return wholesale
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(tab)
+        return scroll
 
-    # ------------------------------------------------------------ 多开挂机
+    # -- 多开挂机：录制 / 窗口 / 角色名 ----------------------------------
     def _multi_record_data(self, index: int) -> Optional[dict]:
         if not (0 <= index < len(self.combo_multi_records)):
             return None
-        name = str(self.combo_multi_records[index].currentData() or "").strip()
+        return self._boss_record_by_name(
+            self.combo_multi_records[index].currentData()
+        )
+
+    def _heal_record_data(self, index: int) -> Optional[dict]:
+        if not (0 <= index < len(self.combo_multi_heal_records)):
+            return None
+        name = self.combo_multi_heal_records[index].currentData()
         if not name:
             return None
-        return next(
-            (
-                record
-                for record in self._dungeon_records
-                if str(record.get("name", "")) == name
-            ),
-            None,
-        )
+        for record in self._heal_records:
+            if record.get("name") == name:
+                return record
+        return None
+
+    @staticmethod
+    def _fill_named_record_combo(
+        combo: QComboBox, records: list[dict], placeholder: str
+    ) -> None:
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(placeholder, None)
+        for record in records:
+            combo.addItem(str(record.get("name") or ""), record.get("name"))
+        index = combo.findData(current)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.blockSignals(False)
 
     def _refresh_multi_records(self) -> None:
         if not hasattr(self, "combo_multi_records"):
             return
-        for combo in self.combo_multi_records:
-            current = str(combo.currentData() or "")
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("（请选择 BOSS 录制）", "")
-            for record in self._dungeon_records:
-                name = str(record.get("name", "")).strip()
-                if name:
-                    combo.addItem(name, name)
-            idx = combo.findData(current) if current else -1
-            if idx > 0:
-                combo.setCurrentIndex(idx)
-            elif combo.count() > 1:
-                combo.setCurrentIndex(1)
-            combo.blockSignals(False)
+        for index in range(4):
+            self._fill_named_record_combo(
+                self.combo_multi_records[index],
+                self._boss_records,
+                "（请选择 BOSS 录制）",
+            )
+            self._fill_named_record_combo(
+                self.combo_multi_heal_records[index],
+                self._heal_records,
+                "（不选择回血录制）",
+            )
         self._update_multi_controls()
 
-    def _refresh_multi_windows(self) -> None:
-        if not hasattr(self, "combo_multi_windows"):
-            return
+    def _enum_creature_windows(self) -> list[tuple[str, int]]:
         own_hwnd = 0
         try:
             own_hwnd = int(self.winId())
@@ -4222,125 +5988,406 @@ class MainWindow(QMainWindow):
 
         try:
             win32gui.EnumWindows(enum_callback, None)
-        except Exception as exc:
-            self._set_status(f"枚举窗口失败：{exc}", "error")
-            return
+        except Exception:
+            return []
         unique = {(title, hwnd) for title, hwnd in found}
-        found = sorted(unique, key=lambda item: (item[0].lower(), item[1]))
-        hwnds = [hwnd for _title, hwnd in found]
-        current = [combo.currentData() for combo in self.combo_multi_windows]
-        used: set[int] = set()
-        for runner in self._multi_runners:
-            if runner is not None and getattr(runner, "is_running", False):
-                used.add(int(runner.hwnd))
+        return sorted(unique, key=lambda item: (item[0].lower(), item[1]))
 
-        for index, combo in enumerate(self.combo_multi_windows):
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("（未选择）", None)
-            for title, hwnd in found:
-                combo.addItem(f"{title} [0x{hwnd:X}]", hwnd)
-            desired = current[index]
-            chosen = None
-            if desired in hwnds and desired not in used:
-                chosen = desired
-            else:
-                for hwnd in hwnds:
-                    if hwnd not in used:
-                        chosen = hwnd
-                        break
-            if chosen is not None:
-                idx = combo.findData(chosen)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-                used.add(int(chosen))
-            else:
-                combo.setCurrentIndex(0)
-            combo.blockSignals(False)
+    def _refresh_multi_windows(self) -> None:
+        if not hasattr(self, "combo_multi_windows"):
+            return
+        found = self._enum_creature_windows()
+        found_hwnds = {hwnd for _title, hwnd in found}
 
-        self._multi_state_text = (
-            f"找到 {len(found)} 个游戏窗口" if found else "没有找到游戏窗口"
-        )
+        self._multi_loading = True
+        try:
+            used: set[int] = set()
+            for index in range(4):
+                combo = self.combo_multi_windows[index]
+                current = combo.currentData()
+                desired = None
+                if current is not None and int(current) in found_hwnds:
+                    desired = int(current)
+                elif (
+                    self._multi_saved_hwnds[index] is not None
+                    and int(self._multi_saved_hwnds[index]) in found_hwnds
+                ):
+                    desired = int(self._multi_saved_hwnds[index])
+                if desired is not None and desired in used:
+                    desired = None
+                if desired is not None:
+                    used.add(desired)
+
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItem("（请选择窗口）", None)
+                for title, hwnd in found:
+                    combo.addItem(f"{title} [0x{hwnd:X}]", hwnd)
+                index_to_select = (
+                    combo.findData(desired) if desired is not None else 0
+                )
+                if index_to_select < 0:
+                    index_to_select = 0
+                combo.setCurrentIndex(index_to_select)
+                combo.blockSignals(False)
+                self._multi_saved_hwnds[index] = combo.currentData()
+
+            # 第二遍：把没分配到的槽位自动填上还没被占用的窗口
+            used = {
+                int(combo.currentData())
+                for combo in self.combo_multi_windows
+                if combo.currentData() is not None
+            }
+            free = [hwnd for _title, hwnd in found if hwnd not in used]
+            for index in range(4):
+                combo = self.combo_multi_windows[index]
+                if combo.currentData() is not None or not free:
+                    continue
+                hwnd = free.pop(0)
+                combo.blockSignals(True)
+                combo.setCurrentIndex(combo.findData(hwnd))
+                combo.blockSignals(False)
+                self._multi_saved_hwnds[index] = hwnd
+        finally:
+            self._multi_loading = False
+
         self._update_multi_controls()
+        for index in range(4):
+            self._schedule_multi_name(index)
 
-        # 运行中的槽位如果窗口被关闭，自动停止。
-        for index, runner in enumerate(self._multi_runners):
-            if runner is None or not getattr(runner, "is_running", False):
-                continue
-            if not self._window_alive(runner.hwnd):
-                runner.stop("游戏窗口已关闭", "error")
+    def _on_multi_window_changed(self, index: int) -> None:
+        if getattr(self, "_multi_loading", False):
+            return
+        if 0 <= index < len(self.combo_multi_windows):
+            self._multi_saved_hwnds[index] = (
+                self.combo_multi_windows[index].currentData()
+            )
+        self._schedule_multi_name(index)
+        self._update_multi_controls()
+        self._save_multi_settings()
 
+    def _schedule_multi_name(self, index: int) -> None:
+        if not (0 <= index < len(self.lbl_multi_names)):
+            return
+        label = self.lbl_multi_names[index]
+        if self._name_roi_norm is None:
+            label.setText("角色: 未设置区域")
+            label.setStyleSheet("color: #ffb454; padding: 0;")
+            label.setToolTip("请先点“框选角色名区域”")
+            return
+        hwnd = self._multi_slot_hwnd(index)
+        if hwnd is None:
+            label.setText("角色: --")
+            label.setStyleSheet("color: #8f959e; padding: 0;")
+            return
+        if self._window_alive(hwnd) and win32gui.IsIconic(hwnd):
+            label.setText("角色: 窗口已最小化")
+            label.setStyleSheet("color: #8f959e; padding: 0;")
+            label.setToolTip("恢复游戏窗口后会自动读取")
+            return
+        label.setText("角色: 读取中…")
+        label.setStyleSheet("color: #8ab4f8; padding: 0;")
+        QTimer.singleShot(120, lambda i=index: self._read_multi_name(i))
+
+    def _read_multi_name(self, index: int) -> None:
+        if self._quitting or self._name_roi_norm is None:
+            return
+        if not (0 <= index < 4):
+            return
+        hwnd = self._multi_slot_hwnd(index)
+        if hwnd is None:
+            return
+        if self._window_alive(hwnd) and win32gui.IsIconic(hwnd):
+            self._schedule_multi_name(index)
+            return
+        old = self._name_readers[index]
+        if old is not None and old.isRunning():
+            old.stop()
+        reader = NameReader(hwnd, self._name_roi_norm, parent=self)
+        self._name_readers[index] = reader
+        reader.result.connect(
+            lambda name, msg, i=index, h=hwnd: self._on_multi_name_result(
+                i, h, name, msg
+            )
+        )
+        reader.finished.connect(
+            lambda i=index, r=reader: self._on_multi_name_finished(i, r)
+        )
+        reader.start()
+
+    def _on_multi_name_result(
+        self, index: int, hwnd: int, name: str, message: str
+    ) -> None:
+        if not (0 <= index < len(self.lbl_multi_names)):
+            return
+        current = self._multi_slot_hwnd(index)
+        if current is None or int(current) != int(hwnd):
+            return
+        label = self.lbl_multi_names[index]
+        if name:
+            label.setText(f"角色: {name}")
+            label.setStyleSheet("color: #3ddc84; padding: 0;")
+            label.setToolTip(message)
+        elif "最小化" in str(message):
+            label.setText("角色: 窗口已最小化")
+            label.setStyleSheet("color: #8f959e; padding: 0;")
+            label.setToolTip("恢复游戏窗口后会自动读取")
+        else:
+            label.setText("角色: 识别失败")
+            label.setStyleSheet("color: #ffb454; padding: 0;")
+            label.setToolTip(message or "未识别到角色名，请重新框选区域")
+
+    def _on_multi_name_finished(
+        self, index: int, reader: NameReader
+    ) -> None:
+        if 0 <= index < len(self._name_readers):
+            if self._name_readers[index] is reader:
+                self._name_readers[index] = None
+        try:
+            reader.deleteLater()
+        except Exception:
+            pass
+
+    def _read_all_names(self) -> None:
+        if self._name_roi_norm is None:
+            self._notify(
+                "尚未框选角色名区域",
+                "请先点“框选角色名区域”，框住每个窗口里显示的角色名。",
+            )
+            return
+        for index in range(4):
+            if self._multi_slot_hwnd(index) is not None:
+                self._schedule_multi_name(index)
+
+    def _stop_name_readers(self) -> None:
+        for index, reader in enumerate(self._name_readers):
+            if reader is not None:
+                try:
+                    reader.stop()
+                    reader.wait(1500)
+                except Exception:
+                    pass
+                self._name_readers[index] = None
+
+    def _multi_slot_hwnd(self, index: int) -> Optional[int]:
+        if not (0 <= index < len(self.combo_multi_windows)):
+            return None
+        hwnd = self.combo_multi_windows[index].currentData()
+        if hwnd is None:
+            return None
+        return int(hwnd)
+
+    def _multi_heal_recording(self) -> bool:
+        return (
+            self._heal_recorder is not None
+            or self._heal_record_pending
+        )
+
+    def _any_multi_running(self) -> bool:
+        return any(
+            runner is not None and getattr(runner, "is_running", False)
+            for runner in self._multi_runners
+        )
+
+    def _multi_busy(self) -> bool:
+        return (
+            self._any_multi_running()
+            or self._multi_heal_recording()
+            or self._heal_test_player is not None
+        )
+
+    def _single_busy_for_multi(self) -> bool:
+        return bool(
+            self._worker is not None
+            or self._boss_busy()
+            or self._heal_recorder is not None
+            or self._heal_record_pending
+            or self._heal_test_player is not None
+        )
+
+    def _set_multi_slot_text(self, index: int, text: str) -> None:
+        if 0 <= index < len(self.lbl_multi_slots):
+            self.lbl_multi_slots[index].setText(text)
+
+    # -- 多开挂机：控件状态 ----------------------------------------------
     def _update_multi_controls(self) -> None:
         if not hasattr(self, "btn_multi_start_all"):
             return
-        roi_ok = self._fatigue_roi_norm is not None
-        single_busy = self._single_window_busy()
+        single_busy = self._single_busy_for_multi()
+        heal_recording = self._multi_heal_recording()
+        heal_testing = self._heal_test_player is not None
         any_running = self._any_multi_running()
-        startable = False
         running_count = 0
+        can_start_any = False
+
         for index in range(4):
             runner = self._multi_runners[index]
-            running = runner is not None and getattr(runner, "is_running", False)
+            running = runner is not None and getattr(
+                runner, "is_running", False
+            )
             if running:
                 running_count += 1
+            hwnd = self._multi_slot_hwnd(index)
+            farm_only = self.chk_multi_farm_only[index].isChecked()
             record = self._multi_record_data(index)
             record_ok = bool(record and record.get("events"))
-            window_combo = self.combo_multi_windows[index]
-            record_combo = self.combo_multi_records[index]
-            farm_only = self.chk_multi_farm_only[index].isChecked()
-            hwnd = window_combo.currentData()
-            window_combo.setEnabled(not running)
-            record_combo.setEnabled(not running and not farm_only)
+            heal_record = self._heal_record_data(index)
+            heal_ok = bool(heal_record and heal_record.get("events"))
+            hp_guard = self.chk_hp_guard.isChecked()
+            need_heal = self.chk_hp_need_heal.isChecked()
+            hp_potion = self.chk_hp_potion.isChecked()
+            heal_enabled = bool(hp_guard and need_heal)
+            hp_roi_required = bool(hp_guard or hp_potion)
+            hp_roi_ok = self._hp_roi_norm is not None
+            heal_recording_here = (
+                heal_recording and self._heal_record_index == index
+            )
+            idle = (
+                (not running)
+                and (not single_busy)
+                and (not heal_recording)
+                and (not heal_testing)
+            )
+
+            self.combo_multi_windows[index].setEnabled(
+                not running and not heal_recording and not single_busy
+            )
+            self.combo_multi_records[index].setEnabled(idle and not farm_only)
+            self.combo_multi_heal_records[index].setEnabled(
+                idle and heal_enabled
+            )
             self.chk_multi_farm_only[index].setEnabled(not running)
             self.spin_multi_thresholds[index].setEnabled(not running)
             self.spin_multi_potions[index].setEnabled(not running)
             self.spin_multi_priorities[index].setEnabled(not running)
-            can_start = (
-                (not running)
-                and bool(hwnd)
-                and not single_busy
-                and (farm_only or (record_ok and roi_ok))
+
+            heal_visible = bool(hp_guard and need_heal)
+            self.lbl_multi_heal_labels[index].setVisible(heal_visible)
+            self.combo_multi_heal_records[index].setVisible(heal_visible)
+            self.btn_multi_heal_records[index].setVisible(heal_visible)
+            self.btn_multi_heal_tests[index].setVisible(heal_visible)
+            self.btn_multi_heal_deletes[index].setVisible(heal_visible)
+
+            heal_btn = self.btn_multi_heal_records[index]
+            if heal_recording_here:
+                heal_btn.setText(
+                    "取消录制" if self._heal_record_pending else "停止录制"
+                )
+            else:
+                heal_btn.setText("录制回血")
+            heal_btn.setEnabled(
+                heal_recording_here
+                or (idle and heal_enabled and hwnd is not None)
+            )
+            self.btn_multi_heal_tests[index].setEnabled(
+                idle and heal_enabled and heal_ok and hwnd is not None
+            )
+            self.btn_multi_heal_deletes[index].setEnabled(
+                idle and heal_enabled and heal_ok
+            )
+
+            hp_ok = (not hp_roi_required) or (
+                hp_roi_ok
+                and (heal_ok or not (hp_guard and need_heal))
+            )
+            can_start = bool(
+                idle
+                and hwnd is not None
+                and hp_ok
+                and (farm_only or (record_ok and self._fatigue_roi_norm))
+            )
+            missing = []
+            if hwnd is None:
+                missing.append("游戏窗口")
+            if not farm_only and not record_ok:
+                missing.append("BOSS 录制")
+            if not farm_only and self._fatigue_roi_norm is None:
+                missing.append("疲劳提示区域")
+            if hp_roi_required and not hp_roi_ok:
+                missing.append("血量区域")
+            if hp_guard and need_heal and not heal_ok:
+                missing.append("回血录制")
+            self.btn_multi_starts[index].setToolTip(
+                "还缺少：" + "、".join(missing)
+                if missing
+                else "开始这个窗口的挂机"
             )
             self.btn_multi_starts[index].setEnabled(can_start)
             self.btn_multi_stops[index].setEnabled(running)
             self.btn_multi_tests[index].setEnabled(
-                (not running)
-                and bool(hwnd)
-                and record_ok
-                and not single_busy
-                and not farm_only
+                idle and hwnd is not None and record_ok and not farm_only
             )
             if can_start:
-                startable = True
+                can_start_any = True
+
         self.spin_multi_interval.setEnabled(not any_running)
-        self.btn_multi_start_all.setEnabled(startable)
+        self.btn_multi_refresh.setEnabled(
+            not any_running and not heal_recording and not heal_testing
+        )
+        self.btn_multi_start_all.setEnabled(can_start_any)
         self.btn_multi_stop_all.setEnabled(any_running)
-        self.btn_multi_refresh.setEnabled(True)
+        for widget in (
+            self.chk_hp_guard,
+            self.chk_hp_need_heal,
+            self.spin_hp_threshold,
+            self.spin_hp_pause_line,
+            self.spin_hp_interval,
+            self.btn_hp_roi,
+            self.btn_name_roi,
+            self.chk_hp_potion,
+            self.spin_hp_potion_threshold,
+            self.chk_multi_background,
+            self.chk_multi_relative_mouse,
+            self.chk_multi_keyboard_only,
+        ):
+            widget.setEnabled(
+                not any_running and not heal_recording and not heal_testing
+            )
+        self.chk_hp_need_heal.setEnabled(
+            (not any_running)
+            and (not heal_recording)
+            and (not heal_testing)
+            and self.chk_hp_guard.isChecked()
+        )
         if any_running:
             self.lbl_multi_state.setText(f"多开运行中：{running_count}/4")
         else:
             self.lbl_multi_state.setText(
                 getattr(self, "_multi_state_text", "未运行")
             )
+        self._update_bind_button_state()
+        self._update_toggle_action()
 
-    def _start_multi_slot(self, index: int) -> None:
-        if index < 0 or index >= 4:
+    # -- 多开挂机：启动 / 停止 --------------------------------------------
+    def _start_multi_slot(self, index: int, silent: bool = False) -> None:
+        if not (0 <= index < 4):
             return
-        if self._single_window_busy():
-            self._notify(
-                "单窗口正在运行",
-                "请先停止基础挂机/路径/副本/组合/疲劳循环，再启动多开。",
-            )
+        if self._single_busy_for_multi() or self._multi_heal_recording():
+            if not silent:
+                self._notify(
+                    "单开自动化正在运行",
+                    "请先停止单开挂机/自动BOSS/回血录制，再启动多开。",
+                )
             return
         runner = self._multi_runners[index]
         if runner is not None and getattr(runner, "is_running", False):
             return
-        hwnd = self.combo_multi_windows[index].currentData()
+        hwnd = self._multi_slot_hwnd(index)
         if hwnd is None:
-            self._notify("没有选择窗口", f"请给窗口 {index + 1} 选择一个游戏窗口。")
+            if not silent:
+                self._notify(
+                    "没有选择窗口",
+                    f"请给窗口 {index + 1} 选择一个游戏窗口。",
+                )
+            else:
+                self._set_multi_slot_text(index, "未选择窗口")
             return
-        if not self._window_alive(int(hwnd)):
-            self._notify("窗口已关闭", "请先点“刷新窗口”，重新选择。")
+        if not self._window_alive(hwnd):
+            if not silent:
+                self._notify(
+                    "窗口已关闭",
+                    "请先点“刷新窗口”，重新选择。",
+                )
             return
         for other_index, other in enumerate(self._multi_runners):
             if (
@@ -4349,32 +6396,187 @@ class MainWindow(QMainWindow):
                 and getattr(other, "is_running", False)
                 and int(other.hwnd) == int(hwnd)
             ):
-                self._notify(
-                    "窗口重复",
-                    f"窗口 {index + 1} 和窗口 {other_index + 1} 选了同一个游戏窗口。",
-                )
+                if not silent:
+                    self._notify(
+                        "窗口重复",
+                        f"窗口 {index + 1} 和窗口 {other_index + 1} "
+                        "选了同一个游戏窗口。",
+                    )
                 return
+
         farm_only = self.chk_multi_farm_only[index].isChecked()
         record = self._multi_record_data(index)
         if not farm_only:
             if record is None or not record.get("events"):
-                self._notify(
-                    "没有录制",
-                    f"请先给窗口 {index + 1} 选择一段有效的 BOSS 录制，"
-                    "或者勾选“本地挂机”。",
-                )
+                if not silent:
+                    self._notify(
+                        "没有录制",
+                        f"请先给窗口 {index + 1} 选择一段有效的 BOSS 录制，"
+                        "或者勾选“本地挂机”。",
+                    )
                 return
             if self._fatigue_roi_norm is None:
-                self._notify(
-                    "尚未框选疲劳区域",
-                    "请先在基础挂机页框选疲劳提示区域，"
-                    "或者勾选“本地挂机”。",
-                )
+                if not silent:
+                    self._notify(
+                        "尚未框选疲劳区域",
+                        "请先在单开页框选疲劳提示区域，"
+                        "或者勾选“本地挂机”。",
+                    )
                 return
+
+        hp_enabled = self.chk_hp_guard.isChecked()
+        need_heal = self.chk_hp_need_heal.isChecked()
+        hp_potion = self.chk_hp_potion.isChecked()
+        heal_record = self._heal_record_data(index)
+        if (hp_enabled or hp_potion) and self._hp_roi_norm is None:
+            if not silent:
+                self._notify(
+                    "尚未框选血量区域",
+                    "请先点“框选血量区域”，框住头像旁边的当前血量数字。",
+                )
+            return
+        if hp_enabled:
+            if need_heal and (
+                heal_record is None or not heal_record.get("events")
+            ):
+                if not silent:
+                    self._notify(
+                        "没有回血录制",
+                        f"请给窗口 {index + 1} 选择一段回血录制，"
+                        "或者取消勾选“需要回血脚本”。",
+                    )
+                return
+
+        self._save_multi_settings()
+        if (
+            self.chk_multi_background.isChecked()
+            and self._record_move_count(record) > 20
+        ):
+            self._set_status(
+                "提示：多开录制含大量鼠标移动，后台回放可能走偏；"
+                "可关闭后台并勾选“相对鼠标移动”",
+                "warn",
+            )
         config = {
+            "label": str(record.get("name") or "本地挂机") if record else "本地挂机",
             "farm_only": bool(farm_only),
             "events": list(record.get("events", [])) if record else [],
             "meta": record.get("meta") if record else None,
+            "hp_enabled": bool(hp_enabled),
+            "hp_need_heal": bool(need_heal),
+            "hp_potion_enabled": bool(hp_potion),
+            "hp_potion_threshold": int(
+                self.spin_hp_potion_threshold.value()
+            ),
+            "hp_roi": (
+                list(self._hp_roi_norm)
+                if (hp_enabled or hp_potion)
+                else None
+            ),
+            "hp_threshold": int(self.spin_hp_threshold.value()),
+            "hp_pause_line": int(self.spin_hp_pause_line.value()),
+            "hp_red_line": HP_RED_LINE,
+            "hp_interval": int(self.spin_hp_interval.value()),
+            "heal_events": (
+                list(heal_record.get("events", []))
+                if hp_enabled and need_heal and heal_record
+                else []
+            ),
+            "heal_meta": (
+                heal_record.get("meta")
+                if hp_enabled and need_heal and heal_record
+                else None
+            ),
+            "threshold": int(self.spin_multi_thresholds[index].value()),
+            "priority": int(self.spin_multi_priorities[index].value()),
+            "interval": float(self.spin_multi_interval.value()),
+            "roi_norm": self._fatigue_roi_norm,
+            "speed": 1.0,
+            "interval_ms": int(self.spin_interval.value()),
+            "use_skills": bool(self.chk_skills.isChecked()),
+            "potion_interval_ms": int(
+                self.spin_multi_potions[index].value()
+            ) * 1000,
+            "use_pickup": bool(self.chk_pickup.isChecked()),
+            "use_potion": bool(self.chk_potion.isChecked())
+            and not bool(hp_potion),
+            "background": bool(
+                self.chk_multi_background.isChecked()
+                or self.chk_multi_keyboard_only.isChecked()
+            ),
+            "relative_mouse": bool(
+                self.chk_multi_relative_mouse.isChecked()
+            ),
+            "keyboard_only": bool(
+                self.chk_multi_keyboard_only.isChecked()
+            ),
+        }
+        slot = SlotRunner(int(hwnd), config, parent=self)
+        slot.status.connect(
+            lambda text, level, i=index: self._on_multi_slot_status(
+                i, text, level
+            )
+        )
+        slot.finished.connect(
+            lambda i=index: self._on_multi_slot_finished(i)
+        )
+        slot.hp_changed.connect(
+            lambda cur, mx, msg, i=index: self._on_multi_slot_hp(
+                i, cur, mx, msg
+            )
+        )
+        self._multi_runners[index] = slot
+        self.lbl_multi_slots[index].setText("启动中…")
+        slot.start()
+        if not getattr(slot, "is_running", False):
+            slot.deleteLater()
+            self._multi_runners[index] = None
+        self._schedule_multi_name(index)
+        self._update_multi_controls()
+
+    def _test_multi_slot(self, index: int) -> None:
+        if not (0 <= index < 4):
+            return
+        if self._single_busy_for_multi() or self._multi_heal_recording():
+            self._notify(
+                "单开自动化正在运行",
+                "请先停止单开挂机/自动BOSS/回血录制，再试放多开录制。",
+            )
+            return
+        runner = self._multi_runners[index]
+        if runner is not None and getattr(runner, "is_running", False):
+            return
+        if self.chk_multi_farm_only[index].isChecked():
+            self._notify(
+                "本地挂机不需要试放",
+                "“本地挂机”只后台打怪，不播放 BOSS 录制。",
+            )
+            return
+        hwnd = self._multi_slot_hwnd(index)
+        if hwnd is None or not self._window_alive(hwnd):
+            self._notify("没有有效窗口", "请先选择并刷新游戏窗口。")
+            return
+        record = self._multi_record_data(index)
+        if record is None or not record.get("events"):
+            self._notify("没有录制", "请先选择一段有效的 BOSS 录制。")
+            return
+        self._save_multi_settings()
+        if (
+            self.chk_multi_background.isChecked()
+            and self._record_move_count(record) > 20
+        ):
+            self._set_status(
+                "提示：录制含大量鼠标移动，后台试放可能走偏；"
+                "可关闭后台并勾选“相对鼠标移动”再试放",
+                "warn",
+            )
+        config = {
+            "label": str(record.get("name") or "BOSS"),
+            "farm_only": False,
+            "events": list(record.get("events", [])),
+            "meta": record.get("meta"),
+            "hp_enabled": False,
+            "hp_roi": None,
             "threshold": int(self.spin_multi_thresholds[index].value()),
             "priority": int(self.spin_multi_priorities[index].value()),
             "interval": float(self.spin_multi_interval.value()),
@@ -4387,79 +6589,22 @@ class MainWindow(QMainWindow):
                 self.spin_multi_potions[index].value()
             ) * 1000,
             "use_pickup": bool(self.chk_pickup.isChecked()),
-            "lock_user_input": bool(self.chk_lock_input.isChecked()),
-            "background": bool(self.chk_background_replay.isChecked()),
-        }
-        slot = SlotRunner(int(hwnd), config, parent=self)
-        slot.status.connect(
-            lambda text, level, i=index: self._on_multi_slot_status(i, text, level)
-        )
-        slot.finished.connect(
-            lambda i=index: self._on_multi_slot_finished(i)
-        )
-        self._multi_runners[index] = slot
-        self.lbl_multi_slots[index].setText("启动中…")
-        slot.start()
-        if not getattr(slot, "is_running", False):
-            slot.deleteLater()
-            self._multi_runners[index] = None
-        self._update_multi_controls()
-
-    def _test_multi_slot(self, index: int) -> None:
-        if index < 0 or index >= 4:
-            return
-        if self.chk_multi_farm_only[index].isChecked():
-            self._notify(
-                "本地挂机模式",
-                "当前窗口勾选了“本地挂机”，没有录制可以试放。",
-            )
-            return
-        if self._single_window_busy():
-            self._notify(
-                "单窗口正在运行",
-                "请先停止单窗口自动化，再试放多开录制。",
-            )
-            return
-        runner = self._multi_runners[index]
-        if runner is not None and getattr(runner, "is_running", False):
-            return
-        hwnd = self.combo_multi_windows[index].currentData()
-        if hwnd is None:
-            self._notify("没有选择窗口", f"请给窗口 {index + 1} 选择一个游戏窗口。")
-            return
-        if not self._window_alive(int(hwnd)):
-            self._notify("窗口已关闭", "请先点“刷新窗口”，重新选择。")
-            return
-        for other_index, other in enumerate(self._multi_runners):
-            if (
-                other_index != index
-                and other is not None
-                and getattr(other, "is_running", False)
-                and int(other.hwnd) == int(hwnd)
-            ):
-                self._notify(
-                    "窗口重复",
-                    f"窗口 {index + 1} 和窗口 {other_index + 1} 选了同一个游戏窗口。",
-                )
-                return
-        record = self._multi_record_data(index)
-        if record is None or not record.get("events"):
-            self._notify(
-                "没有录制",
-                f"请先给窗口 {index + 1} 选择一段有效的 BOSS 录制。",
-            )
-            return
-        config = {
-            "events": list(record.get("events", [])),
-            "meta": record.get("meta"),
-            "speed": 1.0,
-            "priority": int(self.spin_multi_priorities[index].value()),
-            "lock_user_input": bool(self.chk_lock_input.isChecked()),
-            "background": bool(self.chk_background_replay.isChecked()),
+            "background": bool(
+                self.chk_multi_background.isChecked()
+                or self.chk_multi_keyboard_only.isChecked()
+            ),
+            "relative_mouse": bool(
+                self.chk_multi_relative_mouse.isChecked()
+            ),
+            "keyboard_only": bool(
+                self.chk_multi_keyboard_only.isChecked()
+            ),
         }
         slot = SlotRunner(int(hwnd), config, test_only=True, parent=self)
         slot.status.connect(
-            lambda text, level, i=index: self._on_multi_slot_status(i, text, level)
+            lambda text, level, i=index: self._on_multi_slot_status(
+                i, text, level
+            )
         )
         slot.finished.connect(
             lambda i=index: self._on_multi_slot_finished(i)
@@ -4473,21 +6618,17 @@ class MainWindow(QMainWindow):
         self._update_multi_controls()
 
     def _stop_multi_slot(self, index: int) -> None:
-        if index < 0 or index >= 4:
+        if not (0 <= index < 4):
             return
         runner = self._multi_runners[index]
         if runner is not None:
             runner.stop("已停止", "warn")
-        else:
-            self._update_multi_controls()
+        self._update_multi_controls()
 
     def _start_all_multi(self) -> None:
         for index in range(4):
-            runner = self._multi_runners[index]
-            if runner is not None and getattr(runner, "is_running", False):
-                continue
-            if self.combo_multi_windows[index].currentData() is not None:
-                self._start_multi_slot(index)
+            if self._multi_slot_hwnd(index) is not None:
+                self._start_multi_slot(index, silent=True)
 
     def _stop_all_multi(self) -> None:
         for index in range(4):
@@ -4496,16 +6637,733 @@ class MainWindow(QMainWindow):
                 runner.stop("已停止", "warn")
         self._update_multi_controls()
 
-    def _on_multi_slot_status(self, index: int, text: str, level: str) -> None:
+    def _on_multi_slot_status(
+        self, index: int, text: str, level: str
+    ) -> None:
         if 0 <= index < len(self.lbl_multi_slots):
             self.lbl_multi_slots[index].setText(text)
 
+    def _on_multi_slot_hp(
+        self, index: int, current, maximum, message: str
+    ) -> None:
+        if not (0 <= index < len(self.lbl_multi_hps)):
+            return
+        label = self.lbl_multi_hps[index]
+        if current is None:
+            if "最小化" in str(message):
+                label.setText("血量: 窗口已最小化")
+            else:
+                label.setText(f"血量: {message or '--'}")
+            label.setStyleSheet("color: #8f959e; padding: 0;")
+            return
+        try:
+            cur = int(current)
+        except (TypeError, ValueError):
+            return
+        text = (
+            f"血量: {cur}/{int(maximum)}"
+            if maximum is not None
+            else f"血量: {cur}"
+        )
+        try:
+            potion_threshold = int(
+                self.spin_hp_potion_threshold.value()
+            )
+            potion_interval = int(
+                self.spin_multi_potions[index].value()
+            )
+        except Exception:
+            potion_threshold = 1600
+            potion_interval = 60
+        if (
+            cur < potion_threshold
+            and self.chk_hp_potion.isChecked()
+        ):
+            text += f"（自动吃药中：每 {potion_interval} 秒）"
+        label.setText(text)
+        try:
+            heal_line = int(self.spin_hp_threshold.value())
+        except Exception:
+            heal_line = 600
+        try:
+            pause_line = int(self.spin_hp_pause_line.value())
+        except Exception:
+            pause_line = HP_RED_LINE
+        if cur < pause_line:
+            color = "#ff6b6b"
+        elif cur < heal_line:
+            color = "#ffb454"
+        else:
+            color = "#3ddc84"
+        label.setStyleSheet(f"color: {color}; padding: 0;")
+
     def _on_multi_slot_finished(self, index: int) -> None:
+        if not (0 <= index < 4):
+            return
         runner = self._multi_runners[index]
         if runner is not None:
             runner.deleteLater()
             self._multi_runners[index] = None
-        # 状态文字由 SlotRunner 最后的 status 信号决定（已停止/试放完成/错误）。
+        self._update_multi_controls()
+
+    # -- 多开挂机：血量 / 角色名区域 --------------------------------------
+    def _set_roi_spin(self, spin: QSpinBox, value: int) -> None:
+        spin.blockSignals(True)
+        spin.setValue(int(value))
+        spin.blockSignals(False)
+
+    def _on_hp_line_changed(self, *_args) -> None:
+        if not hasattr(self, "spin_hp_threshold"):
+            return
+        heal = max(HP_RED_LINE, int(self.spin_hp_threshold.value()))
+        pause = max(HP_RED_LINE, int(self.spin_hp_pause_line.value()))
+        if pause > heal:
+            pause = heal
+        if heal != self.spin_hp_threshold.value():
+            self._set_roi_spin(self.spin_hp_threshold, heal)
+        if pause != self.spin_hp_pause_line.value():
+            self._set_roi_spin(self.spin_hp_pause_line, pause)
+
+    def _refresh_hp_roi_label(self) -> None:
+        if not hasattr(self, "lbl_hp_roi"):
+            return
+        if self._hp_roi_norm is None:
+            self.lbl_hp_roi.setText("未设置")
+            self.lbl_hp_roi.setStyleSheet("color: #ffb454; padding: 0;")
+            return
+        self.lbl_hp_roi.setText("已设置")
+        self.lbl_hp_roi.setStyleSheet("color: #3ddc84; padding: 0;")
+
+    def _select_hp_roi(self) -> None:
+        image = self._capture_game_image()
+        if image is None or image.isNull():
+            return
+        current = None
+        if self._hp_roi_norm is not None:
+            try:
+                current = roi_from_norm(
+                    self._hp_roi_norm, image.width(), image.height()
+                )
+            except Exception:
+                current = None
+        dialog = RegionSelectDialog(
+            image,
+            current,
+            self._capture_game_image,
+            self,
+            title_text="框选血量区域",
+            info_text=(
+                "框住头像旁边的“当前血量”数字，例如 1725/1780 中的当前血量部分。"
+                "多开时所有窗口共用这个区域，程序会按窗口客户区尺寸自动缩放。"
+                "血量数字不要框进太多其它文字，否则 OCR 容易识别错。"
+            ),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        roi = dialog.selected_roi()
+        if roi is None:
+            return
+        cw, ch = image.width(), image.height()
+        if cw <= 0 or ch <= 0:
+            return
+        self._hp_roi_norm = (
+            roi[0] / cw,
+            roi[1] / ch,
+            roi[2] / cw,
+            roi[3] / ch,
+        )
+        self._save_multi_settings()
+        self._refresh_hp_roi_label()
+        self._refresh_single_hp_roi_label()
+        self._update_multi_controls()
+
+    def _refresh_name_roi_label(self) -> None:
+        if not hasattr(self, "lbl_name_roi"):
+            return
+        if self._name_roi_norm is None:
+            self.lbl_name_roi.setText("未设置")
+            self.lbl_name_roi.setStyleSheet("color: #ffb454; padding: 0;")
+            return
+        self.lbl_name_roi.setText("已设置")
+        self.lbl_name_roi.setStyleSheet("color: #3ddc84; padding: 0;")
+
+    def _select_name_roi(self) -> None:
+        image = self._capture_game_image()
+        if image is None or image.isNull():
+            return
+        current = None
+        if self._name_roi_norm is not None:
+            try:
+                current = roi_from_norm(
+                    self._name_roi_norm, image.width(), image.height()
+                )
+            except Exception:
+                current = None
+        dialog = RegionSelectDialog(
+            image,
+            current,
+            self._capture_game_image,
+            self,
+            title_text="框选角色名区域",
+            info_text=(
+                "框住游戏窗口里显示角色名的位置。"
+                "绑定/刷新多开窗口时会自动读取，并显示在“角色:”旁边；"
+                "如果名字有多个字/带称号，尽量只框角色名本身，识别率更高。"
+            ),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        roi = dialog.selected_roi()
+        if roi is None:
+            return
+        cw, ch = image.width(), image.height()
+        if cw <= 0 or ch <= 0:
+            return
+        self._name_roi_norm = (
+            roi[0] / cw,
+            roi[1] / ch,
+            roi[2] / cw,
+            roi[3] / ch,
+        )
+        self._save_multi_settings()
+        self._refresh_name_roi_label()
+        self._update_multi_controls()
+        self._read_all_names()
+
+    # -- 多开挂机：设置持久化 --------------------------------------------
+    def _load_multi_settings(self) -> None:
+        if not hasattr(self, "chk_hp_guard"):
+            return
+        self._multi_loading = True
+        s = self._settings
+        try:
+            self.chk_multi_keyboard_only.setChecked(
+                self._bool_setting(s.value("multi/keyboard_only", False))
+            )
+            self.chk_multi_relative_mouse.setChecked(
+                self._bool_setting(
+                    s.value("multi/relative_mouse", False)
+                )
+            )
+            self.chk_multi_background.setChecked(
+                self._bool_setting(s.value("multi/background", True))
+            )
+            if self.chk_multi_keyboard_only.isChecked():
+                self.chk_multi_background.blockSignals(True)
+                self.chk_multi_background.setChecked(True)
+                self.chk_multi_background.blockSignals(False)
+                self.chk_multi_relative_mouse.blockSignals(True)
+                self.chk_multi_relative_mouse.setChecked(False)
+                self.chk_multi_relative_mouse.blockSignals(False)
+            elif (
+                self.chk_multi_background.isChecked()
+                and self.chk_multi_relative_mouse.isChecked()
+            ):
+                self.chk_multi_relative_mouse.blockSignals(True)
+                self.chk_multi_relative_mouse.setChecked(False)
+                self.chk_multi_relative_mouse.blockSignals(False)
+            try:
+                self.spin_multi_interval.setValue(
+                    max(
+                        5,
+                        min(
+                            600,
+                            int(s.value("multi/fatigue_interval", 30)),
+                        ),
+                    )
+                )
+            except (TypeError, ValueError):
+                pass
+            self.chk_hp_guard.setChecked(
+                self._bool_setting(s.value("multi/hp_enabled", False))
+            )
+            self.chk_hp_need_heal.setChecked(
+                self._bool_setting(s.value("multi/hp_need_heal", False))
+            )
+            self.chk_hp_potion.setChecked(
+                self._bool_setting(
+                    s.value("multi/hp_potion_enabled", False)
+                )
+            )
+            try:
+                self.spin_hp_potion_threshold.setValue(
+                    max(
+                        1,
+                        min(
+                            100000,
+                            int(
+                                s.value(
+                                    "multi/hp_potion_threshold", 1600
+                                )
+                            ),
+                        ),
+                    )
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                self.spin_hp_threshold.setValue(
+                    max(
+                        HP_RED_LINE,
+                        int(s.value("multi/hp_threshold", 600)),
+                    )
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                self.spin_hp_pause_line.setValue(
+                    max(
+                        HP_RED_LINE,
+                        int(s.value("multi/hp_pause_line", HP_RED_LINE)),
+                    )
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                self.spin_hp_interval.setValue(
+                    max(1, min(30, int(s.value("multi/hp_interval", 1))))
+                )
+            except (TypeError, ValueError):
+                pass
+
+            self._hp_roi_norm = self._parse_roi_setting(
+                s.value("multi/hp_roi_norm")
+            )
+            self._name_roi_norm = self._parse_roi_setting(
+                s.value("multi/name_roi_norm")
+            )
+
+            for index in range(4):
+                self._multi_saved_hwnds[index] = self._parse_int_setting(
+                    s.value(f"multi/slot{index}/hwnd")
+                )
+                try:
+                    self.spin_multi_thresholds[index].setValue(
+                        max(
+                            50,
+                            min(
+                                1000,
+                                int(
+                                    s.value(
+                                        f"multi/slot{index}/threshold",
+                                        self._fatigue_threshold,
+                                    )
+                                ),
+                            ),
+                        )
+                    )
+                    self.spin_multi_potions[index].setValue(
+                        max(
+                            5,
+                            min(
+                                3600,
+                                int(
+                                    s.value(
+                                        f"multi/slot{index}/potion",
+                                        self.spin_potion.value(),
+                                    )
+                                ),
+                            ),
+                        )
+                    )
+                    self.spin_multi_priorities[index].setValue(
+                        max(
+                            1,
+                            min(
+                                99,
+                                int(
+                                    s.value(
+                                        f"multi/slot{index}/priority",
+                                        index + 1,
+                                    )
+                                ),
+                            ),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    pass
+                self.chk_multi_farm_only[index].setChecked(
+                    self._bool_setting(
+                        s.value(f"multi/slot{index}/farm_only", False)
+                    )
+                )
+                for combo, key in (
+                    (
+                        self.combo_multi_records[index],
+                        f"multi/slot{index}/record",
+                    ),
+                    (
+                        self.combo_multi_heal_records[index],
+                        f"multi/slot{index}/heal",
+                    ),
+                ):
+                    name = str(s.value(key, ""))
+                    pos = combo.findData(name)
+                    if pos >= 0:
+                        combo.setCurrentIndex(pos)
+        finally:
+            self._multi_loading = False
+        self._on_hp_line_changed()
+        self._refresh_hp_roi_label()
+        self._refresh_single_hp_roi_label()
+        self._refresh_name_roi_label()
+        self._update_multi_controls()
+
+    @staticmethod
+    def _parse_int_setting(value) -> Optional[int]:
+        try:
+            if value is None or str(value).strip() == "":
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_roi_setting(
+        value,
+    ) -> Optional[tuple[float, float, float, float]]:
+        if isinstance(value, str):
+            value = [
+                part
+                for part in value.replace("[", "").replace("]", "").split(",")
+                if part.strip()
+            ]
+        try:
+            if isinstance(value, (list, tuple)) and len(value) == 4:
+                values = tuple(float(v) for v in value)
+                if (
+                    0.0 <= values[0] <= 1.0
+                    and 0.0 <= values[1] <= 1.0
+                    and values[2] > 0
+                    and values[3] > 0
+                ):
+                    return values  # type: ignore[return-value]
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def _save_multi_settings(self) -> None:
+        if getattr(self, "_multi_loading", False):
+            return
+        if not hasattr(self, "chk_hp_guard"):
+            return
+        s = self._settings
+        s.setValue(
+            "multi/background", self.chk_multi_background.isChecked()
+        )
+        s.setValue(
+            "multi/relative_mouse",
+            self.chk_multi_relative_mouse.isChecked(),
+        )
+        s.setValue(
+            "multi/keyboard_only",
+            self.chk_multi_keyboard_only.isChecked(),
+        )
+        s.setValue(
+            "multi/fatigue_interval", int(self.spin_multi_interval.value())
+        )
+        s.setValue("multi/hp_enabled", self.chk_hp_guard.isChecked())
+        s.setValue("multi/hp_need_heal", self.chk_hp_need_heal.isChecked())
+        s.setValue(
+            "multi/hp_potion_enabled", self.chk_hp_potion.isChecked()
+        )
+        s.setValue(
+            "multi/hp_potion_threshold",
+            int(self.spin_hp_potion_threshold.value()),
+        )
+        s.setValue(
+            "multi/hp_threshold", int(self.spin_hp_threshold.value())
+        )
+        s.setValue(
+            "multi/hp_pause_line", int(self.spin_hp_pause_line.value())
+        )
+        s.setValue("multi/hp_interval", int(self.spin_hp_interval.value()))
+        if self._hp_roi_norm is not None:
+            s.setValue(
+                "multi/hp_roi_norm",
+                [round(float(v), 6) for v in self._hp_roi_norm],
+            )
+        else:
+            s.remove("multi/hp_roi_norm")
+        if self._name_roi_norm is not None:
+            s.setValue(
+                "multi/name_roi_norm",
+                [round(float(v), 6) for v in self._name_roi_norm],
+            )
+        else:
+            s.remove("multi/name_roi_norm")
+        for index in range(4):
+            s.setValue(
+                f"multi/slot{index}/hwnd",
+                self._multi_slot_hwnd(index) or "",
+            )
+            s.setValue(
+                f"multi/slot{index}/record",
+                self.combo_multi_records[index].currentData() or "",
+            )
+            s.setValue(
+                f"multi/slot{index}/heal",
+                self.combo_multi_heal_records[index].currentData() or "",
+            )
+            s.setValue(
+                f"multi/slot{index}/farm_only",
+                self.chk_multi_farm_only[index].isChecked(),
+            )
+            s.setValue(
+                f"multi/slot{index}/threshold",
+                int(self.spin_multi_thresholds[index].value()),
+            )
+            s.setValue(
+                f"multi/slot{index}/potion",
+                int(self.spin_multi_potions[index].value()),
+            )
+            s.setValue(
+                f"multi/slot{index}/priority",
+                int(self.spin_multi_priorities[index].value()),
+            )
+
+    # -- 多开挂机：回血录制 ----------------------------------------------
+    def _toggle_multi_heal_record(self, index: int) -> None:
+        if not (0 <= index < 4):
+            return
+        if self._heal_recorder is not None:
+            if self._heal_record_index == index:
+                self._stop_multi_heal_record()
+            return
+        if self._heal_record_pending:
+            if self._heal_record_index == index:
+                self._heal_record_pending = False
+                self._heal_record_index = None
+                self._set_multi_slot_text(index, "已取消录制回血")
+                self._update_multi_controls()
+            return
+        if self._any_multi_running() or self._single_busy_for_multi():
+            self._notify(
+                "当前正在运行自动化",
+                "请先停止多开/单开挂机，再录制回血。",
+            )
+            return
+        hwnd = self._multi_slot_hwnd(index)
+        if hwnd is None or not self._window_alive(hwnd):
+            self._notify("没有有效窗口", "请先选择游戏窗口。")
+            return
+        self._heal_record_index = index
+        self._heal_record_pending = True
+        self._set_multi_slot_text(index, "3 秒后开始录制回血，请切到游戏…")
+        self._update_multi_controls()
+        QTimer.singleShot(3000, self._begin_multi_heal_record)
+
+    def _begin_multi_heal_record(self) -> None:
+        if not self._heal_record_pending or self._quitting:
+            return
+        self._heal_record_pending = False
+        index = self._heal_record_index
+        if index is None or not (0 <= index < 4):
+            return
+        hwnd = self._multi_slot_hwnd(index)
+        if hwnd is None or not self._window_alive(hwnd):
+            self._heal_record_index = None
+            self._set_multi_slot_text(index, "窗口已关闭，录制取消")
+            self._update_multi_controls()
+            return
+        try:
+            recorder = MacroRecorder(hwnd)
+            recorder.start()
+        except Exception as exc:
+            self._heal_record_index = None
+            self._set_multi_slot_text(index, f"回血录制启动失败：{exc}")
+            self._notify("回血录制启动失败", str(exc))
+            self._update_multi_controls()
+            return
+        self._heal_recorder = recorder
+        self._set_multi_slot_text(
+            index, "回血录制中… 操作完切回本窗口点“停止录制”"
+        )
+        self._update_multi_controls()
+
+    def _stop_multi_heal_record(self) -> None:
+        recorder = self._heal_recorder
+        index = self._heal_record_index
+        self._heal_recorder = None
+        self._heal_record_index = None
+        if recorder is None:
+            return
+        try:
+            events = strip_hotkey_tail(recorder.stop())
+            meta = recorder.meta()
+        except Exception as exc:
+            if index is not None:
+                self._set_multi_slot_text(index, f"停止回血录制失败：{exc}")
+            self._update_multi_controls()
+            return
+        self._update_multi_controls()
+        if index is None:
+            return
+        if not events:
+            self._set_multi_slot_text(index, "没有录到操作，未保存")
+            self._notify(
+                "没有录到操作",
+                "录制时游戏必须在前台，并且鼠标要位于游戏窗口内。",
+            )
+            return
+
+        default_name = f"回血录制 {len(self._heal_records) + 1}"
+        name, ok = QInputDialog.getText(
+            self, "保存回血录制", "给这段回血录制起个名字：", text=default_name
+        )
+        if not ok:
+            self._set_multi_slot_text(index, "已放弃保存回血录制")
+            return
+        name = str(name or "").strip() or default_name
+        existing = {str(r.get("name")) for r in self._heal_records}
+        base = name
+        suffix = 2
+        while name in existing:
+            name = f"{base} ({suffix})"
+            suffix += 1
+        self._heal_records.append(
+            {
+                "name": name,
+                "created": datetime.datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "events": events,
+                "meta": meta,
+            }
+        )
+        saved = save_heal_records(self._heal_records)
+        self._refresh_multi_records()
+        pos = self.combo_multi_heal_records[index].findData(name)
+        if pos >= 0:
+            self.combo_multi_heal_records[index].setCurrentIndex(pos)
+        self._save_multi_settings()
+        self._set_multi_slot_text(
+            index,
+            f"已保存回血录制“{name}”（{len(events)} 个动作）"
+            if saved
+            else f"回血录制“{name}”已生效，但写入失败（本次有效）",
+        )
+        self._update_multi_controls()
+
+    def _test_multi_heal(self, index: int) -> None:
+        if not (0 <= index < 4):
+            return
+        if self._any_multi_running() or self._multi_heal_recording():
+            self._notify(
+                "多开正在运行",
+                "请先停止多开，再试放回血录制。",
+            )
+            return
+        if self._single_busy_for_multi():
+            self._notify(
+                "单开自动化正在运行",
+                "请先停止单开挂机/自动BOSS，再试放回血录制。",
+            )
+            return
+        record = self._heal_record_data(index)
+        if record is None or not record.get("events"):
+            self._notify("没有回血录制", "请先录制或选择回血录制。")
+            return
+        hwnd = self._multi_slot_hwnd(index)
+        if hwnd is None or not self._window_alive(hwnd):
+            self._notify("没有有效窗口", "请先选择游戏窗口。")
+            return
+        player = MacroPlayer(
+            int(hwnd),
+            "试放回血",
+            list(record.get("events") or []),
+            meta=record.get("meta"),
+            speed=1.0,
+            background=(
+                self.chk_multi_background.isChecked()
+                or self.chk_multi_keyboard_only.isChecked()
+            ),
+            relative_mouse=self.chk_multi_relative_mouse.isChecked(),
+            keyboard_only=self.chk_multi_keyboard_only.isChecked(),
+            parent=self,
+        )
+        player.done.connect(self._on_multi_heal_test_done)
+        player.error.connect(self._on_multi_heal_test_error)
+        self._heal_test_player = player
+        self._heal_test_index = index
+        self._set_multi_slot_text(index, "试放回血录制…")
+        player.start()
+        self._update_multi_controls()
+
+    def _on_multi_heal_test_done(self, _stage: str) -> None:
+        player = self.sender()
+        if player is not self._heal_test_player:
+            return
+        self._heal_test_player = None
+        index = self._heal_test_index
+        self._heal_test_index = None
+        if player is not None:
+            try:
+                player.wait(500)
+            except Exception:
+                pass
+            player.deleteLater()
+        if index is not None:
+            self._set_multi_slot_text(index, "回血试放完成")
+        self._update_multi_controls()
+
+    def _on_multi_heal_test_error(self, _stage: str, message: str) -> None:
+        player = self.sender()
+        if player is not self._heal_test_player:
+            return
+        self._heal_test_player = None
+        index = self._heal_test_index
+        self._heal_test_index = None
+        if player is not None:
+            try:
+                player.wait(500)
+            except Exception:
+                pass
+            player.deleteLater()
+        if index is not None:
+            self._set_multi_slot_text(index, f"回血试放失败：{message}")
+        self._update_multi_controls()
+
+    def _stop_multi_heal_test(self) -> None:
+        player = self._heal_test_player
+        self._heal_test_player = None
+        self._heal_test_index = None
+        if player is not None:
+            try:
+                player.stop()
+                if not player.wait(3000):
+                    player.terminate()
+                    player.wait(500)
+            except Exception:
+                pass
+            player.deleteLater()
+
+    def _delete_multi_heal(self, index: int) -> None:
+        if not (0 <= index < 4):
+            return
+        record = self._heal_record_data(index)
+        if record is None:
+            return
+        if self._any_multi_running() or self._multi_heal_recording():
+            self._notify("多开正在运行", "请先停止多开，再删除回血录制。")
+            return
+        name = str(record.get("name") or "")
+        answer = QMessageBox.question(
+            self,
+            "删除回血录制",
+            f"确定删除回血录制“{name}”吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._heal_records = [
+            item for item in self._heal_records if item is not record
+        ]
+        save_heal_records(self._heal_records)
+        self._refresh_multi_records()
+        self._save_multi_settings()
+        self._set_multi_slot_text(index, f"已删除回血录制“{name}”")
         self._update_multi_controls()
 
     @staticmethod
@@ -4661,12 +7519,12 @@ class MainWindow(QMainWindow):
 
     # -- 运行控制 ---------------------------------------------------------
     def _start_sending(self) -> None:
-        if self._worker is not None or self._quitting:
+        if self._worker is not None or self._quitting or self._boss_busy():
             return
-        if self._macro_busy():
+        if self._multi_busy():
             self._notify(
-                "当前正在路线编辑/地图测试/路径执行/副本或组合挂机",
-                "请先停止当前自动化，再启动基础挂机。",
+                "多开正在运行",
+                "请先停止多开挂机/回血录制，再启动单开挂机。",
             )
             return
 
@@ -4706,6 +7564,16 @@ class MainWindow(QMainWindow):
                 seconds=10,
             )
 
+        hp_potion = self.chk_single_hp_potion.isChecked()
+        if hp_potion and self._hp_roi_norm is None:
+            self._notify(
+                "尚未框选血量区域",
+                "请先点“框选血量区域”，框住头像旁边的当前血量数字，"
+                "再开始挂机。",
+            )
+            self._set_status("血量自动吃药缺少血量区域。", "warn")
+            return
+
         self._last_failure = None
         self._last_rounds = 0
         self.rounds_label.setText("已发送 0 轮")
@@ -4714,7 +7582,7 @@ class MainWindow(QMainWindow):
             hwnd,
             self.spin_interval.value(),
             use_skills=self.chk_skills.isChecked(),
-            use_potion=self.chk_potion.isChecked(),
+            use_potion=self.chk_potion.isChecked() and not hp_potion,
             potion_interval_ms=self.spin_potion.value() * 1000,
             use_pickup=self.chk_pickup.isChecked(),
             parent=self,
@@ -4725,6 +7593,8 @@ class MainWindow(QMainWindow):
         self._worker = worker
         self._stopping = False
         worker.start()
+        if hp_potion:
+            self._start_single_hp_monitor()
 
         # 疲劳检测只在发送期间运行；首次检测在 30 秒后
         if self.chk_fatigue.isChecked():
@@ -4745,6 +7615,7 @@ class MainWindow(QMainWindow):
             return
         self._stopping = True
         self._worker.stop()
+        self._stop_single_hp_monitor()
         self._stop_fatigue_monitor()
 
         self.btn_start.setText("正在停止…")
@@ -4756,26 +7627,24 @@ class MainWindow(QMainWindow):
     def _toggle_running(self) -> None:
         if self._quitting:
             return
+        if self._boss_recorder is not None or self._boss_record_pending:
+            self._toggle_boss_record()
+            return
+        if self._heal_recorder is not None or self._heal_record_pending:
+            self._stop_multi_heal_record()
+            return
+        if self._heal_test_player is not None:
+            index = self._heal_test_index
+            self._stop_multi_heal_test()
+            if index is not None:
+                self._set_multi_slot_text(index, "已停止回血试放")
+            self._update_multi_controls()
+            return
         if self._any_multi_running():
             self._stop_all_multi()
             return
-        if self._fatigue_loop_running:
-            self._stop_fatigue_loop()
-            return
-        if self._combo_running:
-            self._stop_combo()
-            return
-        if self._dungeon_recorder is not None or self._dungeon_recording_pending:
-            self._stop_dungeon_record()
-            return
-        if self._dungeon_running:
-            self._stop_dungeon_play()
-            return
-        if self._map_runner is not None:
-            self._stop_map_runner()
-            return
-        if self._path_runner is not None:
-            self._stop_path_runner()
+        if self._boss_busy():
+            self._stop_boss("已停止 BOSS", "warn")
             return
         if self._stopping:
             return
@@ -4785,7 +7654,9 @@ class MainWindow(QMainWindow):
             self._start_sending()
 
     def _on_worker_finished(self) -> None:
-        worker = self._worker
+        worker = self.sender()
+        if worker is not self._worker:
+            return
         self._worker = None
 
         rounds = worker.rounds if worker is not None else self._last_rounds
@@ -4794,6 +7665,7 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.deleteLater()
 
+        self._stop_single_hp_monitor()
         self._stop_fatigue_monitor()
 
         if self._quitting:
@@ -4815,7 +7687,7 @@ class MainWindow(QMainWindow):
         self._update_toggle_action()
 
     def _on_cycle_done(self, rounds: int) -> None:
-        if self._quitting:
+        if self._quitting or self.sender() is not self._worker:
             return
         self._last_rounds = int(rounds)
         self.rounds_label.setText(f"已发送 {int(rounds)} 轮")
@@ -4823,6 +7695,8 @@ class MainWindow(QMainWindow):
             self._update_tray_tooltip(True)
 
     def _on_worker_failed(self, message: str) -> None:
+        if self.sender() is not self._worker:
+            return
         self._last_failure = message
         if self._quitting:
             return
@@ -4842,15 +7716,6 @@ class MainWindow(QMainWindow):
     def _on_threshold_changed(self, value: int) -> None:
         value = max(50, min(1000, int(value)))
         self._fatigue_threshold = value
-        for spin_name in (
-            "spin_fatigue_threshold",
-            "spin_fl_threshold",
-        ):
-            spin = getattr(self, spin_name, None)
-            if spin is not None and spin.value() != value:
-                spin.blockSignals(True)
-                spin.setValue(value)
-                spin.blockSignals(False)
         try:
             self._settings.setValue(
                 "fatigue_threshold", self._fatigue_threshold
@@ -4858,7 +7723,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._refresh_threshold_labels()
-        # 基础页正在做疲劳检测时，用新阈值重启监控
+        # 正在做疲劳检测时，用新阈值重启监控
         if self._fatigue_monitor is not None:
             self._stop_fatigue_monitor()
             self._start_fatigue_monitor()
@@ -4869,7 +7734,6 @@ class MainWindow(QMainWindow):
             self.lbl_threshold_hint.setText(
                 f"低于 -{threshold} / 高于 +{threshold} 弹窗"
             )
-
 
     # -- 辅助功能：技能 / 喝药 -------------------------------------------
     def _on_pickup_toggled(self, checked: bool) -> None:
@@ -4985,2155 +7849,6 @@ class MainWindow(QMainWindow):
         # GetDIBits 返回 BGRA；用 RGB32 显示，忽略可能为 0 的 alpha 字节
         return QImage(bytes(data), w, h, w * 4, QImage.Format.Format_RGB32).copy()
 
-    def _capture_game_image(self) -> Optional[QImage]:
-        """只截取游戏客户区，不移动鼠标。"""
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return None
-        cap, err = capture_client_bgra(self.target_hwnd)
-        if cap is None:
-            self._notify("截图失败", err or "无法截取游戏画面。")
-            return None
-        w, h, data = cap
-        return QImage(bytes(data), w, h, w * 4, QImage.Format.Format_RGB32).copy()
-
-
-    # ------------------------------------------------------------ 地图标注寻路
-    def _refresh_map_profiles(self) -> None:
-        if not hasattr(self, "combo_map_profile"):
-            return
-        try:
-            from map_labels import load_maps
-
-            profiles = load_maps()
-        except Exception:
-            profiles = []
-        current = self.combo_map_profile.currentData()
-        current_name = str(current.get("name", "")) if isinstance(current, dict) else ""
-        self.combo_map_profile.blockSignals(True)
-        self.combo_map_profile.clear()
-        for profile in profiles:
-            self.combo_map_profile.addItem(
-                str(profile.get("name", "未命名")), profile
-            )
-        self.combo_map_profile.blockSignals(False)
-        if current_name:
-            idx = next(
-                (
-                    i
-                    for i in range(self.combo_map_profile.count())
-                    if str(
-                        (self.combo_map_profile.itemData(i) or {}).get("name", "")
-                    )
-                    == current_name
-                ),
-                -1,
-            )
-            if idx >= 0:
-                self.combo_map_profile.setCurrentIndex(idx)
-        self._refresh_map_targets()
-
-    def _refresh_map_targets(self, *_args) -> None:
-        if not hasattr(self, "combo_map_target"):
-            return
-        profile = self.combo_map_profile.currentData()
-        self.combo_map_target.blockSignals(True)
-        self.combo_map_target.clear()
-        if isinstance(profile, dict):
-            for target in profile.get("targets", []):
-                if not isinstance(target, dict):
-                    continue
-                kind = {"farm": "打怪点", "boss": "BOSS点", "other": "其他"}.get(
-                    str(target.get("kind", "")), "其他"
-                )
-                self.combo_map_target.addItem(
-                    f"{target.get('name', '')} [{kind}]", target
-                )
-        self.combo_map_target.blockSignals(False)
-        self._update_map_controls_state()
-
-    def _update_map_controls_state(self) -> None:
-        if not hasattr(self, "btn_map_test"):
-            return
-        map_running = self._map_runner is not None
-        busy = self._macro_busy()
-        usable = bool(self.combo_map_profile.currentData()) and bool(
-            self.combo_map_target.currentData()
-        )
-        target_ok = (
-            self.target_hwnd is not None and self._window_alive(self.target_hwnd)
-        )
-        self.btn_map_test.setText("停止地图测试" if map_running else "测试前往目标")
-        self.btn_map_test.setEnabled(
-            map_running or (usable and target_ok and not busy)
-        )
-        self.btn_map_learn.setEnabled(target_ok and not busy and not map_running)
-        self.combo_map_profile.setEnabled(not busy and not map_running)
-        self.combo_map_target.setEnabled(not busy and not map_running)
-        self.spin_map_travel_wait.setEnabled(not busy and not map_running)
-
-    # ------------------------------------------------------------ 路径执行
-    def _refresh_paths(self) -> None:
-        if not hasattr(self, "combo_path"):
-            return
-        try:
-            from paths import load_paths
-
-            paths = load_paths()
-        except Exception:
-            paths = []
-        current = self.combo_path.currentData()
-        current_name = str(current.get("name", "")) if isinstance(current, dict) else ""
-        self.combo_path.blockSignals(True)
-        self.combo_path.clear()
-        for path in paths:
-            self.combo_path.addItem(str(path.get("name", "未命名")), path)
-        self.combo_path.blockSignals(False)
-        if current_name:
-            idx = next(
-                (
-                    i
-                    for i in range(self.combo_path.count())
-                    if str((self.combo_path.itemData(i) or {}).get("name", ""))
-                    == current_name
-                ),
-                -1,
-            )
-            if idx >= 0:
-                self.combo_path.setCurrentIndex(idx)
-        self._update_path_controls_state()
-        self._refresh_fatigue_loop_options()
-
-    def _update_path_controls_state(self) -> None:
-        if not hasattr(self, "btn_path_run"):
-            return
-        running = self._path_runner is not None
-        busy = self._macro_busy()
-        has_path = isinstance(self.combo_path.currentData(), dict)
-        target_ok = (
-            self.target_hwnd is not None and self._window_alive(self.target_hwnd)
-        )
-        self.btn_path_run.setText("停止路径" if running else "执行路径")
-        self.btn_path_run.setEnabled(running or (has_path and target_ok and not busy))
-        self.btn_path_edit.setEnabled(target_ok and not busy and not running)
-        self.combo_path.setEnabled(not busy and not running)
-
-    def _open_path_editor(self) -> None:
-        if self._macro_busy():
-            self._notify("当前正忙", "请先停止其它自动化。")
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-        try:
-            from paths import PathEditorDialog
-        except Exception as exc:
-            self._notify("路径编辑器不可用", f"加载失败：{exc}")
-            return
-        dialog = PathEditorDialog(parent=self)
-        dialog.exec()
-        self._refresh_paths()
-        self._refresh_combos()
-        self._refresh_fatigue_loop_options()
-        self._set_status("路径列表已刷新。", "ok")
-
-    def _toggle_path_run(self) -> None:
-        if self._path_runner is not None:
-            self._stop_path_runner()
-            return
-        self._start_path_run()
-
-    def _start_path_run(self) -> None:
-        if self._quitting or self._path_runner is not None:
-            return
-        if self._macro_busy() or self._worker is not None:
-            self._notify("当前正忙", "请先停止其它自动化。")
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-        path = self.combo_path.currentData()
-        if not isinstance(path, dict):
-            self._notify("没有路径", "请先点“编辑路径”创建一条路径。")
-            return
-        try:
-            from map_labels import load_maps
-            from paths import PathRunner
-        except Exception as exc:
-            self._notify("路径执行不可用", f"加载失败：{exc}")
-            return
-        profiles = load_maps()
-        if not profiles:
-            self._notify("没有地图标注", "请先在“地图标注寻路”里人工标注地图。")
-            return
-        runner = PathRunner(
-            self.target_hwnd,
-            path,
-            profiles,
-            map_key=self._macro_cfg.get("map_key", "m"),
-            close_key=self._macro_cfg.get("close_map_key", "esc"),
-            mount_key=self._macro_cfg.get("mount_key", "f"),
-            parent=self,
-        )
-        runner.status.connect(self._on_path_status)
-        runner.done.connect(self._on_path_done)
-        runner.failed.connect(self._on_path_failed)
-        self._path_runner = runner
-        self.lbl_path_state.setText("路径执行：准备中…")
-        self._set_status("路径执行开始。", "warn")
-        self._update_macro_button_states()
-        self._update_path_controls_state()
-        runner.start()
-
-    def _on_path_status(self, text: str, level: str) -> None:
-        if hasattr(self, "lbl_path_state"):
-            self.lbl_path_state.setText(text)
-        self._set_status(text, level)
-
-    def _on_path_done(self) -> None:
-        runner = self.sender()
-        if runner is self._path_runner:
-            self._path_runner = None
-            if isinstance(runner, QThread):
-                runner.wait(500)
-                runner.deleteLater()
-        self.lbl_path_state.setText("路径执行完成")
-        self._set_status("路径执行完成。", "ok")
-        self._update_macro_button_states()
-        self._update_path_controls_state()
-
-    def _on_path_failed(self, message: str) -> None:
-        runner = self.sender()
-        if runner is self._path_runner:
-            self._path_runner = None
-            if isinstance(runner, QThread):
-                runner.wait(500)
-                runner.deleteLater()
-        stopped = str(message).strip() == "已停止。"
-        self.lbl_path_state.setText("已停止" if stopped else "路径执行失败")
-        self._set_status(
-            "路径执行已停止。" if stopped else f"路径执行失败：{message}",
-            "warn" if stopped else "error",
-        )
-        if not stopped:
-            try:
-                self._popup.show_message("路径执行失败", message, seconds=15)
-            except Exception:
-                pass
-        self._update_macro_button_states()
-        self._update_path_controls_state()
-
-    def _stop_path_runner(self) -> None:
-        runner = self._path_runner
-        self._path_runner = None
-        if runner is not None:
-            runner.stop()
-            if not runner.wait(4000):
-                runner.terminate()
-                runner.wait(500)
-            runner.deleteLater()
-        self.lbl_path_state.setText("已停止")
-        self._set_status("路径执行已停止。", "warn")
-        self._update_macro_button_states()
-        self._update_path_controls_state()
-
-    # ------------------------------------------------------------ 副本整段录制 / 回放
-    def _refresh_dungeon_records(self) -> None:
-        if not hasattr(self, "combo_dungeon_record"):
-            return
-        current = self.combo_dungeon_record.currentData()
-        current_name = (
-            str(current.get("name", "")) if isinstance(current, dict) else ""
-        )
-        self.combo_dungeon_record.blockSignals(True)
-        self.combo_dungeon_record.clear()
-        for record in self._dungeon_records:
-            duration = float(record.get("duration", 0.0) or 0.0)
-            clicks = int(record.get("clicks", 0) or 0)
-            if clicks == 0:
-                clicks = sum(
-                    1
-                    for event in record.get("events", [])
-                    if isinstance(event, dict)
-                    and event.get("type") == "down"
-                )
-            self.combo_dungeon_record.addItem(
-                f"{record.get('name', '未命名')}  "
-                f"({duration:.1f} 秒 / 点击 {clicks} 次)",
-                record,
-            )
-        if current_name:
-            idx = next(
-                (
-                    i
-                    for i in range(self.combo_dungeon_record.count())
-                    if str(
-                        (self.combo_dungeon_record.itemData(i) or {}).get(
-                            "name", ""
-                        )
-                    )
-                    == current_name
-                ),
-                -1,
-            )
-            if idx >= 0:
-                self.combo_dungeon_record.setCurrentIndex(idx)
-        self.combo_dungeon_record.blockSignals(False)
-        self._update_dungeon_controls()
-        self._refresh_fatigue_loop_options()
-        self._refresh_multi_records()
-
-    def _selected_dungeon_record(self) -> Optional[dict]:
-        data = self.combo_dungeon_record.currentData()
-        return data if isinstance(data, dict) else None
-
-    def _update_dungeon_controls(self) -> None:
-        if not hasattr(self, "btn_dungeon_run"):
-            return
-        recording = (
-            self._dungeon_recorder is not None
-            or self._dungeon_recording_pending
-        )
-        running = self._dungeon_running
-        has_record = isinstance(
-            self.combo_dungeon_record.currentData(), dict
-        )
-        target_ok = (
-            self.target_hwnd is not None
-            and self._window_alive(self.target_hwnd)
-        )
-        busy_other = bool(
-            self._worker is not None
-            or self._route_editor is not None
-            or self._map_runner is not None
-            or self._path_runner is not None
-            or self._combo_running
-            or self._combo_path_runner is not None
-            or self._combo_player is not None
-            or self._fatigue_loop_running
-            or self._fatigue_loop_worker is not None
-            or self._fatigue_loop_monitor is not None
-            or self._fatigue_loop_path_runner is not None
-            or self._fatigue_loop_player is not None
-            or self._any_multi_running()
-        )
-        idle = (not recording) and (not running) and (not busy_other)
-
-        self.btn_dungeon_record.setText(
-            "取消录制"
-            if self._dungeon_recording_pending
-            else ("停止录制" if recording else "开始录制")
-        )
-        record_enabled = recording or (idle and target_ok)
-        self.btn_dungeon_record.setEnabled(record_enabled)
-        if hasattr(self, "btn_fl_record"):
-            self.btn_fl_record.setText(self.btn_dungeon_record.text())
-            self.btn_fl_record.setEnabled(record_enabled)
-        for widget in (
-            self.combo_dungeon_record,
-            self.btn_dungeon_rename,
-            self.btn_dungeon_delete,
-        ):
-            widget.setEnabled(idle and has_record)
-        self.btn_dungeon_test.setEnabled(idle and has_record and target_ok)
-        self.btn_dungeon_run.setText("停止副本" if running else "开始副本")
-        self.btn_dungeon_run.setEnabled(
-            running or (idle and has_record and target_ok)
-        )
-        for widget in (
-            self.spin_dungeon_repeat,
-            self.spin_dungeon_interval,
-            self.spin_dungeon_speed,
-        ):
-            widget.setEnabled(not recording and not running)
-
-    def _toggle_dungeon_record(self) -> None:
-        if self._dungeon_recorder is not None or self._dungeon_recording_pending:
-            self._stop_dungeon_record()
-            return
-        self._start_dungeon_record()
-
-    def _start_dungeon_record(self) -> None:
-        if self._quitting or self._dungeon_running:
-            return
-        if self._macro_busy():
-            self._notify("当前正忙", "请先停止基础挂机/地图测试/路径执行。")
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-        self._dungeon_recording_pending = True
-        self.lbl_dungeon_state.setText("3 秒后开始录制，请切到游戏…")
-        self._set_status(
-            "3 秒后开始录制副本；请切到游戏，完整操作后回来点“停止录制”。",
-            "warn",
-        )
-        self._update_dungeon_controls()
-        self._update_toggle_action()
-        QTimer.singleShot(3000, self._begin_dungeon_record)
-
-    def _begin_dungeon_record(self) -> None:
-        if not self._dungeon_recording_pending:
-            return
-        self._dungeon_recording_pending = False
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self.lbl_dungeon_state.setText("未运行")
-            self._set_status("绑定窗口已失效，录制未开始。", "error")
-            self._update_dungeon_controls()
-            return
-        recorder = MacroRecorder(self.target_hwnd)
-        try:
-            _force_foreground_window(self.target_hwnd)
-            recorder.start()
-        except Exception as exc:
-            self.lbl_dungeon_state.setText("录制启动失败")
-            self._set_status(f"录制启动失败：{exc}", "error")
-            self._notify("录制启动失败", str(exc))
-            self._update_dungeon_controls()
-            return
-        self._dungeon_recorder = recorder
-        self.lbl_dungeon_state.setText("录制中… 0 个动作")
-        self._set_status(
-            "正在录制副本。请在游戏里操作，完成后切回本窗口点“停止录制”。",
-            "ok",
-        )
-        self._update_dungeon_controls()
-        self._update_toggle_action()
-
-    @staticmethod
-    def _strip_dungeon_hotkey_tail(events: list[dict]) -> list[dict]:
-        """用 Ctrl+Alt+F8 停止录制时，把结尾这组热键事件从录制里去掉。"""
-        if not events:
-            return events
-        try:
-            last_t = float(events[-1].get("t", 0.0))
-        except (TypeError, ValueError):
-            last_t = 0.0
-        cutoff = last_t - 1.0
-        hot_keys = {"ctrl", "alt", "f8"}
-        cleaned = []
-        for event in events:
-            try:
-                t = float(event.get("t", 0.0))
-            except (TypeError, ValueError):
-                t = 0.0
-            name = str(event.get("name", "")).lower()
-            if (
-                t >= cutoff
-                and event.get("type") in ("key_down", "key_up")
-                and name in hot_keys
-            ):
-                continue
-            cleaned.append(event)
-        return cleaned
-
-    def _stop_dungeon_record(self) -> None:
-        if self._dungeon_recording_pending:
-            self._dungeon_recording_pending = False
-            self.lbl_dungeon_state.setText("未运行")
-            self._set_status("已取消录制。", "warn")
-            self._update_dungeon_controls()
-            self._update_toggle_action()
-            return
-        recorder = self._dungeon_recorder
-        self._dungeon_recorder = None
-        if recorder is None:
-            self._update_dungeon_controls()
-            return
-        try:
-            events = recorder.stop()
-        except Exception:
-            events = []
-        events = self._strip_dungeon_hotkey_tail(events)
-        meta = recorder.meta()
-        clicks = sum(1 for e in events if e.get("type") == "down")
-        duration = 0.0
-        if events:
-            try:
-                duration = max(0.0, float(events[-1].get("t", 0.0)))
-            except (TypeError, ValueError):
-                duration = 0.0
-        if not events:
-            self.lbl_dungeon_state.setText("录制为空")
-            self._set_status("没有录到任何操作，未保存。", "warn")
-            self._notify(
-                "录制为空",
-                "没有录到操作。录制开始后请让游戏保持前台，并在游戏窗口内操作。",
-            )
-            self._update_dungeon_controls()
-            self._update_toggle_action()
-            return
-
-        self._restore_window()
-        default_name = "副本 " + datetime.datetime.now().strftime("%m-%d %H:%M:%S")
-        name, ok = QInputDialog.getText(
-            self, "保存副本录制", "录制名称：", text=default_name
-        )
-        name = name.strip() if ok else ""
-        if not name:
-            name = default_name
-        existing = next(
-            (
-                i
-                for i, rec in enumerate(self._dungeon_records)
-                if str(rec.get("name", "")) == name
-            ),
-            None,
-        )
-        if existing is not None:
-            answer = QMessageBox.question(
-                self,
-                "覆盖录制",
-                f"录制「{name}」已存在，是否覆盖？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                self.lbl_dungeon_state.setText("已保留旧录制")
-                self._update_dungeon_controls()
-                self._update_toggle_action()
-                return
-        record = {
-            "name": name,
-            "events": events,
-            "clicks": clicks,
-            "duration": duration,
-            "meta": meta,
-            "updated_at": datetime.datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-        }
-        if existing is not None:
-            self._dungeon_records[existing] = record
-        else:
-            self._dungeon_records.append(record)
-        if not save_records(self._dungeon_records):
-            self._notify("保存失败", f"无法写入：{RECORDS_PATH}")
-        self._refresh_dungeon_records()
-        idx = next(
-            (
-                i
-                for i in range(self.combo_dungeon_record.count())
-                if str(
-                    (self.combo_dungeon_record.itemData(i) or {}).get("name", "")
-                )
-                == name
-            ),
-            -1,
-        )
-        if idx >= 0:
-            self.combo_dungeon_record.setCurrentIndex(idx)
-        self.lbl_dungeon_state.setText(
-            f"已保存：{name}（{len(events)} 个动作 / {duration:.1f} 秒）"
-        )
-        if clicks == 0:
-            self._notify(
-                "这段录制没有鼠标点击",
-                "录制里没有录到任何鼠标点击。如果“进入游戏”是在另一个窗口点的，"
-                "请先让那个窗口在前台；或者勾选“回放前识别并点击”。",
-            )
-        self._set_status(
-            f"副本录制已保存：{name}（点击 {clicks} 次）", "ok"
-        )
-        self._update_dungeon_controls()
-        self._update_toggle_action()
-
-    def _rename_dungeon_record(self) -> None:
-        record = self._selected_dungeon_record()
-        if record is None:
-            return
-        old_name = str(record.get("name", ""))
-        new_name, ok = QInputDialog.getText(
-            self, "重命名录制", "新名称：", text=old_name
-        )
-        new_name = new_name.strip()
-        if not ok or not new_name or new_name == old_name:
-            return
-        if any(
-            str(rec.get("name", "")) == new_name
-            for rec in self._dungeon_records
-            if str(rec.get("name", "")) != old_name
-        ):
-            self._notify("名称重复", f"录制「{new_name}」已存在。")
-            return
-        actual = next(
-            (
-                rec
-                for rec in self._dungeon_records
-                if str(rec.get("name", "")) == old_name
-            ),
-            None,
-        )
-        if actual is None:
-            self._notify("录制不存在", f"找不到录制「{old_name}」。")
-            return
-        actual["name"] = new_name
-        actual["updated_at"] = datetime.datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        if not save_records(self._dungeon_records):
-            self._notify("保存失败", f"无法写入：{RECORDS_PATH}")
-        combos_changed = False
-        for combo in self._combos:
-            if str(combo.get("record", "")) == old_name:
-                combo["record"] = new_name
-                combos_changed = True
-        if combos_changed:
-            save_combos(self._combos)
-            self._refresh_combos()
-        self._refresh_dungeon_records()
-        self._set_status(f"已重命名：{new_name}", "ok")
-
-    def _delete_dungeon_record(self) -> None:
-        record = self._selected_dungeon_record()
-        if record is None:
-            return
-        name = str(record.get("name", ""))
-        answer = QMessageBox.question(
-            self,
-            "删除录制",
-            f"确定删除录制「{name}」？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self._dungeon_records = [
-            rec
-            for rec in self._dungeon_records
-            if str(rec.get("name", "")) != name
-        ]
-        if not save_records(self._dungeon_records):
-            self._notify("保存失败", f"无法写入：{RECORDS_PATH}")
-        combos_changed = False
-        for combo in self._combos:
-            if str(combo.get("record", "")) == name:
-                combo["record"] = ""
-                combos_changed = True
-        if combos_changed:
-            save_combos(self._combos)
-            self._refresh_combos()
-        self._refresh_dungeon_records()
-        self._set_status(f"已删除录制：{name}", "warn")
-
-    def _play_dungeon_once_test(self) -> None:
-        self._start_dungeon_play(loop=False)
-
-    def _toggle_dungeon_run(self) -> None:
-        if self._dungeon_running:
-            self._stop_dungeon_play("副本回放已停止。")
-            return
-        self._start_dungeon_play(loop=True)
-
-    def _start_dungeon_play(self, loop: bool) -> None:
-        if self._quitting or self._dungeon_running:
-            return
-        if self._dungeon_recorder is not None or self._dungeon_recording_pending:
-            self._notify("正在录制", "请先停止录制。")
-            return
-        if self._macro_busy():
-            self._notify("当前正忙", "请先停止基础挂机/地图测试/路径执行。")
-            return
-        record = self._selected_dungeon_record()
-        if record is None or not record.get("events"):
-            self._notify("没有录制", "请先录制一段副本流程。")
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-
-        repeat = int(self.spin_dungeon_repeat.value())
-        self._dungeon_total = 1 if not loop else repeat
-        self._dungeon_done_count = 0
-        self._dungeon_interval = float(self.spin_dungeon_interval.value())
-        self._dungeon_speed = max(
-            0.5, min(2.0, float(self.spin_dungeon_speed.value()) / 100.0)
-        )
-        self._dungeon_running = True
-        total_label = "∞" if self._dungeon_total == 0 else str(self._dungeon_total)
-        self.lbl_dungeon_state.setText(f"准备回放 0/{total_label}…")
-        self._set_status(
-            "开始副本回放：请勿操作鼠标键盘，结束后会自动恢复前台窗口。",
-            "warn",
-        )
-        self._update_dungeon_controls()
-        self._update_toggle_action()
-        self._play_dungeon_once()
-
-    def _play_dungeon_once(self) -> None:
-        if not self._dungeon_running:
-            return
-        if self._dungeon_total > 0 and self._dungeon_done_count >= self._dungeon_total:
-            self._finish_dungeon_play()
-            return
-        if self._dungeon_player is not None:
-            return
-        record = self._selected_dungeon_record()
-        if record is None or not record.get("events"):
-            self._stop_dungeon_play("录制不存在，已停止。", "error")
-            return
-        events = list(record.get("events", []))
-        meta = record.get("meta")
-        player = MacroPlayer(
-            self.target_hwnd,
-            "副本",
-            events,
-            meta=meta if isinstance(meta, dict) else None,
-            speed=self._dungeon_speed,
-            lock_user_input=bool(self.chk_lock_input.isChecked()),
-            background=bool(self.chk_background_replay.isChecked()),
-            parent=self,
-        )
-        player.done.connect(self._on_dungeon_player_done)
-        player.error.connect(self._on_dungeon_player_error)
-        self._dungeon_player = player
-        total_label = "∞" if self._dungeon_total == 0 else str(self._dungeon_total)
-        self.lbl_dungeon_state.setText(
-            f"回放中 {self._dungeon_done_count + 1}/{total_label}…"
-        )
-        player.start()
-
-    def _on_dungeon_player_done(self, stage: str) -> None:
-        player = self.sender()
-        if isinstance(player, MacroPlayer):
-            player.wait(500)
-            player.deleteLater()
-        if player is not self._dungeon_player:
-            return
-        self._dungeon_player = None
-        if not self._dungeon_running:
-            return
-        self._dungeon_done_count += 1
-        total_label = "∞" if self._dungeon_total == 0 else str(self._dungeon_total)
-        self.lbl_dungeon_state.setText(
-            f"已完成 {self._dungeon_done_count}/{total_label}"
-        )
-        if (
-            self._dungeon_total > 0
-            and self._dungeon_done_count >= self._dungeon_total
-        ):
-            self._finish_dungeon_play()
-            return
-        if self._dungeon_pending_timer is None:
-            self._dungeon_pending_timer = QTimer(self)
-            self._dungeon_pending_timer.setSingleShot(True)
-            self._dungeon_pending_timer.timeout.connect(self._play_dungeon_once)
-        self._set_status(
-            f"下一次回放将在 {self._dungeon_interval:.0f} 秒后开始…", "warn"
-        )
-        self._dungeon_pending_timer.start(
-            max(0, int(self._dungeon_interval * 1000))
-        )
-
-    def _on_dungeon_player_error(self, stage: str, message: str) -> None:
-        player = self.sender()
-        if isinstance(player, MacroPlayer):
-            player.wait(500)
-            player.deleteLater()
-        if player is not self._dungeon_player:
-            return
-        self._dungeon_player = None
-        self._stop_dungeon_play(f"副本回放失败：{message}", "error")
-        try:
-            self._popup.show_message("副本回放失败", message, seconds=15)
-        except Exception:
-            pass
-
-    def _finish_dungeon_play(self) -> None:
-        self._dungeon_running = False
-        if self._dungeon_pending_timer is not None:
-            self._dungeon_pending_timer.stop()
-        self.lbl_dungeon_state.setText("副本回放完成")
-        self._set_status("副本回放完成。", "ok")
-        self._update_dungeon_controls()
-        self._update_toggle_action()
-
-    def _stop_dungeon_play(
-        self, message: str = "副本回放已停止。", level: str = "warn"
-    ) -> None:
-        was_running = self._dungeon_running
-        self._dungeon_running = False
-        if self._dungeon_pending_timer is not None:
-            self._dungeon_pending_timer.stop()
-        player = self._dungeon_player
-        self._dungeon_player = None
-        if player is not None:
-            player.stop()
-            if not player.wait(3000):
-                player.terminate()
-                player.wait(500)
-            player.deleteLater()
-        if was_running:
-            self.lbl_dungeon_state.setText("已停止")
-            self._set_status(message, level)
-        self._update_dungeon_controls()
-        self._update_toggle_action()
-
-    # ------------------------------------------------------------ 组合挂机
-    def _refresh_combos(self) -> None:
-        if not hasattr(self, "combo_combo"):
-            return
-        current = self.combo_combo.currentData()
-        current_name = (
-            str(current.get("name", "")) if isinstance(current, dict) else ""
-        )
-        self.combo_combo.blockSignals(True)
-        self.combo_combo.clear()
-        for combo in self._combos:
-            path_name = str(combo.get("path", "")).strip() or "无路径"
-            record_name = str(combo.get("record", "")).strip() or "无录制"
-            repeat = int(combo.get("repeat", 1))
-            repeat_text = "∞" if repeat == 0 else str(repeat)
-            self.combo_combo.addItem(
-                f"{combo.get('name', '未命名')}  [{path_name} + {record_name}] ×{repeat_text}",
-                combo,
-            )
-        if current_name:
-            idx = next(
-                (
-                    i
-                    for i in range(self.combo_combo.count())
-                    if str(
-                        (self.combo_combo.itemData(i) or {}).get("name", "")
-                    )
-                    == current_name
-                ),
-                -1,
-            )
-            if idx >= 0:
-                self.combo_combo.setCurrentIndex(idx)
-        self.combo_combo.blockSignals(False)
-        self._update_combo_controls()
-
-    def _selected_combo(self) -> Optional[dict]:
-        data = self.combo_combo.currentData()
-        return data if isinstance(data, dict) else None
-
-    def _update_combo_controls(self) -> None:
-        if not hasattr(self, "btn_combo_run"):
-            return
-        running = self._combo_running
-        has_combo = isinstance(self.combo_combo.currentData(), dict)
-        target_ok = (
-            self.target_hwnd is not None
-            and self._window_alive(self.target_hwnd)
-        )
-        busy_other = bool(
-            self._worker is not None
-            or self._route_editor is not None
-            or self._map_runner is not None
-            or self._path_runner is not None
-            or self._dungeon_recorder is not None
-            or self._dungeon_recording_pending
-            or self._dungeon_running
-            or self._dungeon_player is not None
-            or self._combo_running
-            or self._combo_path_runner is not None
-            or self._combo_player is not None
-            or self._any_multi_running()
-        )
-        idle = (not running) and (not busy_other)
-        self.combo_combo.setEnabled(idle and has_combo)
-        self.btn_combo_new.setEnabled(idle)
-        self.btn_combo_edit.setEnabled(idle and has_combo)
-        self.btn_combo_delete.setEnabled(idle and has_combo)
-        self.btn_combo_run.setText("停止组合" if running else "开始组合")
-        self.btn_combo_run.setEnabled(
-            running or (idle and has_combo and target_ok)
-        )
-
-    def _new_combo(self) -> None:
-        if self._combo_running:
-            return
-        try:
-            from paths import load_paths
-
-            paths = load_paths()
-        except Exception:
-            paths = []
-        dialog = ComboEditDialog(paths, self._dungeon_records, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        data = dialog.combo_data()
-        if any(
-            str(combo.get("name", "")) == data["name"]
-            for combo in self._combos
-        ):
-            self._notify("名称重复", f"组合「{data['name']}」已存在。")
-            return
-        self._combos.append(data)
-        if not save_combos(self._combos):
-            self._notify("保存失败", f"无法写入：{COMBOS_PATH}")
-        self._refresh_combos()
-        idx = next(
-            (
-                i
-                for i in range(self.combo_combo.count())
-                if str((self.combo_combo.itemData(i) or {}).get("name", ""))
-                == data["name"]
-            ),
-            -1,
-        )
-        if idx >= 0:
-            self.combo_combo.setCurrentIndex(idx)
-        self._set_status(f"已新建组合：{data['name']}", "ok")
-
-    def _edit_combo(self) -> None:
-        combo = self._selected_combo()
-        if combo is None or self._combo_running:
-            return
-        try:
-            from paths import load_paths
-
-            paths = load_paths()
-        except Exception:
-            paths = []
-        dialog = ComboEditDialog(
-            paths, self._dungeon_records, combo, parent=self
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        data = dialog.combo_data()
-        old_name = str(combo.get("name", ""))
-        if any(
-            str(other.get("name", "")) == data["name"]
-            for other in self._combos
-            if str(other.get("name", "")) != old_name
-        ):
-            self._notify("名称重复", f"组合「{data['name']}」已存在。")
-            return
-        actual = next(
-            (
-                item
-                for item in self._combos
-                if str(item.get("name", "")) == old_name
-            ),
-            None,
-        )
-        if actual is None:
-            self._notify("组合不存在", f"找不到组合「{old_name}」。")
-            return
-        actual.clear()
-        actual.update(data)
-        if not save_combos(self._combos):
-            self._notify("保存失败", f"无法写入：{COMBOS_PATH}")
-        self._refresh_combos()
-        idx = next(
-            (
-                i
-                for i in range(self.combo_combo.count())
-                if str((self.combo_combo.itemData(i) or {}).get("name", ""))
-                == data["name"]
-            ),
-            -1,
-        )
-        if idx >= 0:
-            self.combo_combo.setCurrentIndex(idx)
-        self._set_status(f"组合已保存：{data['name']}", "ok")
-
-    def _delete_combo(self) -> None:
-        combo = self._selected_combo()
-        if combo is None or self._combo_running:
-            return
-        name = str(combo.get("name", ""))
-        answer = QMessageBox.question(
-            self,
-            "删除组合",
-            f"确定删除组合「{name}」？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self._combos = [
-            item
-            for item in self._combos
-            if str(item.get("name", "")) != name
-        ]
-        if not save_combos(self._combos):
-            self._notify("保存失败", f"无法写入：{COMBOS_PATH}")
-        self._refresh_combos()
-        self._set_status(f"已删除组合：{name}", "warn")
-
-    def _toggle_combo(self) -> None:
-        if self._combo_running:
-            self._stop_combo("组合挂机已停止。")
-            return
-        self._start_combo()
-
-    def _start_combo(self) -> None:
-        if self._quitting or self._combo_running:
-            return
-        if self._macro_busy():
-            self._notify(
-                "当前正忙", "请先停止基础挂机/路径执行/副本录制或回放。"
-            )
-            return
-        combo = self._selected_combo()
-        if combo is None:
-            self._notify("没有组合", "请先新建并选择一个组合。")
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-
-        path_name = str(combo.get("path", "")).strip()
-        record_name = str(combo.get("record", "")).strip()
-        if not path_name and not record_name:
-            self._notify("组合为空", "组合里路径和副本录制至少要有一个。")
-            return
-        if path_name:
-            try:
-                from paths import load_paths
-
-                paths = load_paths()
-            except Exception:
-                paths = []
-            if not any(
-                str(path.get("name", "")) == path_name for path in paths
-            ):
-                self._notify(
-                    "路径不存在",
-                    f"组合引用的路径「{path_name}」不存在，请编辑组合重新选择。",
-                )
-                return
-        if record_name and not any(
-            str(record.get("name", "")) == record_name
-            for record in self._dungeon_records
-        ):
-            self._notify(
-                "录制不存在",
-                f"组合引用的录制「{record_name}」不存在，请编辑组合重新选择。",
-            )
-            return
-
-        self._combo_cfg = dict(combo)
-        self._combo_name = str(combo.get("name", ""))
-        self._combo_total = max(0, int(combo.get("repeat", 1)))
-        self._combo_done_count = 0
-        self._combo_running = True
-        total_label = "∞" if self._combo_total == 0 else str(self._combo_total)
-        self.lbl_combo_state.setText(f"准备 0/{total_label}…")
-        self._set_status(
-            f"开始组合挂机：{self._combo_name}", "ok"
-        )
-        self._update_combo_controls()
-        self._update_macro_button_states()
-        self._update_toggle_action()
-        self._combo_run_path()
-
-    def _combo_next_label(self) -> str:
-        total_label = "∞" if self._combo_total == 0 else str(self._combo_total)
-        return f"{self._combo_done_count + 1}/{total_label}"
-
-    def _combo_run_path(self) -> None:
-        if not self._combo_running:
-            return
-        if self._combo_path_runner is not None or self._combo_player is not None:
-            return
-        path_name = str(self._combo_cfg.get("path", "")).strip()
-        if not path_name:
-            self._combo_play_record()
-            return
-        try:
-            from map_labels import load_maps
-            from paths import PathRunner, load_paths
-        except Exception as exc:
-            self._stop_combo(f"加载路径模块失败：{exc}", "error")
-            return
-        path = next(
-            (
-                item
-                for item in load_paths()
-                if str(item.get("name", "")) == path_name
-            ),
-            None,
-        )
-        if path is None:
-            self._stop_combo(f"路径「{path_name}」不存在。", "error")
-            return
-        profiles = load_maps()
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._stop_combo("目标窗口已关闭。", "error")
-            return
-        runner = PathRunner(
-            self.target_hwnd,
-            path,
-            profiles,
-            map_key=self._macro_cfg.get("map_key", "m"),
-            close_key=self._macro_cfg.get("close_map_key", "esc"),
-            mount_key=self._macro_cfg.get("mount_key", "f"),
-            parent=self,
-        )
-        runner.status.connect(self._on_combo_path_status)
-        runner.done.connect(self._on_combo_path_done)
-        runner.failed.connect(self._on_combo_path_failed)
-        self._combo_path_runner = runner
-        self.lbl_combo_state.setText(
-            f"第 {self._combo_next_label()} 轮：执行路径「{path_name}」…"
-        )
-        runner.start()
-
-    def _on_combo_path_status(self, text: str, level: str) -> None:
-        self.lbl_combo_state.setText(text)
-        self._set_status(text, level)
-
-    def _on_combo_path_done(self) -> None:
-        runner = self.sender()
-        if isinstance(runner, QThread):
-            runner.wait(500)
-            runner.deleteLater()
-        if runner is not self._combo_path_runner:
-            return
-        self._combo_path_runner = None
-        if not self._combo_running:
-            return
-        self._combo_play_record()
-
-    def _on_combo_path_failed(self, message: str) -> None:
-        runner = self.sender()
-        if isinstance(runner, QThread):
-            runner.wait(500)
-            runner.deleteLater()
-        if runner is not self._combo_path_runner:
-            return
-        self._combo_path_runner = None
-        if not self._combo_running:
-            return
-        self._stop_combo(f"组合路径失败：{message}", "error")
-        try:
-            self._popup.show_message("组合路径失败", message, seconds=15)
-        except Exception:
-            pass
-
-    def _combo_play_record(self) -> None:
-        if not self._combo_running or self._combo_player is not None:
-            return
-        record_name = str(self._combo_cfg.get("record", "")).strip()
-        if not record_name:
-            self._combo_cycle_done()
-            return
-        record = next(
-            (
-                item
-                for item in self._dungeon_records
-                if str(item.get("name", "")) == record_name
-            ),
-            None,
-        )
-        if record is None or not record.get("events"):
-            self._stop_combo(
-                f"副本录制「{record_name}」不存在或为空。", "error"
-            )
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._stop_combo("目标窗口已关闭。", "error")
-            return
-        meta = record.get("meta")
-        player = MacroPlayer(
-            self.target_hwnd,
-            "组合",
-            list(record.get("events", [])),
-            meta=meta if isinstance(meta, dict) else None,
-            speed=float(self._combo_cfg.get("speed", 1.0) or 1.0),
-            lock_user_input=bool(self.chk_lock_input.isChecked()),
-            background=bool(self.chk_background_replay.isChecked()),
-            parent=self,
-        )
-        player.done.connect(self._on_combo_player_done)
-        player.error.connect(self._on_combo_player_error)
-        self._combo_player = player
-        self.lbl_combo_state.setText(
-            f"第 {self._combo_next_label()} 轮：回放副本录制「{record_name}」…"
-        )
-        player.start()
-
-    def _on_combo_player_done(self, stage: str) -> None:
-        player = self.sender()
-        if isinstance(player, MacroPlayer):
-            player.wait(500)
-            player.deleteLater()
-        if player is not self._combo_player:
-            return
-        self._combo_player = None
-        if not self._combo_running:
-            return
-        self._combo_cycle_done()
-
-    def _on_combo_player_error(self, stage: str, message: str) -> None:
-        player = self.sender()
-        if isinstance(player, MacroPlayer):
-            player.wait(500)
-            player.deleteLater()
-        if player is not self._combo_player:
-            return
-        self._combo_player = None
-        if not self._combo_running:
-            return
-        self._stop_combo(f"组合录制回放失败：{message}", "error")
-        try:
-            self._popup.show_message("组合录制回放失败", message, seconds=15)
-        except Exception:
-            pass
-
-    def _combo_cycle_done(self) -> None:
-        if not self._combo_running:
-            return
-        self._combo_done_count += 1
-        total_label = "∞" if self._combo_total == 0 else str(self._combo_total)
-        self.lbl_combo_state.setText(
-            f"已完成 {self._combo_done_count}/{total_label}"
-        )
-        if (
-            self._combo_total > 0
-            and self._combo_done_count >= self._combo_total
-        ):
-            self._finish_combo()
-            return
-        interval = max(0.0, float(self._combo_cfg.get("interval", 0) or 0))
-        if self._combo_pending_timer is None:
-            self._combo_pending_timer = QTimer(self)
-            self._combo_pending_timer.setSingleShot(True)
-            self._combo_pending_timer.timeout.connect(self._combo_run_path)
-        self._set_status(
-            f"下一轮组合将在 {interval:.0f} 秒后开始…", "warn"
-        )
-        self._combo_pending_timer.start(max(0, int(interval * 1000)))
-
-    def _finish_combo(self) -> None:
-        self._combo_running = False
-        if self._combo_pending_timer is not None:
-            self._combo_pending_timer.stop()
-        self.lbl_combo_state.setText("组合挂机完成")
-        self._set_status(f"组合挂机完成：{self._combo_name}", "ok")
-        self._update_combo_controls()
-        self._update_macro_button_states()
-        self._update_toggle_action()
-
-    def _stop_combo(
-        self, message: str = "组合挂机已停止。", level: str = "warn"
-    ) -> None:
-        was_running = self._combo_running
-        self._combo_running = False
-        if self._combo_pending_timer is not None:
-            self._combo_pending_timer.stop()
-        runner = self._combo_path_runner
-        self._combo_path_runner = None
-        if runner is not None:
-            runner.stop()
-            if not runner.wait(4000):
-                runner.terminate()
-                runner.wait(500)
-            runner.deleteLater()
-        player = self._combo_player
-        self._combo_player = None
-        if player is not None:
-            player.stop()
-            if not player.wait(3000):
-                player.terminate()
-                player.wait(500)
-            player.deleteLater()
-        if was_running:
-            self.lbl_combo_state.setText("已停止")
-            self._set_status(message, level)
-        self._update_combo_controls()
-        self._update_macro_button_states()
-        self._update_toggle_action()
-
-    # ------------------------------------------------------------ 疲劳循环（打怪 ↔ BOSS）
-    def _refresh_fatigue_loop_options(self) -> None:
-        if not hasattr(self, "combo_fl_record"):
-            return
-        combo = self.combo_fl_record
-        current = str(combo.currentData() or "")
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItem("（请选择 BOSS 整段录制）", "")
-        for record in self._dungeon_records:
-            name = str(record.get("name", "")).strip()
-            if name:
-                combo.addItem(name, name)
-        idx = combo.findData(current)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-        combo.blockSignals(False)
-        self._update_fatigue_loop_controls()
-
-    def _refresh_fl_boss_targets(self, *_args) -> None:
-        if not hasattr(self, "combo_fl_boss_target"):
-            return
-        profile_name = str(self.combo_fl_boss_map.currentData() or "")
-        try:
-            from map_labels import load_maps
-
-            profiles = load_maps()
-        except Exception:
-            profiles = []
-        profile = None
-        if profile_name:
-            profile = next(
-                (
-                    item
-                    for item in profiles
-                    if str(item.get("name", "")) == profile_name
-                ),
-                None,
-            )
-            if profile is None:
-                profile = next(
-                    (
-                        item
-                        for item in profiles
-                        if profile_name in str(item.get("name", ""))
-                        or str(item.get("name", "")) in profile_name
-                    ),
-                    None,
-                )
-        combo = self.combo_fl_boss_target
-        current = str(combo.currentData() or "")
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItem("（请选择 BOSS 点）", "")
-        if profile is not None:
-            for target in profile.get("targets", []):
-                if not isinstance(target, dict):
-                    continue
-                name = str(target.get("name", "")).strip()
-                if name:
-                    kind = {"farm": "打怪点", "boss": "BOSS点", "other": "其他"}.get(
-                        str(target.get("kind", "")), "其他"
-                    )
-                    combo.addItem(f"{name} [{kind}]", name)
-        idx = combo.findData(current)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-        combo.blockSignals(False)
-        self._update_fatigue_loop_controls()
-
-    def _update_fatigue_loop_controls(self) -> None:
-        if not hasattr(self, "btn_fl_run"):
-            return
-        running = self._fatigue_loop_running
-        target_ok = (
-            self.target_hwnd is not None
-            and self._window_alive(self.target_hwnd)
-        )
-        roi_ok = self._fatigue_roi_norm is not None
-        busy_other = bool(
-            self._worker is not None
-            or self._route_editor is not None
-            or self._map_runner is not None
-            or self._path_runner is not None
-            or self._dungeon_recorder is not None
-            or self._dungeon_recording_pending
-            or self._dungeon_running
-            or self._dungeon_player is not None
-            or self._combo_running
-            or self._combo_path_runner is not None
-            or self._combo_player is not None
-        )
-        idle = (not running) and (not busy_other)
-        self.btn_fl_run.setText("停止疲劳循环" if running else "开始疲劳循环")
-        # 不因为没选满而禁用按钮，点击后由 _start_fatigue_loop 给出具体原因。
-        self.btn_fl_run.setEnabled(running or idle)
-        missing = []
-        if not self.combo_fl_record.currentData():
-            missing.append("BOSS录制")
-        if not target_ok:
-            missing.append("绑定窗口")
-        if not roi_ok:
-            missing.append("框选疲劳区域")
-        if missing:
-            self.btn_fl_run.setToolTip("还缺少：" + "、".join(missing))
-        else:
-            self.btn_fl_run.setToolTip("开始疲劳循环")
-        has_record = bool(self.combo_fl_record.currentData())
-        for widget in (
-            self.combo_fl_record,
-            self.spin_fl_threshold,
-            self.spin_fl_interval,
-        ):
-            widget.setEnabled(idle)
-        if hasattr(self, "btn_fl_delete_record"):
-            self.btn_fl_delete_record.setEnabled(idle and has_record)
-        if hasattr(self, "btn_fl_test"):
-            self.btn_fl_test.setEnabled(idle and has_record and target_ok)
-        if hasattr(self, "btn_fl_record"):
-            recording = (
-                self._dungeon_recorder is not None
-                or self._dungeon_recording_pending
-            )
-            self.btn_fl_record.setText(
-                "取消录制"
-                if self._dungeon_recording_pending
-                else ("停止录制" if recording else "录制新脚本")
-            )
-            self.btn_fl_record.setEnabled(recording or (idle and target_ok))
-
-    def _fl_set_state(self, text: str, level: str = "normal") -> None:
-        if hasattr(self, "lbl_fl_state"):
-            self.lbl_fl_state.setText(text)
-        self._set_status(text, level)
-
-    def _play_fl_record_test(self) -> None:
-        name = str(self.combo_fl_record.currentData() or "").strip()
-        if not name:
-            return
-        for i in range(self.combo_dungeon_record.count()):
-            data = self.combo_dungeon_record.itemData(i) or {}
-            if isinstance(data, dict) and str(data.get("name", "")) == name:
-                self.combo_dungeon_record.setCurrentIndex(i)
-                break
-        self._play_dungeon_once_test()
-
-    def _delete_fl_record(self) -> None:
-        name = str(self.combo_fl_record.currentData() or "").strip()
-        if not name or self._fatigue_loop_running:
-            return
-        # 同步选中第 4 组里的同一条录制，复用统一的删除逻辑。
-        target_index = -1
-        for i in range(self.combo_dungeon_record.count()):
-            data = self.combo_dungeon_record.itemData(i) or {}
-            if isinstance(data, dict) and str(data.get("name", "")) == name:
-                target_index = i
-                break
-        if target_index >= 0:
-            self.combo_dungeon_record.setCurrentIndex(target_index)
-            self._delete_dungeon_record()
-            return
-        # 兜底：第 4 组没有这条时，直接按名字删除。
-        answer = QMessageBox.question(
-            self,
-            "删除录制",
-            f"确定删除录制「{name}」？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self._dungeon_records = [
-            rec
-            for rec in self._dungeon_records
-            if str(rec.get("name", "")) != name
-        ]
-        if not save_records(self._dungeon_records):
-            self._notify("保存失败", f"无法写入：{RECORDS_PATH}")
-        self._refresh_dungeon_records()
-        self._refresh_fatigue_loop_options()
-        self._set_status(f"已删除录制：{name}", "warn")
-
-    def _toggle_fatigue_loop(self) -> None:
-        if self._fatigue_loop_running:
-            self._stop_fatigue_loop("疲劳循环已停止。")
-            return
-        self._start_fatigue_loop()
-
-    def _start_fatigue_loop(self) -> None:
-        if self._quitting or self._fatigue_loop_running:
-            return
-        if self._macro_busy():
-            self._notify(
-                "当前正忙", "请先停止基础挂机/路径执行/副本回放/组合挂机。"
-            )
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-        if self._fatigue_roi_norm is None:
-            self._notify(
-                "尚未框选疲劳区域",
-                "请先在基础挂机页点击“框选区域”，框住右下角的疲劳提示按钮。",
-            )
-            return
-        record_name = str(self.combo_fl_record.currentData() or "").strip()
-        if not record_name:
-            self._notify("没有录制", "请先选择一段 BOSS 整段录制。")
-            return
-        if not any(
-            str(record.get("name", "")) == record_name
-            for record in self._dungeon_records
-        ):
-            self._notify("录制不存在", f"BOSS 录制「{record_name}」不存在。")
-            return
-
-        self._fatigue_loop_cfg = {
-            "record": record_name,
-            "threshold": int(self.spin_fl_threshold.value()),
-            "interval": float(self.spin_fl_interval.value()),
-        }
-        self._fatigue_loop_rounds = 0
-        self._fatigue_loop_running = True
-        self._fatigue_loop_state = "farming"
-        self._fl_set_state("开始疲劳循环：先打怪，随后检测疲劳…", "ok")
-        self._update_fatigue_loop_controls()
-        self._update_macro_button_states()
-        self._update_toggle_action()
-        self._fl_start_farming()
-        self._fl_schedule_check(2.0)
-
-    def _fl_start_farming(self) -> None:
-        if not self._fatigue_loop_running:
-            return
-        if self._fatigue_loop_worker is not None:
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._stop_fatigue_loop("目标窗口已关闭。", "error")
-            return
-        self._fatigue_loop_state = "farming"
-        worker = KeySender(
-            self.target_hwnd,
-            self.spin_interval.value(),
-            use_skills=self.chk_skills.isChecked(),
-            use_potion=self.chk_potion.isChecked(),
-            potion_interval_ms=self.spin_potion.value() * 1000,
-            use_pickup=self.chk_pickup.isChecked(),
-            parent=self,
-        )
-        worker.cycle_done.connect(self._on_fl_farm_cycle)
-        worker.failed.connect(self._on_fl_farm_failed)
-        self._fatigue_loop_worker = worker
-        worker.start()
-
-    def _fl_stop_farming(self) -> None:
-        worker = self._fatigue_loop_worker
-        self._fatigue_loop_worker = None
-        if worker is not None:
-            worker.stop()
-            if not worker.wait(2500):
-                worker.terminate()
-                worker.wait(500)
-            worker.deleteLater()
-
-    def _on_fl_farm_cycle(self, rounds: int) -> None:
-        if not self._fatigue_loop_running or self._fatigue_loop_state != "farming":
-            return
-        last = getattr(self, "_fl_last_fatigue_text", "")
-        suffix = f" / {last}" if last else ""
-        self.lbl_fl_state.setText(f"打怪中… 已 {int(rounds)} 轮{suffix}")
-
-    def _on_fl_farm_failed(self, message: str) -> None:
-        if not self._fatigue_loop_running:
-            return
-        if self._fatigue_loop_state != "farming":
-            return
-        self._stop_fatigue_loop(f"打怪线程停止：{message}", "error")
-        try:
-            self._popup.show_message("打怪线程停止", message, seconds=15)
-        except Exception:
-            pass
-
-    def _fl_schedule_check(self, delay: float) -> None:
-        if not self._fatigue_loop_running:
-            return
-        if self._fatigue_loop_timer is None:
-            self._fatigue_loop_timer = QTimer(self)
-            self._fatigue_loop_timer.setSingleShot(True)
-            self._fatigue_loop_timer.timeout.connect(self._fl_check_once)
-        self._fatigue_loop_timer.start(max(0, int(delay * 1000)))
-
-    def _fl_check_once(self) -> None:
-        if not self._fatigue_loop_running:
-            return
-        if self._fatigue_loop_monitor is not None:
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._stop_fatigue_loop("目标窗口已关闭。", "error")
-            return
-        if self._fatigue_roi_norm is None:
-            self._stop_fatigue_loop("尚未框选疲劳提示区域。", "error")
-            return
-        monitor = FatigueMonitor(
-            self.target_hwnd,
-            self._fatigue_roi_norm,
-            one_shot=True,
-            parent=self,
-        )
-        monitor.result.connect(self._on_fl_fatigue_result)
-        self._fatigue_loop_monitor = monitor
-        if self._fatigue_loop_state == "farming":
-            self.lbl_fl_state.setText("打怪中… 正在检测疲劳…")
-        else:
-            self.lbl_fl_state.setText("正在检测疲劳…")
-        monitor.start()
-
-    def _on_fl_fatigue_result(self, current, maximum, message: str) -> None:
-        monitor = self.sender()
-        if isinstance(monitor, FatigueMonitor):
-            monitor.wait(2000)
-            monitor.deleteLater()
-        if monitor is not self._fatigue_loop_monitor:
-            return
-        self._fatigue_loop_monitor = None
-        if not self._fatigue_loop_running:
-            return
-        if self._fatigue_loop_state != "farming":
-            return
-        threshold = int(
-            self._fatigue_loop_cfg.get("threshold", self._fatigue_threshold)
-        )
-        interval = max(5.0, float(self._fatigue_loop_cfg.get("interval", 30)))
-        if current is None or maximum is None:
-            self._fl_set_state(
-                f"疲劳检测失败：{message}（继续当前状态）", "warn"
-            )
-            if self._fatigue_loop_state == "farming":
-                self._fl_start_farming()
-                self._fl_schedule_check(interval)
-            return
-        current = int(current)
-        maximum = int(maximum)
-        self._fl_last_fatigue_text = f"上次疲劳 {current}/{maximum}"
-        self._fl_set_state(
-            f"当前疲劳 {current}/{maximum}（阈值 ±{threshold}）", "ok"
-        )
-        if current < -threshold:
-            self._fl_go_boss(current, maximum, threshold)
-        else:
-            self._fl_continue_farming(
-                f"疲劳 {current}/{maximum}，继续打怪…", interval
-            )
-
-    def _fl_go_boss(self, current: int, maximum: int, threshold: int) -> None:
-        if not self._fatigue_loop_running:
-            return
-        self._fatigue_loop_state = "boss"
-        if self._fatigue_loop_timer is not None:
-            self._fatigue_loop_timer.stop()
-        self._fl_stop_farming()
-        self._fl_set_state(
-            f"疲劳 {current}/{maximum} < -{threshold}，回放 BOSS 录制…", "warn"
-        )
-        self._fl_play_record()
-
-    def _fl_continue_farming(
-        self, message: str = "继续打怪…", interval: Optional[float] = None
-    ) -> None:
-        if not self._fatigue_loop_running:
-            return
-        if self._fatigue_loop_state in ("to_boss", "boss"):
-            return
-        self._fatigue_loop_state = "farming"
-        self._fl_start_farming()
-        self._fl_set_state(message, "ok")
-        if interval is None:
-            interval = max(
-                5.0, float(self._fatigue_loop_cfg.get("interval", 30))
-            )
-        self._fl_schedule_check(interval)
-
-    def _fl_resume_farming(
-        self, current: int, maximum: int, threshold: int, interval: float
-    ) -> None:
-        self._fl_continue_farming(
-            f"疲劳 {current}/{maximum} > +{threshold}，继续打怪…",
-            interval,
-        )
-
-    def _fl_run_path(self, kind: str) -> None:
-        if not self._fatigue_loop_running:
-            return
-        if self._fatigue_loop_path_runner is not None:
-            return
-        path_name = str(self._fatigue_loop_cfg.get(kind, "")).strip()
-        if not path_name:
-            self._stop_fatigue_loop(f"没有选择{kind}路径。", "error")
-            return
-        try:
-            from map_labels import load_maps
-            from paths import PathRunner, load_paths
-        except Exception as exc:
-            self._stop_fatigue_loop(f"加载路径模块失败：{exc}", "error")
-            return
-        path = next(
-            (
-                item
-                for item in load_paths()
-                if str(item.get("name", "")) == path_name
-            ),
-            None,
-        )
-        if path is None:
-            self._stop_fatigue_loop(f"路径「{path_name}」不存在。", "error")
-            return
-        runner = PathRunner(
-            self.target_hwnd,
-            path,
-            load_maps(),
-            map_key=self._macro_cfg.get("map_key", "m"),
-            close_key=self._macro_cfg.get("close_map_key", "esc"),
-            mount_key=self._macro_cfg.get("mount_key", "f"),
-            parent=self,
-        )
-        runner.status.connect(self._on_fl_path_status)
-        runner.done.connect(self._on_fl_path_done)
-        runner.failed.connect(self._on_fl_path_failed)
-        self._fatigue_loop_path_kind = kind
-        self._fatigue_loop_path_runner = runner
-        label = "进路路径" if kind == "to_boss" else "返回路径"
-        self.lbl_fl_state.setText(f"执行{label}「{path_name}」…")
-        runner.start()
-
-    def _on_fl_path_status(self, text: str, level: str) -> None:
-        self.lbl_fl_state.setText(text)
-        self._set_status(text, level)
-
-    def _on_fl_path_done(self) -> None:
-        runner = self.sender()
-        if isinstance(runner, QThread):
-            runner.wait(500)
-            runner.deleteLater()
-        if runner is not self._fatigue_loop_path_runner:
-            return
-        self._fatigue_loop_path_runner = None
-        if not self._fatigue_loop_running:
-            return
-        kind = self._fatigue_loop_path_kind
-        self._fl_map_open = bool(getattr(runner, "_map_open", False))
-        if kind == "to_boss":
-            self._fatigue_loop_state = "boss_point"
-            self._fl_click_boss_point_and_wait()
-        else:
-            # 返回路径结束后地图可能还开着，先关掉再打怪。
-            if self._fl_map_open:
-                self._fl_tap_key(self._macro_cfg.get("close_map_key", "esc"))
-                self._fl_map_open = False
-            self._fl_continue_farming("已返回打怪点，继续打怪…")
-
-    def _on_fl_path_failed(self, message: str) -> None:
-        runner = self.sender()
-        if isinstance(runner, QThread):
-            runner.wait(500)
-            runner.deleteLater()
-        if runner is not self._fatigue_loop_path_runner:
-            return
-        self._fatigue_loop_path_runner = None
-        if not self._fatigue_loop_running:
-            return
-        self._stop_fatigue_loop(f"疲劳循环路径失败：{message}", "error")
-        try:
-            self._popup.show_message("疲劳循环路径失败", message, seconds=15)
-        except Exception:
-            pass
-
-    def _fl_tap_key(self, name: str) -> None:
-        if not name:
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            return
-        _force_foreground_window(self.target_hwnd)
-        time.sleep(0.1)
-        _send_key_name(name, True)
-        time.sleep(0.05)
-        _send_key_name(name, False)
-        time.sleep(0.3)
-
-    def _fl_click_norm(self, nx: float, ny: float) -> None:
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            return
-        _l, _t, cw, ch = win32gui.GetClientRect(self.target_hwnd)
-        cw, ch = int(cw), int(ch)
-        if cw <= 0 or ch <= 0:
-            return
-        x = max(1, min(cw - 2, int(round(float(nx) * cw))))
-        y = max(1, min(ch - 2, int(round(float(ny) * ch))))
-        sx, sy = win32gui.ClientToScreen(self.target_hwnd, (x, y))
-        _force_foreground_window(self.target_hwnd)
-        time.sleep(0.1)
-        _send_mouse_move_to(int(sx), int(sy))
-        time.sleep(0.06)
-        _send_mouse_button("left", True)
-        time.sleep(0.07)
-        _send_mouse_button("left", False)
-        time.sleep(0.2)
-
-    def _fl_wait_enter_keyword(
-        self, keyword: str, timeout: float = 12.0
-    ) -> bool:
-        try:
-            from map_labels import compact_text
-
-            wanted_parts = [
-                compact_text(part)
-                for part in re.split(r"[,，;；\s]+", keyword or "")
-                if compact_text(part)
-            ]
-        except Exception:
-            wanted_parts = [keyword.strip()] if keyword.strip() else []
-        if not wanted_parts:
-            return True
-        self._fl_set_state(f"等待识别“{keyword}”…", "warn")
-        start = time.monotonic()
-        last_text = ""
-        while True:
-            if not self._fatigue_loop_running:
-                return False
-            if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-                return False
-            elapsed = time.monotonic() - start
-            if elapsed >= timeout:
-                self._set_status(
-                    f"没有识别到“{keyword}”（OCR：{last_text or '空'}）", "error"
-                )
-                return False
-            cap, _err = capture_client_bgra(self.target_hwnd)
-            if cap is not None:
-                w, h, data = cap
-                try:
-                    items = ocr_screen_items(data, w, h)
-                except Exception:
-                    items = []
-                texts = [str(item.get("text", "")) for item in items]
-                blob = "".join(compact_text(t) for t in texts)
-                for part in wanted_parts:
-                    if part in blob:
-                        self._set_status(
-                            f"识别到“{keyword}”，开始回放 BOSS 录制。", "ok"
-                        )
-                        return True
-                if texts:
-                    last_text = " ".join(texts)[:80]
-            self._fl_set_state(
-                f"等待“{keyword}”…（OCR：{last_text or '空'}）", "warn"
-            )
-            time.sleep(0.8)
-            # 轮询期间保持界面可响应，方便随时点“停止疲劳循环”。
-            QApplication.processEvents()
-        return False
-
-    def _fl_click_boss_point_and_wait(self) -> None:
-        if not self._fatigue_loop_running:
-            return
-        self._fatigue_loop_state = "boss_point"
-        boss_map = str(self._fatigue_loop_cfg.get("boss_map", "")).strip()
-        boss_target = str(self._fatigue_loop_cfg.get("boss_target", "")).strip()
-        keyword = str(
-            self._fatigue_loop_cfg.get("enter_keyword", "进入副本")
-        ).strip() or "进入副本"
-        try:
-            from map_labels import _valid_map_xy, _valid_rect, load_maps
-        except Exception as exc:
-            self._stop_fatigue_loop(f"加载地图标注失败：{exc}", "error")
-            return
-        profiles = load_maps()
-        profile = next(
-            (
-                item
-                for item in profiles
-                if str(item.get("name", "")) == boss_map
-            ),
-            None,
-        )
-        if profile is None:
-            profile = next(
-                (
-                    item
-                    for item in profiles
-                    if boss_map in str(item.get("name", ""))
-                    or str(item.get("name", "")) in boss_map
-                ),
-                None,
-            )
-        if profile is None:
-            self._stop_fatigue_loop(f"找不到 BOSS 地图「{boss_map}」。", "error")
-            return
-        target = next(
-            (
-                item
-                for item in profile.get("targets", [])
-                if isinstance(item, dict)
-                and str(item.get("name", "")) == boss_target
-            ),
-            None,
-        )
-        if target is None:
-            self._stop_fatigue_loop(
-                f"BOSS 地图「{boss_map}」里没有「{boss_target}」。", "error"
-            )
-            return
-
-        if not self._fl_map_open:
-            self._fl_tap_key(self._macro_cfg.get("map_key", "m"))
-            time.sleep(0.9)
-            self._fl_map_open = True
-        rect = _valid_rect(profile.get("map_rect_norm"))
-        mx, my = _valid_map_xy(target)
-        if rect is not None and mx is not None and my is not None:
-            x0, y0, x1, y1 = rect
-            nx = x0 + mx * (x1 - x0)
-            ny = y0 + my * (y1 - y0)
-        else:
-            nx = float(target.get("nx", 0.5))
-            ny = float(target.get("ny", 0.5))
-        nx = max(0.0, min(1.0, float(nx)))
-        ny = max(0.0, min(1.0, float(ny)))
-        self._fl_set_state(f"点击 BOSS 点「{boss_target}」…", "warn")
-        self._fl_click_norm(nx, ny)
-        time.sleep(0.8)
-        # 点完 BOSS 点后地图通常会关闭/弹进入确认框，下一次重新打开地图。
-        self._fl_map_open = False
-        if not self._fl_wait_enter_keyword(keyword, timeout=12.0):
-            self._stop_fatigue_loop(
-                f"点击 BOSS 点后没有识别到“{keyword}”，已停止。", "error"
-            )
-            return
-        self._fl_play_record()
-
-    def _fl_play_record(self) -> None:
-        if not self._fatigue_loop_running or self._fatigue_loop_player is not None:
-            return
-        record_name = str(self._fatigue_loop_cfg.get("record", "")).strip()
-        record = next(
-            (
-                item
-                for item in self._dungeon_records
-                if str(item.get("name", "")) == record_name
-            ),
-            None,
-        )
-        if record is None or not record.get("events"):
-            self._stop_fatigue_loop(
-                f"BOSS 录制「{record_name}」不存在或为空。", "error"
-            )
-            return
-        meta = record.get("meta")
-        player = MacroPlayer(
-            self.target_hwnd,
-            "疲劳循环BOSS",
-            list(record.get("events", [])),
-            meta=meta if isinstance(meta, dict) else None,
-            speed=1.0,
-            lock_user_input=bool(self.chk_lock_input.isChecked()),
-            background=bool(self.chk_background_replay.isChecked()),
-            parent=self,
-        )
-        player.done.connect(self._on_fl_player_done)
-        player.error.connect(self._on_fl_player_error)
-        self._fatigue_loop_player = player
-        self.lbl_fl_state.setText(f"回放 BOSS 录制「{record_name}」…")
-        player.start()
-
-    def _on_fl_player_done(self, stage: str) -> None:
-        player = self.sender()
-        if isinstance(player, MacroPlayer):
-            player.wait(500)
-            player.deleteLater()
-        if player is not self._fatigue_loop_player:
-            return
-        self._fatigue_loop_player = None
-        if not self._fatigue_loop_running:
-            return
-        self._fatigue_loop_state = "farming"
-        interval = max(
-            5.0, float(self._fatigue_loop_cfg.get("interval", 30))
-        )
-        self._fl_set_state("BOSS 录制完成，恢复打怪…", "ok")
-        self._fl_start_farming()
-        self._fl_schedule_check(interval)
-
-    def _on_fl_player_error(self, stage: str, message: str) -> None:
-        player = self.sender()
-        if isinstance(player, MacroPlayer):
-            player.wait(500)
-            player.deleteLater()
-        if player is not self._fatigue_loop_player:
-            return
-        self._fatigue_loop_player = None
-        if not self._fatigue_loop_running:
-            return
-        self._stop_fatigue_loop(f"BOSS 录制回放失败：{message}", "error")
-        try:
-            self._popup.show_message("BOSS 录制回放失败", message, seconds=15)
-        except Exception:
-            pass
-
-    def _stop_fatigue_loop(
-        self, message: str = "疲劳循环已停止。", level: str = "warn"
-    ) -> None:
-        was_running = self._fatigue_loop_running
-        self._fatigue_loop_running = False
-        self._fatigue_loop_state = "idle"
-        if self._fatigue_loop_timer is not None:
-            self._fatigue_loop_timer.stop()
-        monitor = self._fatigue_loop_monitor
-        self._fatigue_loop_monitor = None
-        if monitor is not None:
-            monitor.stop()
-            if not monitor.wait(3000):
-                monitor.terminate()
-                monitor.wait(500)
-            monitor.deleteLater()
-        self._fl_stop_farming()
-        runner = self._fatigue_loop_path_runner
-        self._fatigue_loop_path_runner = None
-        if runner is not None:
-            runner.stop()
-            if not runner.wait(4000):
-                runner.terminate()
-                runner.wait(500)
-            runner.deleteLater()
-        player = self._fatigue_loop_player
-        self._fatigue_loop_player = None
-        if player is not None:
-            player.stop()
-            if not player.wait(3000):
-                player.terminate()
-                player.wait(500)
-            player.deleteLater()
-        self._fl_last_fatigue_text = ""
-        if was_running:
-            self.lbl_fl_state.setText("已停止")
-            self._set_status(message, level)
-        self._update_fatigue_loop_controls()
-        self._update_macro_button_states()
-        self._update_toggle_action()
-
-    def _open_map_learner(self) -> None:
-        if self._macro_busy():
-            self._notify("当前正忙", "请先停止地图测试/路径执行。")
-            return
-        if self._worker is not None or self._test_monitor is not None:
-            self._notify("当前正忙", "请先停止基础挂机/疲劳测试。")
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-        try:
-            from map_labels import MapLabelDialog
-        except Exception as exc:
-            self._notify("地图标注不可用", f"加载失败：{exc}")
-            return
-        dialog = MapLabelDialog(self.target_hwnd, parent=self)
-        dialog.exec()
-        self._refresh_map_profiles()
-        if getattr(dialog, "saved", False):
-            self._set_status("地图标注已保存，可以测试前往目标。", "ok")
-
-    def _toggle_map_test(self) -> None:
-        if self._map_runner is not None:
-            self._stop_map_runner()
-            return
-        self._start_map_test()
-
-    def _start_map_test(self) -> None:
-        if self._quitting or self._map_runner is not None:
-            return
-        if self._macro_busy() or self._worker is not None:
-            self._notify("当前正忙", "请先停止其它自动化。")
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-        profile = self.combo_map_profile.currentData()
-        target = self.combo_map_target.currentData()
-        if not isinstance(profile, dict) or not isinstance(target, dict):
-            self._notify("没有地图目标", "请先学习地图标注，并选择目标。")
-            return
-        try:
-            from map_labels import MapTravelRunner
-        except Exception as exc:
-            self._notify("地图寻路不可用", f"加载失败：{exc}")
-            return
-        runner = MapTravelRunner(
-            self.target_hwnd,
-            profile,
-            target,
-            map_key=self._macro_cfg.get("map_key", "m"),
-            close_key=self._macro_cfg.get("close_map_key", "esc"),
-            travel_wait=float(self.spin_map_travel_wait.value()),
-            parent=self,
-        )
-        runner.status.connect(self._on_map_status)
-        runner.done.connect(self._on_map_done)
-        runner.failed.connect(self._on_map_failed)
-        self._map_runner = runner
-        self.lbl_map_state.setText("地图测试：准备中…")
-        self._set_status("地图寻路测试开始：按地图键 → OCR 找标注 → 点击 → 关闭地图。", "warn")
-        self._update_macro_button_states()
-        self._update_map_controls_state()
-        runner.start()
-
-    def _on_map_status(self, text: str, level: str) -> None:
-        if hasattr(self, "lbl_map_state"):
-            self.lbl_map_state.setText(text)
-        self._set_status(text, level)
-
-    def _on_map_done(self) -> None:
-        runner = self.sender()
-        if runner is self._map_runner:
-            self._map_runner = None
-            if isinstance(runner, QThread):
-                runner.wait(500)
-                runner.deleteLater()
-        self.lbl_map_state.setText("地图测试完成，已等待自动寻路")
-        self._set_status("地图测试完成。", "ok")
-        self._update_macro_button_states()
-        self._update_map_controls_state()
-
-    def _on_map_failed(self, message: str) -> None:
-        runner = self.sender()
-        if runner is self._map_runner:
-            self._map_runner = None
-            if isinstance(runner, QThread):
-                runner.wait(500)
-                runner.deleteLater()
-        stopped = str(message).strip() == "已停止。"
-        self.lbl_map_state.setText("已停止" if stopped else "地图测试失败")
-        self._set_status(
-            "地图测试已停止。" if stopped else f"地图测试失败：{message}",
-            "warn" if stopped else "error",
-        )
-        if not stopped:
-            try:
-                self._popup.show_message("地图寻路失败", message, seconds=15)
-            except Exception:
-                pass
-        self._update_macro_button_states()
-        self._update_map_controls_state()
-
-    def _stop_map_runner(self) -> None:
-        runner = self._map_runner
-        self._map_runner = None
-        if runner is not None:
-            runner.stop()
-            if not runner.wait(4000):
-                runner.terminate()
-                runner.wait(500)
-            runner.deleteLater()
-        self.lbl_map_state.setText("已停止")
-        self._set_status("地图测试已停止。", "warn")
-        self._update_macro_button_states()
-        self._update_map_controls_state()
-
-    def _open_route_editor(self) -> None:
-        if self._quitting:
-            return
-        if self._macro_busy():
-            self._notify("当前正忙", "请先停止地图测试/路径执行。")
-            return
-        if self._worker is not None or self._test_monitor is not None:
-            self._notify("当前正忙", "请先停止基础挂机/疲劳测试。")
-            return
-        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
-            self._notify("尚未绑定窗口", "请先绑定 CreatureCurios 窗口。")
-            return
-        if self._route_editor is not None:
-            self._route_editor.show()
-            self._route_editor.raise_()
-            self._route_editor.activateWindow()
-            return
-        try:
-            from route_editor import RouteEditor
-        except Exception as exc:
-            self._notify("路线编辑器不可用", f"加载失败：{exc}")
-            return
-        editor = RouteEditor(game_hwnd=self.target_hwnd, parent=self)
-        editor.destroyed.connect(self._on_route_editor_destroyed)
-        self._route_editor = editor
-        editor.show()
-        editor.raise_()
-        editor.activateWindow()
-        self._update_macro_button_states()
-
-    def _on_route_editor_destroyed(self, *_args) -> None:
-        self._route_editor = None
-        self._update_macro_button_states()
-
     def _select_fatigue_region(self) -> None:
         if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
             self._notify(
@@ -7170,7 +7885,6 @@ class MainWindow(QMainWindow):
         )
         saved = save_fatigue_roi_norm(self._fatigue_roi_norm)
         self._refresh_fatigue_roi_label()
-        self._update_fatigue_loop_controls()
         self.lbl_fatigue.setText(
             "上次: 区域已保存" if saved else "上次: 区域已生效（本次运行）"
         )
@@ -7208,6 +7922,236 @@ class MainWindow(QMainWindow):
             self.lbl_fatigue.setText("上次: --")
             self.lbl_fatigue.setStyleSheet("color: #8f959e; padding: 0;")
 
+    def _on_keyboard_only_toggled(self, checked: bool) -> None:
+        if getattr(self, "_boss_loading", False):
+            return
+        if checked:
+            if not self.chk_background_mode.isChecked():
+                self.chk_background_mode.blockSignals(True)
+                self.chk_background_mode.setChecked(True)
+                self.chk_background_mode.blockSignals(False)
+            if self.chk_relative_mouse.isChecked():
+                self.chk_relative_mouse.blockSignals(True)
+                self.chk_relative_mouse.setChecked(False)
+                self.chk_relative_mouse.blockSignals(False)
+            self._settings.setValue("background_mode", True)
+            self._settings.setValue("relative_mouse", False)
+            self._settings.setValue("keyboard_only", True)
+            self._set_status(
+                "静止鼠标/仅键盘：不移动鼠标、不抢前台，只发送键盘", "ok"
+            )
+        else:
+            self._settings.setValue("keyboard_only", False)
+            self._set_status("静止鼠标/仅键盘已关闭", "normal")
+
+    def _on_background_mode_toggled(self, checked: bool) -> None:
+        if getattr(self, "_boss_loading", False):
+            return
+        if not checked and self.chk_keyboard_only.isChecked():
+            self.chk_keyboard_only.blockSignals(True)
+            self.chk_keyboard_only.setChecked(False)
+            self.chk_keyboard_only.blockSignals(False)
+            self._settings.setValue("keyboard_only", False)
+        if checked and self.chk_relative_mouse.isChecked():
+            self.chk_relative_mouse.blockSignals(True)
+            self.chk_relative_mouse.setChecked(False)
+            self.chk_relative_mouse.blockSignals(False)
+            self._settings.setValue("relative_mouse", False)
+        try:
+            self._settings.setValue("background_mode", bool(checked))
+        except Exception:
+            pass
+        if self._fatigue_monitor is not None:
+            self._stop_fatigue_monitor()
+            self._start_fatigue_monitor()
+        self._set_status(
+            "后台模式：不抢鼠标键盘" if checked else "前台模式：回放会接管鼠标键盘",
+            "ok" if checked else "warn",
+        )
+
+    def _on_relative_mouse_toggled(self, checked: bool) -> None:
+        if getattr(self, "_boss_loading", False):
+            return
+        if checked and self.chk_keyboard_only.isChecked():
+            self.chk_keyboard_only.blockSignals(True)
+            self.chk_keyboard_only.setChecked(False)
+            self.chk_keyboard_only.blockSignals(False)
+            self._settings.setValue("keyboard_only", False)
+        if checked and self.chk_background_mode.isChecked():
+            self.chk_background_mode.blockSignals(True)
+            self.chk_background_mode.setChecked(False)
+            self.chk_background_mode.blockSignals(False)
+            self._on_background_mode_toggled(False)
+        self._settings.setValue("relative_mouse", bool(checked))
+        self._set_status(
+            "前台相对鼠标已开启：会移动真实鼠标并占用前台"
+            if checked
+            else "相对鼠标回放已关闭",
+            "ok" if checked else "normal",
+        )
+
+    def _on_multi_keyboard_only_toggled(self, checked: bool) -> None:
+        if getattr(self, "_multi_loading", False):
+            return
+        if checked:
+            if not self.chk_multi_background.isChecked():
+                self.chk_multi_background.blockSignals(True)
+                self.chk_multi_background.setChecked(True)
+                self.chk_multi_background.blockSignals(False)
+            if self.chk_multi_relative_mouse.isChecked():
+                self.chk_multi_relative_mouse.blockSignals(True)
+                self.chk_multi_relative_mouse.setChecked(False)
+                self.chk_multi_relative_mouse.blockSignals(False)
+            self._settings.setValue("multi/background", True)
+            self._settings.setValue("multi/relative_mouse", False)
+            self._settings.setValue("multi/keyboard_only", True)
+            self._set_status(
+                "多开静止鼠标/仅键盘：不移动鼠标、不抢前台，只发送键盘",
+                "ok",
+            )
+        else:
+            self._settings.setValue("multi/keyboard_only", False)
+            self._set_status("多开静止鼠标/仅键盘已关闭", "normal")
+        self._update_multi_controls()
+
+    def _on_multi_background_toggled(self, checked: bool) -> None:
+        if getattr(self, "_multi_loading", False):
+            return
+        if not checked and self.chk_multi_keyboard_only.isChecked():
+            self.chk_multi_keyboard_only.blockSignals(True)
+            self.chk_multi_keyboard_only.setChecked(False)
+            self.chk_multi_keyboard_only.blockSignals(False)
+            self._settings.setValue("multi/keyboard_only", False)
+        if checked and self.chk_multi_relative_mouse.isChecked():
+            self.chk_multi_relative_mouse.blockSignals(True)
+            self.chk_multi_relative_mouse.setChecked(False)
+            self.chk_multi_relative_mouse.blockSignals(False)
+            self._settings.setValue("multi/relative_mouse", False)
+        self._settings.setValue("multi/background", bool(checked))
+        self._set_status(
+            "多开后台回放已开启，下次开始/试放生效"
+            if checked
+            else "多开后台回放已关闭，下次开始/试放生效",
+            "ok" if checked else "warn",
+        )
+        self._update_multi_controls()
+
+    def _on_multi_relative_mouse_toggled(self, checked: bool) -> None:
+        if getattr(self, "_multi_loading", False):
+            return
+        if checked and self.chk_multi_keyboard_only.isChecked():
+            self.chk_multi_keyboard_only.blockSignals(True)
+            self.chk_multi_keyboard_only.setChecked(False)
+            self.chk_multi_keyboard_only.blockSignals(False)
+            self._settings.setValue("multi/keyboard_only", False)
+        if checked and self.chk_multi_background.isChecked():
+            self.chk_multi_background.blockSignals(True)
+            self.chk_multi_background.setChecked(False)
+            self.chk_multi_background.blockSignals(False)
+            self._on_multi_background_toggled(False)
+        self._settings.setValue("multi/relative_mouse", bool(checked))
+        self._set_status(
+            "多开前台相对鼠标已开启：会移动真实鼠标并占用前台"
+            if checked
+            else "多开相对鼠标回放已关闭",
+            "ok" if checked else "normal",
+        )
+
+    def _on_single_hp_potion_toggled(self, checked: bool) -> None:
+        if getattr(self, "_boss_loading", False):
+            return
+        self._save_boss_settings()
+        if checked and self._hp_roi_norm is None:
+            self._set_status(
+                "血量自动吃药已开启，但还没框选血量区域", "warn"
+            )
+
+    def _refresh_single_hp_roi_label(self) -> None:
+        if not hasattr(self, "lbl_single_hp_roi"):
+            return
+        if self._hp_roi_norm is None:
+            self.lbl_single_hp_roi.setText("未设置")
+            self.lbl_single_hp_roi.setStyleSheet(
+                "color: #ffb454; padding: 0;"
+            )
+        else:
+            self.lbl_single_hp_roi.setText("已设置")
+            self.lbl_single_hp_roi.setStyleSheet(
+                "color: #3ddc84; padding: 0;"
+            )
+
+    def _start_single_hp_monitor(self) -> None:
+        if not self.chk_single_hp_potion.isChecked():
+            return
+        if self._single_hp_monitor is not None:
+            return
+        if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
+            return
+        if self._hp_roi_norm is None:
+            return
+        monitor = HpMonitor(
+            self.target_hwnd,
+            self._hp_roi_norm,
+            1.0,
+            parent=self,
+        )
+        monitor.result.connect(self._on_single_hp_result)
+        self._single_hp_monitor = monitor
+        monitor.start()
+
+    def _stop_single_hp_monitor(self) -> None:
+        monitor = self._single_hp_monitor
+        self._single_hp_monitor = None
+        if monitor is not None:
+            try:
+                monitor.stop()
+                if not monitor.wait(3000):
+                    monitor.terminate()
+                    monitor.wait(500)
+            except Exception:
+                pass
+            monitor.deleteLater()
+
+    def _on_single_hp_result(self, current, maximum, message: str) -> None:
+        if not hasattr(self, "lbl_single_hp_value"):
+            return
+        if current is None:
+            self.lbl_single_hp_value.setText(
+                f"血量: {message or '--'}"
+            )
+            self.lbl_single_hp_value.setStyleSheet(
+                "color: #8f959e; padding: 0;"
+            )
+            return
+        try:
+            cur = int(current)
+        except (TypeError, ValueError):
+            return
+        text = (
+            f"血量: {cur}/{int(maximum)}"
+            if maximum is not None
+            else f"血量: {cur}"
+        )
+        threshold = int(self.spin_single_hp_potion_threshold.value())
+        if cur < threshold and self.chk_single_hp_potion.isChecked():
+            text += (
+                f"（自动吃药中：每 {int(self.spin_potion.value())} 秒 Q+W）"
+            )
+        self.lbl_single_hp_value.setText(text)
+        if cur < threshold:
+            self.lbl_single_hp_value.setStyleSheet(
+                "color: #ff6b6b; padding: 0;"
+            )
+        else:
+            self.lbl_single_hp_value.setStyleSheet(
+                "color: #3ddc84; padding: 0;"
+            )
+        if cur < threshold and self._worker is not None:
+            try:
+                self._worker.trigger_potion()
+            except Exception:
+                pass
+
     def _start_fatigue_monitor(self) -> None:
         if self._quitting or not self.chk_fatigue.isChecked():
             return
@@ -7227,6 +8171,7 @@ class MainWindow(QMainWindow):
             one_shot=False,
             alert_below=-float(self._fatigue_threshold),
             alert_above=float(self._fatigue_threshold),
+            background=self.chk_background_mode.isChecked(),
             parent=self,
         )
         monitor.result.connect(self._on_fatigue_result)
@@ -7275,8 +8220,36 @@ class MainWindow(QMainWindow):
         self.lbl_fatigue.setStyleSheet(f"color: {color}; padding: 0;")
         self.lbl_fatigue.setToolTip(str(message))
 
+        if (
+            self.sender() is self._fatigue_monitor
+            and current < -threshold
+            and self.chk_boss_fatigue.isChecked()
+            and not self._boss_busy()
+            and self._boss_config_ready(silent=True)
+        ):
+            QTimer.singleShot(0, self._on_fatigue_boss_trigger)
+
+    def _on_fatigue_boss_trigger(self) -> None:
+        if self._quitting or self._boss_busy():
+            return
+        if not self.chk_boss_fatigue.isChecked():
+            return
+        if not self._boss_config_ready(silent=True):
+            self._set_boss_state(
+                "疲劳已到阈值，但 BOSS 方案未配置完整", "warn"
+            )
+            return
+        self._boss_start(origin="fatigue", repeat_override=1)
+
     def _on_fatigue_alert(self, message: str) -> None:
         if self._quitting or getattr(self, "_popup", None) is None:
+            return
+        if (
+            "低于" in str(message)
+            and self.chk_boss_fatigue.isChecked()
+            and self._boss_config_ready(silent=True)
+        ):
+            self._set_boss_state("疲劳已到阈值，准备自动打BOSS…", "warn")
             return
         self._popup.show_message("疲劳值提醒", message, seconds=20)
         self.lbl_fatigue.setStyleSheet("color: #ff6b6b; padding: 0;")
@@ -7313,6 +8286,7 @@ class MainWindow(QMainWindow):
             one_shot=True,
             alert_below=-float(self._fatigue_threshold),
             alert_above=float(self._fatigue_threshold),
+            background=self.chk_background_mode.isChecked(),
             parent=self,
         )
         monitor.result.connect(self._on_fatigue_result)
@@ -7372,16 +8346,27 @@ class MainWindow(QMainWindow):
         self._update_timer_label()
 
     def _on_ui_tick(self) -> None:
-        recorder = self._dungeon_recorder
-        if recorder is not None:
+        if self._boss_recorder is not None:
             try:
-                self.lbl_dungeon_state.setText(
-                    f"录制中… {recorder.event_count()} 个动作 / "
-                    f"{recorder.duration():.1f} 秒"
+                self._set_boss_state(
+                    f"录制中… {self._boss_recorder.event_count()} 个动作 / "
+                    f"{self._boss_recorder.duration():.1f} 秒",
+                    "warn",
                 )
             except Exception:
                 pass
-
+        if (
+            self._heal_recorder is not None
+            and self._heal_record_index is not None
+        ):
+            try:
+                self._set_multi_slot_text(
+                    self._heal_record_index,
+                    f"回血录制中… {self._heal_recorder.event_count()} 个动作 / "
+                    f"{self._heal_recorder.duration():.1f} 秒",
+                )
+            except Exception:
+                pass
         if self._quitting or not self.chk_timer.isChecked():
             return
 
@@ -7437,105 +8422,51 @@ class MainWindow(QMainWindow):
             seconds=10,
         )
 
-    # =====================================================================
-    # BOOS 挂机：地图按键 / 路线编辑 / 地图寻路 / 路径执行
-    # =====================================================================
-
-    def _single_window_busy(self) -> bool:
-        return bool(
-            self._worker is not None
-            or self._test_monitor is not None
-            or self._route_editor is not None
-            or self._map_runner is not None
-            or self._path_runner is not None
-            or self._dungeon_recorder is not None
-            or self._dungeon_recording_pending
-            or self._dungeon_running
-            or self._dungeon_player is not None
-            or self._combo_running
-            or self._combo_path_runner is not None
-            or self._combo_player is not None
-            or self._fatigue_loop_running
-            or self._fatigue_loop_worker is not None
-            or self._fatigue_loop_monitor is not None
-            or self._fatigue_loop_player is not None
-        )
-
-    def _any_multi_running(self) -> bool:
-        return any(
-            runner is not None and getattr(runner, "is_running", False)
-            for runner in self._multi_runners
-        )
-
-    def _macro_busy(self) -> bool:
-        return self._single_window_busy() or self._any_multi_running()
-
-    def _save_macro_settings(self) -> None:
-        if not hasattr(self, "edit_map_key"):
-            return
-        map_key = self.edit_map_key.text().strip().lower() or "m"
-        close_key = self.edit_close_key.text().strip().lower() or "esc"
-        mount_key = self.edit_mount_key.text().strip().lower()
-        self.edit_map_key.setText(map_key)
-        self.edit_close_key.setText(close_key)
-        self.edit_mount_key.setText(mount_key)
-        self._macro_cfg["map_key"] = map_key
-        self._macro_cfg["close_map_key"] = close_key
-        self._macro_cfg["mount_key"] = mount_key
-        save_macro_config(self._macro_cfg)
-
-    def _update_macro_button_states(self) -> None:
-        """自动化运行状态变化时，刷新剩余控件的可用性。"""
-        if hasattr(self, "btn_route_editor"):
-            self.btn_route_editor.setEnabled(not self._macro_busy())
-        self._update_map_controls_state()
-        self._update_path_controls_state()
-        self._update_dungeon_controls()
-        self._update_combo_controls()
-        self._update_fatigue_loop_controls()
-        self._update_multi_controls()
-        self._update_bind_button_state()
-
+    # -- 控件状态 ---------------------------------------------------------
     def _set_running_controls(self, running: bool) -> None:
-        self.combo_windows.setEnabled(not running)
-        self.btn_refresh.setEnabled(not running)
+        blocked = bool(running or self._boss_busy() or self._multi_busy())
+        self.combo_windows.setEnabled(not blocked)
+        self.btn_refresh.setEnabled(not blocked)
+        for widget in (
+            getattr(self, "chk_single_hp_potion", None),
+            getattr(self, "spin_single_hp_potion_threshold", None),
+            getattr(self, "btn_single_hp_roi", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(not running)
         self._update_bind_button_state()
+        self._update_boss_controls()
+        self._update_multi_controls()
         self._update_toggle_action()
 
     def _update_bind_button_state(self) -> None:
-        running = self._worker is not None or self._macro_busy()
+        running = (
+            self._worker is not None
+            or self._boss_busy()
+            or self._multi_busy()
+        )
         has_selection = self.combo_windows.currentData() is not None
         self.btn_bind.setEnabled((not running) and has_selection)
-        self._update_map_controls_state()
-        self._update_path_controls_state()
-        self._update_dungeon_controls()
-        self._update_combo_controls()
-        self._update_fatigue_loop_controls()
+        self.combo_windows.setEnabled(not running)
+        self.btn_refresh.setEnabled(not running)
 
     def _update_toggle_action(self) -> None:
         if self._act_toggle is None:
             return
-
-        if self._stopping:
+        if self._boss_recorder is not None or self._boss_record_pending:
+            self._act_toggle.setText("停止录制")
+            self._act_toggle.setEnabled(True)
+        elif self._heal_recorder is not None or self._heal_record_pending:
+            self._act_toggle.setText("停止录制回血")
+            self._act_toggle.setEnabled(True)
+        elif self._any_multi_running():
+            self._act_toggle.setText("停止多开")
+            self._act_toggle.setEnabled(True)
+        elif self._stopping:
             self._act_toggle.setText("正在停止…")
             self._act_toggle.setEnabled(False)
-        elif self._fatigue_loop_running:
-            self._act_toggle.setText("停止疲劳循环")
-            self._act_toggle.setEnabled(True)
-        elif self._combo_running:
-            self._act_toggle.setText("停止组合挂机")
-            self._act_toggle.setEnabled(True)
-        elif self._dungeon_recorder is not None or self._dungeon_recording_pending:
-            self._act_toggle.setText("停止录制副本")
-            self._act_toggle.setEnabled(True)
-        elif self._dungeon_running:
-            self._act_toggle.setText("停止副本")
-            self._act_toggle.setEnabled(True)
-        elif self._map_runner is not None:
-            self._act_toggle.setText("停止地图测试")
-            self._act_toggle.setEnabled(True)
-        elif self._path_runner is not None:
-            self._act_toggle.setText("停止路径执行")
+        elif self._boss_busy():
+            self._act_toggle.setText("停止BOSS")
             self._act_toggle.setEnabled(True)
         elif self._worker is not None:
             self._act_toggle.setText("停止发送")
@@ -7675,6 +8606,8 @@ class MainWindow(QMainWindow):
         if self._cleaned:
             return
         self._cleaned = True
+        global _FOREGROUND_BRIDGE
+        _FOREGROUND_BRIDGE = None
 
         if self._hotkey_handle is not None and keyboard is not None:
             try:
@@ -7690,123 +8623,11 @@ class MainWindow(QMainWindow):
                 pass
             self._local_shortcut = None
 
-        self._dungeon_recording_pending = False
-        self._dungeon_running = False
-        if self._dungeon_pending_timer is not None:
-            try:
-                self._dungeon_pending_timer.stop()
-            except Exception:
-                pass
-            self._dungeon_pending_timer = None
-        recorder = self._dungeon_recorder
-        self._dungeon_recorder = None
-        if recorder is not None:
-            try:
-                recorder.stop()
-            except Exception:
-                pass
-        player = self._dungeon_player
-        self._dungeon_player = None
-        if player is not None:
-            try:
-                player.stop()
-                if not player.wait(3000):
-                    player.terminate()
-                    player.wait(500)
-            except Exception:
-                pass
-
-        self._combo_running = False
-        if self._combo_pending_timer is not None:
-            try:
-                self._combo_pending_timer.stop()
-            except Exception:
-                pass
-            self._combo_pending_timer = None
-        runner = self._combo_path_runner
-        self._combo_path_runner = None
-        if runner is not None:
-            try:
-                runner.stop()
-                if not runner.wait(4000):
-                    runner.terminate()
-                    runner.wait(500)
-            except Exception:
-                pass
-        player = self._combo_player
-        self._combo_player = None
-        if player is not None:
-            try:
-                player.stop()
-                if not player.wait(3000):
-                    player.terminate()
-                    player.wait(500)
-            except Exception:
-                pass
-
-        self._fatigue_loop_running = False
-        self._fatigue_loop_state = "idle"
-        if self._fatigue_loop_timer is not None:
-            try:
-                self._fatigue_loop_timer.stop()
-            except Exception:
-                pass
-            self._fatigue_loop_timer = None
-        monitor = self._fatigue_loop_monitor
-        self._fatigue_loop_monitor = None
-        if monitor is not None:
-            try:
-                monitor.stop()
-                if not monitor.wait(3000):
-                    monitor.terminate()
-                    monitor.wait(500)
-            except Exception:
-                pass
-        worker = self._fatigue_loop_worker
-        self._fatigue_loop_worker = None
-        if worker is not None:
-            try:
-                worker.stop()
-                if not worker.wait(2500):
-                    worker.terminate()
-                    worker.wait(500)
-            except Exception:
-                pass
-        runner = self._fatigue_loop_path_runner
-        self._fatigue_loop_path_runner = None
-        if runner is not None:
-            try:
-                runner.stop()
-                if not runner.wait(4000):
-                    runner.terminate()
-                    runner.wait(500)
-            except Exception:
-                pass
-        player = self._fatigue_loop_player
-        self._fatigue_loop_player = None
-        if player is not None:
-            try:
-                player.stop()
-                if not player.wait(3000):
-                    player.terminate()
-                    player.wait(500)
-            except Exception:
-                pass
-
-        for index in range(4):
-            runner = self._multi_runners[index]
-            self._multi_runners[index] = None
-            if runner is not None:
-                try:
-                    runner.stop("已停止", "warn")
-                except Exception:
-                    pass
-                try:
-                    runner.deleteLater()
-                except Exception:
-                    pass
-
-        for monitor_attr in ("_fatigue_monitor", "_test_monitor"):
+        for monitor_attr in (
+            "_fatigue_monitor",
+            "_test_monitor",
+            "_single_hp_monitor",
+        ):
             monitor = getattr(self, monitor_attr, None)
             setattr(self, monitor_attr, None)
             if monitor is not None:
@@ -7824,6 +8645,52 @@ class MainWindow(QMainWindow):
                 worker.terminate()
                 worker.wait(500)
 
+        self._boss_running = False
+        self._boss_preview = False
+        self._boss_gap_timer.stop()
+        self._boss_fight_timer.stop()
+        self._boss_trigger_timer.stop()
+        self._boss_player_stop()
+        self._stop_boss_watcher()
+        self._stop_boss_fighter()
+        self._stop_boss_looter()
+        recorder = self._boss_recorder
+        self._boss_recorder = None
+        if recorder is not None:
+            try:
+                recorder.stop()
+            except Exception:
+                pass
+
+        heal_recorder = self._heal_recorder
+        self._heal_recorder = None
+        self._heal_record_pending = False
+        self._heal_record_index = None
+        if heal_recorder is not None:
+            try:
+                heal_recorder.stop()
+            except Exception:
+                pass
+        self._stop_multi_heal_test()
+        self._stop_name_readers()
+        for index in range(4):
+            runner = self._multi_runners[index]
+            self._multi_runners[index] = None
+            if runner is not None:
+                for sig_name in ("status", "hp_changed", "finished"):
+                    try:
+                        getattr(runner, sig_name).disconnect()
+                    except Exception:
+                        pass
+                try:
+                    runner.stop("已停止", "warn")
+                except Exception:
+                    pass
+                try:
+                    runner.deleteLater()
+                except Exception:
+                    pass
+
         if getattr(self, "_popup", None) is not None:
             self._popup.hide()
             self._popup.close()
@@ -7840,6 +8707,8 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        self._save_boss_settings()
+        self._save_multi_settings()
         if self._quitting:
             event.accept()
             return
@@ -7893,20 +8762,11 @@ def _run_ocr_selftest(image_path: str, out_path: str) -> int:
         current, maximum, msg = ocr_fatigue_from_bgra(
             bgra.tobytes(), w, h, roi
         )
-        result = "mouse_ready={}{}current={}{}maximum={}{}message={}{}".format(
-            mouse is not None,
-            nl,
-            current,
-            nl,
-            maximum,
-            nl,
-            msg,
-            nl,
+        result = "current={}{}maximum={}{}message={}{}".format(
+            current, nl, maximum, nl, msg, nl
         )
     except Exception as exc:
-        result = "mouse_ready={}{}ERROR {}: {}{}".format(
-            mouse is not None, nl, type(exc).__name__, exc, nl
-        )
+        result = "ERROR {}: {}{}".format(type(exc).__name__, exc, nl)
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(result)
@@ -7933,6 +8793,12 @@ def main() -> int:
             except Exception:
                 pass
             return 1
+
+    # 提高定时器精度，减少回放事件的时间抖动
+    try:
+        ctypes.WinDLL("winmm").timeBeginPeriod(1)
+    except Exception:
+        pass
 
     # 高 DPI（Qt6 默认已开启，这里主要保证 Windows 原生窗口坐标一致）
     try:

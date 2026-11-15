@@ -4,9 +4,10 @@
 
 每个槽位独立运行：
     打怪 → 定时检测疲劳 → 疲劳 < -阈值 → 回放 BOSS 录制 → 播完恢复打怪
+    + 血量保护：低血回血 / 低血停平A
 
 不直接依赖主程序模块，运行时从 sys.modules 取主程序里的
-KeySender / FatigueMonitor / MacroPlayer，避免循环导入。
+KeySender / FatigueMonitor / HpMonitor / MacroPlayer，避免循环导入。
 """
 
 from __future__ import annotations
@@ -89,6 +90,7 @@ class SlotRunner(QObject):
     """一个窗口的“挂机 ↔ 录制”循环。"""
 
     status = Signal(str, str)   # text, level
+    hp_changed = Signal(object, object, str)  # current, maximum, message
     finished = Signal()
 
     def __init__(
@@ -102,10 +104,50 @@ class SlotRunner(QObject):
         self.hwnd = int(hwnd)
         self.config = dict(config)
         self.test_only = bool(test_only)
+        self.label = str(config.get("label") or "BOSS")
         try:
             self.priority = max(1, min(99, int(config.get("priority", 1))))
         except (TypeError, ValueError):
             self.priority = 1
+        # 两条线，每个窗口单独判断：
+        # 1) 回血红线（高）：低于它 → 排队/开始回血
+        # 2) 停平A红线（低，不低于 300）：低于它 → 只暂停发 A，
+        #    技能/喝药继续；高于它才恢复打怪
+        try:
+            self.hp_red_line = max(1, int(config.get("hp_red_line", 300)))
+        except (TypeError, ValueError):
+            self.hp_red_line = 300
+        try:
+            self.hp_heal_line = max(
+                self.hp_red_line,
+                int(config.get("hp_threshold", self.hp_red_line)),
+            )
+        except (TypeError, ValueError):
+            self.hp_heal_line = self.hp_red_line
+        try:
+            self.hp_pause_line = max(
+                self.hp_red_line,
+                min(
+                    self.hp_heal_line,
+                    int(
+                        config.get("hp_pause_line", self.hp_heal_line)
+                        or self.hp_heal_line
+                    ),
+                ),
+            )
+        except (TypeError, ValueError):
+            self.hp_pause_line = self.hp_red_line
+        self.hp_need_heal = bool(config.get("hp_need_heal", True))
+        self.hp_potion_enabled = bool(
+            config.get("hp_potion_enabled", False)
+        )
+        try:
+            self.hp_potion_threshold = max(
+                1, int(config.get("hp_potion_threshold", 1600))
+            )
+        except (TypeError, ValueError):
+            self.hp_potion_threshold = 1600
+        self._attack_paused = False
         self._waiter_id = id(self)
         self.is_running = False
         self.state = "idle"
@@ -123,6 +165,13 @@ class SlotRunner(QObject):
         self._lock_held = False
         self._pending_action = ""
         self._pending_play = None
+        self._request_priority = self.priority
+        self._hp_monitor = None
+        self._hp_current = None
+        self._hp_maximum = None
+        self._heal_pending = False
+        self._playing_heal = False
+        self._heal_cooldown_until = 0.0
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -148,7 +197,7 @@ class SlotRunner(QObject):
         if self.test_only:
             self.state = "boss"
             self._pending_play = (0, 0, 0)
-            self.status.emit("试放 BOSS 录制…", "warn")
+            self.status.emit(f"试放{self.label}录制…", "warn")
             if not self._request_foreground("play"):
                 return
             self._do_play_boss_recording()
@@ -173,7 +222,11 @@ class SlotRunner(QObject):
         self._lock_timer.stop()
         self._pending_action = ""
         self._pending_play = None
+        self._heal_pending = False
+        self._playing_heal = False
+        self._attack_paused = False
         FOREGROUND_ARBITER.cancel(self._waiter_id)
+        self._stop_hp_monitor()
         self._stop_monitor()
         self._stop_farming()
         self._stop_player()
@@ -187,6 +240,12 @@ class SlotRunner(QObject):
         if not self.is_running:
             return
         self._timer.start(max(0, int(delay * 1000)))
+
+    def _is_minimized(self) -> bool:
+        try:
+            return bool(win32gui is not None and win32gui.IsIconic(self.hwnd))
+        except Exception:
+            return False
 
     def _start_farming(self) -> None:
         if not self.is_running or self._worker is not None:
@@ -203,21 +262,25 @@ class SlotRunner(QObject):
                 self.hwnd,
                 int(self.config.get("interval_ms", 250)),
                 use_skills=bool(self.config.get("use_skills", False)),
-                use_potion=bool(self.config.get("use_potion", False)),
+                use_potion=bool(self.config.get("use_potion", False))
+                and not self.hp_potion_enabled,
                 potion_interval_ms=int(
                     self.config.get("potion_interval_ms", 60000)
                 ),
+                attack_enabled=True,
                 use_pickup=bool(self.config.get("use_pickup", True)),
                 parent=self,
             )
         except Exception as exc:
             self.stop(f"打怪线程启动失败：{exc}", "error")
             return
+        self._attack_paused = False
         worker.cycle_done.connect(self._on_farm_cycle)
         worker.failed.connect(self._on_farm_failed)
         self.state = "farming"
         self._worker = worker
         worker.start()
+        self._start_hp_monitor()
 
     def _stop_farming(self) -> None:
         worker = self._worker
@@ -237,8 +300,12 @@ class SlotRunner(QObject):
             return
         self._rounds = int(rounds)
         if self._pending_action:
+            self.status.emit("打怪中… 等待其他窗口完成前台操作…", "warn")
+            return
+        if self._is_minimized():
             self.status.emit(
-                "打怪中… 等待其他窗口完成前台操作…", "warn"
+                f"窗口已最小化（游戏可能暂停），仍发送后台按键… 已 {self._rounds} 轮",
+                "normal",
             )
             return
         if self.config.get("farm_only"):
@@ -254,17 +321,307 @@ class SlotRunner(QObject):
             return
         self.stop(f"打怪线程停止：{message}", "error")
 
-    # ------------------------------------------------------------------
-    def _request_foreground(self, action: str) -> bool:
+    # ---- 血量保护 -----------------------------------------------------
+    def _start_hp_monitor(self) -> None:
+        if not (
+            self.config.get("hp_enabled") or self.hp_potion_enabled
+        ):
+            return
+        if self._hp_monitor is not None:
+            return
+        roi = self.config.get("hp_roi")
+        if not roi:
+            return
+        app = _app()
+        if app is None or not hasattr(app, "HpMonitor"):
+            return
+        try:
+            monitor = app.HpMonitor(
+                self.hwnd,
+                tuple(roi),
+                float(self.config.get("hp_interval", 1)),
+                parent=self,
+            )
+        except Exception:
+            return
+        monitor.result.connect(self._on_hp_result)
+        self._hp_monitor = monitor
+        monitor.start()
+
+    def _stop_hp_monitor(self) -> None:
+        monitor = self._hp_monitor
+        self._hp_monitor = None
+        if monitor is not None:
+            self.hp_changed.emit(None, None, "暂停检测")
+            try:
+                monitor.stop()
+                if not monitor.wait(3000):
+                    monitor.terminate()
+                    monitor.wait(500)
+            except Exception:
+                pass
+            monitor.deleteLater()
+
+    def _on_hp_result(self, current, maximum, message: str) -> None:
+        if not self.is_running:
+            return
+        if current is None:
+            self.hp_changed.emit(None, None, message)
+            return
+        try:
+            self._hp_current = int(current)
+            self._hp_maximum = int(maximum) if maximum is not None else None
+        except (TypeError, ValueError):
+            return
+        self.hp_changed.emit(self._hp_current, self._hp_maximum, message)
+        # 只在打怪阶段检测；BOSS/回血/排队播放期间不触发。
+        if self.state != "farming":
+            return
+        if (
+            self.hp_potion_enabled
+            and self._hp_current is not None
+            and self._hp_current < self.hp_potion_threshold
+            and self._worker is not None
+        ):
+            try:
+                self._worker.trigger_potion()
+            except Exception:
+                pass
+        if not self.config.get("hp_enabled"):
+            return
+        if self._playing_heal:
+            return
+        # 第二个红线：低于它只暂停发平A，技能/喝药继续。
+        self._update_attack_gate(self._hp_current)
+        if (
+            self.hp_need_heal
+            and self._hp_current < self.hp_heal_line
+            and time.monotonic() >= self._heal_cooldown_until
+        ):
+            self._trigger_heal(
+                self._hp_current, self._hp_maximum, self.hp_heal_line
+            )
+
+    def _update_attack_gate(self, current) -> None:
+        """停平A红线：低于它暂停发 A，高于它才恢复打怪。"""
+        if current is None:
+            return
+        line = self.hp_pause_line
+        if current > line:
+            if self._attack_paused:
+                self._attack_paused = False
+                self._set_worker_attack(True)
+                self.status.emit(
+                    f"血量 {current} 高于停平A红线 {line}，恢复打怪…",
+                    "ok",
+                )
+        elif current < line:
+            if not self._attack_paused:
+                self._attack_paused = True
+                self._set_worker_attack(False)
+                self.status.emit(
+                    f"血量 {current} 低于停平A红线 {line}，"
+                    "本窗口暂停平A（其他窗口继续，技能/喝药继续）…",
+                    "warn",
+                )
+
+    def _set_worker_attack(self, enabled: bool) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        try:
+            worker.set_attack_enabled(enabled)
+        except Exception:
+            pass
+
+    def _trigger_heal(self, current, maximum, threshold: int) -> None:
+        if not self.is_running or self._playing_heal:
+            return
+        if self.state != "farming":
+            return
+        if self._heal_pending:
+            return
+        self._heal_pending = True
+        label = "回血红线" if threshold <= self.hp_red_line else "回血阈值"
+        self.status.emit(
+            f"血量 {current}/{maximum} 低于{label} {threshold}，准备回血…",
+            "warn",
+        )
+        # 疲劳检测点击期间：等它结束，_on_fatigue_result 会接着回血。
+        if self._monitor is not None:
+            return
+        # 正在排队（例如别的窗口在播 BOSS）：
+        # 先继续打怪，回血请求改成最高优先级；
+        # 低于停平A红线时由 _update_attack_gate 负责停 A。
+        if self._pending_action and not self._lock_held:
+            self._pending_action = "heal"
+            self._request_priority = 0
+            FOREGROUND_ARBITER.cancel(self._waiter_id)
+            self._lock_timer.start(0)
+            return
+        if self._lock_held:
+            self._release_foreground()
+        self._start_heal()
+
+    def _start_heal(self) -> None:
+        """申请前台并开始回血；拿不到就继续打怪排队。"""
+        if not self.is_running or self._playing_heal:
+            return
+        if not self.hp_need_heal:
+            self._heal_pending = False
+            return
+        if self._is_minimized():
+            self._heal_pending = False
+            self._heal_cooldown_until = time.monotonic() + 30.0
+            self.status.emit(
+                "窗口已最小化，跳过回血（游戏可能暂停）", "warn"
+            )
+            return
+        if self._monitor is not None:
+            self._heal_pending = True
+            return
+        if self.config.get("background"):
+            self._begin_heal_now()
+            return
+        if not self._request_foreground("heal", priority=0):
+            if self._pending_action == "heal":
+                hp_text = (
+                    f"{self._hp_current}/{self._hp_maximum}"
+                    if self._hp_maximum is not None
+                    else str(self._hp_current)
+                )
+                self.status.emit(
+                    f"血量 {hp_text} 低于回血红线，已排队回血，继续打怪"
+                    f"（低于停平A红线 {self.hp_pause_line} 时暂停平A）…",
+                    "warn",
+                )
+            return
+        self._begin_heal_now()
+
+    def _begin_heal_now(self) -> None:
+        """真正开始回血：先停本窗口打怪，再播回血录制。"""
+        if not self.is_running or self._playing_heal:
+            return
+        if not self.hp_need_heal:
+            self._heal_pending = False
+            return
+        if self._is_minimized():
+            self._heal_pending = False
+            self._heal_cooldown_until = time.monotonic() + 30.0
+            self._release_foreground()
+            self.status.emit(
+                "窗口已最小化，跳过回血（游戏可能暂停）", "warn"
+            )
+            return
+        self._timer.stop()
+        self._stop_farming()
+        self.state = "healing"
+        self._playing_heal = True
+        self._stop_hp_monitor()
+        self._heal_pending = True
+        self._do_play_heal()
+
+    def _do_play_heal(self) -> None:
+        events = list(self.config.get("heal_events", []))
+        if not self.is_running or not events:
+            self._playing_heal = False
+            self._release_foreground()
+            self.stop("没有可回放的回血录制", "error")
+            return
+        app = _app()
+        if app is None:
+            self._playing_heal = False
+            self._release_foreground()
+            self.stop("主程序模块不可用", "error")
+            return
+        try:
+            player = app.MacroPlayer(
+                self.hwnd,
+                "回城回血",
+                events,
+                meta=self.config.get("heal_meta"),
+                speed=1.0,
+                background=bool(
+                    self.config.get("background")
+                    or self.config.get("keyboard_only")
+                ),
+                relative_mouse=bool(self.config.get("relative_mouse")),
+                keyboard_only=bool(self.config.get("keyboard_only")),
+                parent=self,
+            )
+        except Exception as exc:
+            self._playing_heal = False
+            self._release_foreground()
+            self.stop(f"回血录制启动失败：{exc}", "error")
+            return
+        player.done.connect(self._on_heal_done)
+        player.error.connect(self._on_heal_error)
+        self._player = player
+        self.status.emit("回血中…", "warn")
+        player.start()
+
+    def _on_heal_done(self, stage: str) -> None:
+        player = self.sender()
+        if player is not None:
+            try:
+                player.wait(500)
+            except Exception:
+                pass
+            try:
+                player.deleteLater()
+            except Exception:
+                pass
+        self._release_foreground()
+        if player is not self._player:
+            return
+        self._player = None
+        self._playing_heal = False
+        self._heal_pending = False
+        self._heal_cooldown_until = time.monotonic() + 3.0
+        if not self.is_running:
+            return
+        self.state = "farming"
+        interval = max(5.0, float(self.config.get("interval", 30)))
+        self.status.emit("回血完成，恢复打怪…", "ok")
+        self._start_farming()
+        self._schedule(interval)
+
+    def _on_heal_error(self, stage: str, message: str) -> None:
+        player = self.sender()
+        if player is not None:
+            try:
+                player.wait(500)
+            except Exception:
+                pass
+            try:
+                player.deleteLater()
+            except Exception:
+                pass
+        self._release_foreground()
+        if player is not self._player:
+            return
+        self._player = None
+        self._playing_heal = False
+        self._heal_pending = False
+        if self.is_running:
+            self.stop(f"回血录制失败：{message}", "error")
+
+    # ---- 前台操作排队 -------------------------------------------------
+    def _request_foreground(self, action: str, priority=None) -> bool:
         """按优先级申请前台操作权；拿不到就定时重试，不阻塞界面。"""
         if self._lock_held:
             return True
-        if FOREGROUND_ARBITER.request(self._waiter_id, self.priority):
+        self._request_priority = (
+            self.priority if priority is None else int(priority)
+        )
+        if FOREGROUND_ARBITER.request(
+            self._waiter_id, self._request_priority
+        ):
             self._lock_held = True
             return True
         if not self._pending_action:
             self.status.emit(
-                f"等待前台操作（优先级 {self.priority}）…", "warn"
+                f"等待前台操作（优先级 {self._request_priority}）…", "warn"
             )
         self._pending_action = action
         self._lock_timer.start(300)
@@ -276,7 +633,9 @@ class SlotRunner(QObject):
             FOREGROUND_ARBITER.cancel(self._waiter_id)
             self._release_foreground()
             return
-        if not FOREGROUND_ARBITER.request(self._waiter_id, self.priority):
+        if not FOREGROUND_ARBITER.request(
+            self._waiter_id, self._request_priority
+        ):
             self._lock_timer.start(300)
             return
         self._lock_held = True
@@ -286,6 +645,8 @@ class SlotRunner(QObject):
             self._do_check_fatigue()
         elif action == "play":
             self._do_play_boss_recording()
+        elif action == "heal":
+            self._begin_heal_now()
         else:
             self._release_foreground()
 
@@ -295,10 +656,24 @@ class SlotRunner(QObject):
         self._lock_held = False
         FOREGROUND_ARBITER.release(self._waiter_id)
 
+    # ---- 疲劳检测 -----------------------------------------------------
     def _check_fatigue(self) -> None:
         if not self.is_running or self.state != "farming":
             return
         if self._monitor is not None:
+            return
+        if self._is_minimized():
+            interval = max(5.0, float(self.config.get("interval", 30)))
+            self.status.emit(
+                "窗口已最小化，跳过疲劳检测（游戏可能暂停）", "normal"
+            )
+            self._schedule(interval)
+            return
+        # 回血请求排队期间不要再插前台检测，避免抢走 heal 的优先级
+        if self._heal_pending or self._playing_heal:
+            return
+        if self.config.get("background"):
+            self._do_check_fatigue()
             return
         if not self._request_foreground("monitor"):
             return
@@ -307,6 +682,14 @@ class SlotRunner(QObject):
     def _do_check_fatigue(self) -> None:
         if not self.is_running or self.state != "farming":
             self._release_foreground()
+            return
+        if self._is_minimized():
+            self._release_foreground()
+            interval = max(5.0, float(self.config.get("interval", 30)))
+            self.status.emit(
+                "窗口已最小化，跳过疲劳检测（游戏可能暂停）", "normal"
+            )
+            self._schedule(interval)
             return
         app = _app()
         if app is None:
@@ -323,6 +706,7 @@ class SlotRunner(QObject):
                 self.hwnd,
                 roi_norm,
                 one_shot=True,
+                background=bool(self.config.get("background")),
                 parent=self,
             )
         except Exception as exc:
@@ -365,6 +749,9 @@ class SlotRunner(QObject):
         self._monitor = None
         if not self.is_running or self.state != "farming":
             return
+        if self._heal_pending:
+            self._start_heal()
+            return
 
         threshold = int(self.config.get("threshold", 800))
         interval = max(5.0, float(self.config.get("interval", 30)))
@@ -386,7 +773,7 @@ class SlotRunner(QObject):
             self._start_farming()
             self._schedule(interval)
 
-    # ------------------------------------------------------------------
+    # ---- BOSS 录制回放 -------------------------------------------------
     def _play_boss_recording(
         self, current: int, maximum: int, threshold: int
     ) -> None:
@@ -407,8 +794,18 @@ class SlotRunner(QObject):
             return
         current, maximum, threshold = self._pending_play
         self._pending_play = None
+        if not self.test_only and self._is_minimized():
+            self._release_foreground()
+            interval = max(5.0, float(self.config.get("interval", 30)))
+            self.status.emit(
+                "窗口已最小化，跳过BOSS回放（游戏可能暂停）", "warn"
+            )
+            self._start_farming()
+            self._schedule(interval)
+            return
         self._stop_farming()
         self.state = "boss"
+        self._stop_hp_monitor()
         app = _app()
         if app is None:
             self._release_foreground()
@@ -419,14 +816,16 @@ class SlotRunner(QObject):
         try:
             player = app.MacroPlayer(
                 self.hwnd,
-                "多开BOSS",
+                f"多开{self.label}",
                 events,
                 meta=meta if isinstance(meta, dict) else None,
                 speed=float(self.config.get("speed", 1.0) or 1.0),
-                lock_user_input=bool(
-                    self.config.get("lock_user_input", True)
+                background=bool(
+                    self.config.get("background")
+                    or self.config.get("keyboard_only")
                 ),
-                background=bool(self.config.get("background", False)),
+                relative_mouse=bool(self.config.get("relative_mouse")),
+                keyboard_only=bool(self.config.get("keyboard_only")),
                 parent=self,
             )
         except Exception as exc:
@@ -437,7 +836,7 @@ class SlotRunner(QObject):
         player.error.connect(self._on_player_error)
         self._player = player
         if self.test_only:
-            self.status.emit("试放 BOSS 录制…", "warn")
+            self.status.emit(f"试放{self.label}录制…", "warn")
         else:
             self.status.emit(
                 f"疲劳 {current}/{maximum} < -{threshold}，回放 BOSS 录制…",

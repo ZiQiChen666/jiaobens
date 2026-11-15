@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title 打包 CreatureCurios 后台按键器 v2
+title 打包 CreatureCurios 后台按键器（多开 + 自动BOSS）
 
 echo ============================================
-echo  CreatureCurios 后台按键器 v2 - 打包 exe
+echo  CreatureCurios 后台按键器（多开 + 自动BOSS） - 打包 exe
 echo ============================================
 echo.
 

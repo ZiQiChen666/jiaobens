@@ -12,3 +12,5 @@ boss_states/
 last_probe_session.txt
 *.log
 *.tmp
+loopback_target_events.jsonl
+raw_only_target.json
