@@ -13,6 +13,9 @@ a = Analysis(
     hiddenimports=[
         'multi_open',
         'raw_input_recorder',
+        'dungeon_flow',
+        'dungeon_ui',
+        'dungeon_wizard',
         'keyboard._winkeyboard',
         'keyboard._winmouse',
         'keyboard._generic',

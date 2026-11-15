@@ -7,8 +7,9 @@
     * 在独立 QThread 中通过 win32api.PostMessage 后台投递 A
       （可选空格拾取）；
     * 可选技能 1 / 2（12s / 6s）和自动喝药 Q（默认 60s）；
-    * 疲劳检测：框选游戏右下的疲劳提示区域，每 30 秒短暂点击一次，
-      OCR 读取“当前疲劳值:xxx/xxx”，超过 ±阈值时弹出不抢焦点的提醒；
+    * 疲劳检测：框选游戏右下的疲劳提示区域，每 30 秒用 PostMessage
+      后台点击一次（不移动鼠标、不抢前台），OCR 读取“当前疲劳值:xxx/xxx”，
+      超过 ±阈值时弹出不抢焦点的提醒；
     * 定时提醒：支持倒计时和指定时刻；
     * 每轮间隔设置、轮次统计、Ctrl+Alt+F8 全局热键；
     * 最小化后驻留系统托盘，双击托盘图标恢复。
@@ -492,6 +493,86 @@ def capture_client_bgra(hwnd: int) -> tuple[Optional[tuple[int, int, bytes]], st
                 _USER32.ReleaseDC(hwnd, hdc)
         except Exception:
             pass
+
+
+# ---- 后台鼠标点击（不移动真实光标、不抢前台） -----------------------------
+
+def _post_message(hwnd: int, message: int, wparam: int, lparam: int) -> bool:
+    """PostMessage 包装：失败时退回 user32 原生调用，不抛异常。"""
+    try:
+        result = win32api.PostMessage(hwnd, message, wparam, lparam)
+        if result is None:
+            return True
+        if int(result) == 0:
+            return bool(_USER32.PostMessageW(hwnd, message, wparam, lparam))
+        return True
+    except Exception:
+        try:
+            return bool(_USER32.PostMessageW(hwnd, message, wparam, lparam))
+        except Exception:
+            return False
+
+
+def prime_background_input(hwnd: int, activate: bool = False) -> None:
+    """让游戏以为窗口处于激活/有焦点状态，但不真正切换前台。
+
+    只 PostMessage 补发消息，不调用 SetForegroundWindow，所以不会抢走
+    用户正在使用的窗口，也不会移动真实光标。
+
+    activate=False（默认，疲劳检测用）：只发 WM_ACTIVATEAPP / WM_NCACTIVATE，
+    这两条不会让窗口真的被激活。
+    activate=True：额外发 WM_ACTIVATE / WM_SETFOCUS；部分游戏的默认
+    窗口过程会因此把窗口拉到前台（抢焦点），所以默认不开。
+    """
+    if not win32gui.IsWindow(hwnd):
+        return
+    try:
+        foreground = int(win32gui.GetForegroundWindow() or 0)
+    except Exception:
+        foreground = 0
+    if foreground == hwnd:
+        return
+    _post_message(hwnd, WM_ACTIVATEAPP, 1, 0)
+    _post_message(hwnd, WM_NCACTIVATE, 1, 0)
+    if activate:
+        _post_message(hwnd, WM_ACTIVATE, WA_ACTIVE, foreground)
+        _post_message(hwnd, WM_SETFOCUS, foreground, 0)
+
+
+def _mouse_lparam(client_x: int, client_y: int) -> int:
+    return ((int(client_x) & 0xFFFF) | ((int(client_y) & 0xFFFF) << 16))
+
+
+def post_mouse_move_client(hwnd: int, client_x: int, client_y: int) -> bool:
+    """向客户区坐标补发一条 WM_MOUSEMOVE（不动真实光标）。"""
+    return _post_message(hwnd, WM_MOUSEMOVE, 0, _mouse_lparam(client_x, client_y))
+
+
+def post_click_client(
+    hwnd: int, client_x: int, client_y: int, hold_seconds: float = 0.04
+) -> bool:
+    """向窗口客户区坐标发一次后台左键点击（纯消息，不动真实鼠标）。
+
+    顺序：WM_MOUSEMOVE → WM_LBUTTONDOWN → WM_LBUTTONUP → WM_MOUSEMOVE。
+    不需要 SetCursorPos，也不会把游戏切到前台，所以用户正在用的
+    窗口不会被打断（不抢鼠标、不抢焦点）。
+    """
+    if not win32gui.IsWindow(hwnd):
+        return False
+    lparam = _mouse_lparam(client_x, client_y)
+    prime_background_input(hwnd)
+    ok = _post_message(hwnd, WM_MOUSEMOVE, 0, lparam)
+    ok = (
+        _post_message(
+            hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam
+        )
+        or ok
+    )
+    if hold_seconds > 0:
+        time.sleep(hold_seconds)
+    ok = _post_message(hwnd, win32con.WM_LBUTTONUP, 0, lparam) or ok
+    _post_message(hwnd, WM_MOUSEMOVE, 0, lparam)
+    return ok
 
 
 # ---- 疲劳提示识别（用户在界面上框选“悬停/点击触发区”，OCR 读取提示文本） ----
@@ -2651,11 +2732,14 @@ class BossWatcher(QThread):
 
 
 class FatigueMonitor(QThread):
-    """每 30 秒点击一次用户框选的疲劳提示区域，读取弹出的文本。
+    """每 30 秒后台点击一次用户框选的疲劳提示区域，读取弹出的文本。
 
-    检测流程：保存鼠标/前台窗口 → 移动到框选区域 → 短暂左键点击 →
-    等待提示框出现 → 后台截图 → 恢复鼠标/前台窗口 → OCR 读取
-    “当前疲劳值:xxx/xxx”。
+    默认流程（不抢鼠标）：PostMessage 后台点击 → 等待提示框出现 →
+    PrintWindow 后台截图 → OCR 读取“当前疲劳值:xxx/xxx”。
+    全程不调用 SetCursorPos、不切前台，所以用户正在用的窗口不会被打断。
+
+    只有用户显式传入 borrow_mouse=True 且后台点击读不到文本时，
+    才会短暂“借用”真实鼠标点击一次，结束后立刻还原光标和前台窗口。
     """
 
     result = Signal(object, object, str)  # current, maximum, message
@@ -2670,6 +2754,7 @@ class FatigueMonitor(QThread):
         alert_below: Optional[float] = None,
         alert_above: Optional[float] = None,
         background: bool = False,
+        borrow_mouse: bool = False,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
@@ -2677,7 +2762,10 @@ class FatigueMonitor(QThread):
         self.roi_norm = roi_norm
         self.alert_below = alert_below
         self.alert_above = alert_above
+        # 疲劳点击始终走后台 PostMessage，不再使用真实鼠标；
+        # background 只保留兼容旧调用。
         self.background = bool(background)
+        self.borrow_mouse = bool(borrow_mouse)
         self.interval = max(5.0, float(interval_seconds))
         self._one_shot = bool(one_shot)
         self._stop_event = threading.Event()
@@ -2718,9 +2806,106 @@ class FatigueMonitor(QThread):
         if self.roi_norm is None:
             self.result.emit(None, None, "尚未框选疲劳提示区域，请先点“框选区域”。")
             return
-        if self.background:
-            self._check_once_background()
+        # 1) 默认路径：纯后台 PostMessage 点击 + 后台截图，
+        #    不移动真实光标、不切换前台，用户正在用的窗口不受影响。
+        cap, cap_err = self._capture_with_background_click()
+        current, maximum, msg = self._read_capture(cap, cap_err)
+        if current is not None or not self.borrow_mouse:
+            self._emit_result(current, maximum, msg)
             return
+
+        # 2) 兜底路径：只有用户显式勾选“后台点击无效时借用鼠标”才走这里，
+        #    借用真实鼠标约 1 秒，结束后立刻还原光标和前台窗口。
+        cap2, cap_err2 = self._capture_with_borrowed_mouse()
+        current2, maximum2, msg2 = self._read_capture(cap2, cap_err2)
+        if current2 is not None:
+            self._emit_result(current2, maximum2, msg2)
+        else:
+            self._emit_result(None, None, msg2 or msg)
+
+    def _roi_in_client(self):
+        """返回 (客户区内的疲劳区域, 客户区宽, 高, 错误文本)。"""
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+        except Exception as exc:
+            return None, 0, 0, f"疲劳区域无效：{type(exc).__name__}: {exc}"
+        cw, ch = int(right - left), int(bottom - top)
+        if cw <= 0 or ch <= 0:
+            return None, 0, 0, "客户区尺寸无效，跳过疲劳检测。"
+        try:
+            roi = roi_from_norm(self.roi_norm, cw, ch)
+        except Exception as exc:
+            return None, cw, ch, f"疲劳区域无效：{type(exc).__name__}: {exc}"
+        return roi, cw, ch, ""
+
+    def _capture_with_background_click(self):
+        """后台点击疲劳图标后截图：全程只发窗口消息，不动真实鼠标。"""
+        roi, cw, ch, err = self._roi_in_client()
+        if roi is None:
+            return None, err
+        client_x = max(1, min(cw - 2, roi[0] + roi[2] // 2))
+        client_y = max(1, min(ch - 2, roi[1] + roi[3] // 2))
+
+        prev_fg = 0
+        try:
+            prev_fg = int(win32gui.GetForegroundWindow() or 0)
+        except Exception:
+            pass
+        try:
+            cursor_before = win32api.GetCursorPos()
+        except Exception:
+            cursor_before = None
+
+        post_click_client(self.hwnd, client_x, client_y)
+
+        # 等提示框完全显示；期间持续补发悬停消息，让游戏一直认为
+        # 鼠标停在该图标上（同样不会移动真实光标）。
+        deadline = time.monotonic() + 1.0
+        try:
+            while time.monotonic() < deadline:
+                if self._stop_event.wait(0.2):
+                    return None, ""
+                post_mouse_move_client(self.hwnd, client_x, client_y)
+        finally:
+            # 兜底：万一游戏自己抢到前台或挪了光标，立刻还给用户
+            self._give_back_input(prev_fg, cursor_before)
+        return capture_client_bgra(self.hwnd)
+
+    def _give_back_input(self, prev_fg: int, cursor_before) -> None:
+        """后台操作后把前台窗口（以及被游戏夹走的光标）还给用户。
+
+        只有确认是游戏把前台抢走了才去恢复，避免用户在后台点击
+        期间自己移动鼠标时被程序到处乱拽。
+        """
+        restored_fg = False
+        try:
+            if (
+                prev_fg
+                and prev_fg != self.hwnd
+                and win32gui.IsWindow(prev_fg)
+                and int(win32gui.GetForegroundWindow() or 0) == self.hwnd
+            ):
+                _restore_foreground_window(prev_fg, self.hwnd)
+                restored_fg = True
+        except Exception:
+            pass
+        if not restored_fg or cursor_before is None:
+            return
+        try:
+            cur = win32api.GetCursorPos()
+            if (int(cur[0]), int(cur[1])) != (
+                int(cursor_before[0]),
+                int(cursor_before[1]),
+            ):
+                win32api.SetCursorPos(cursor_before)
+        except Exception:
+            pass
+
+    def _capture_with_borrowed_mouse(self):
+        """兜底：短暂借用真实鼠标点击一次，随后立即还原（默认不用）。"""
+        roi, cw, ch, err = self._roi_in_client()
+        if roi is None:
+            return None, err
 
         # 用户正在按鼠标时不要抢鼠标
         try:
@@ -2728,21 +2913,9 @@ class FatigueMonitor(QThread):
                 win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000
                 or win32api.GetAsyncKeyState(win32con.VK_RBUTTON) & 0x8000
             ):
-                self.result.emit(None, None, "鼠标按键按下中，跳过本次疲劳检测。")
-                return
+                return None, "鼠标按键按下中，跳过本次疲劳检测。"
         except Exception:
             pass
-
-        try:
-            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
-            cw, ch = int(right - left), int(bottom - top)
-            if cw <= 0 or ch <= 0:
-                self.result.emit(None, None, "客户区尺寸无效，跳过疲劳检测。")
-                return
-            roi = roi_from_norm(self.roi_norm, cw, ch)
-        except Exception as exc:
-            self.result.emit(None, None, f"疲劳区域无效：{type(exc).__name__}: {exc}")
-            return
 
         saved_pos = win32api.GetCursorPos()
         prev_fg = 0
@@ -2761,10 +2934,8 @@ class FatigueMonitor(QThread):
             time.sleep(0.06)
 
             # 点击用户保存的区域中心，让游戏弹出疲劳提示
-            client_x = roi[0] + roi[2] // 2
-            client_y = roi[1] + roi[3] // 2
-            client_x = max(1, min(cw - 2, client_x))
-            client_y = max(1, min(ch - 2, client_y))
+            client_x = max(1, min(cw - 2, roi[0] + roi[2] // 2))
+            client_y = max(1, min(ch - 2, roi[1] + roi[3] // 2))
             sx, sy = win32gui.ClientToScreen(self.hwnd, (client_x, client_y))
             anchor_pos = (int(sx), int(sy))
 
@@ -2776,12 +2947,7 @@ class FatigueMonitor(QThread):
                 else 0
             )
             if root_under != self.hwnd:
-                self.result.emit(
-                    None,
-                    None,
-                    "疲劳提示区域被其他窗口遮挡，已跳过本次点击。",
-                )
-                return
+                return None, "疲劳提示区域被其他窗口遮挡，已跳过本次点击。"
 
             win32api.SetCursorPos(anchor_pos)
             moved_to_anchor = True
@@ -2792,13 +2958,12 @@ class FatigueMonitor(QThread):
 
             # 等提示框完全显示；停止时也能立即退出
             if self._stop_event.wait(1.0):
-                return
-
+                return None, ""
             cap, cap_err = capture_client_bgra(self.hwnd)
         except Exception as exc:
             cap_err = f"疲劳检测异常：{type(exc).__name__}: {exc}"
         finally:
-            # 检测只有约 1 秒，结束后始终把前台窗口和鼠标还给用户。
+            # 借用只有约 1 秒，结束后始终把前台窗口和鼠标还给用户。
             _restore_foreground_window(prev_fg, self.hwnd)
             if moved_to_anchor and saved_pos is not None:
                 try:
@@ -2809,78 +2974,26 @@ class FatigueMonitor(QThread):
                     win32api.SetCursorPos(saved_pos)
                 except Exception:
                     pass
+        return cap, cap_err
 
-        self._process_capture(cap, cap_err)
-
-
-    def _bg_click(self, client_x: int, client_y: int) -> None:
-        """后台点击：只向游戏窗口 PostMessage，不移动真实鼠标。"""
-        try:
-            fg = int(win32gui.GetForegroundWindow() or 0)
-            if fg != self.hwnd:
-                _USER32.PostMessageW(self.hwnd, WM_ACTIVATEAPP, 1, 0)
-                _USER32.PostMessageW(self.hwnd, WM_NCACTIVATE, 1, 0)
-                _USER32.PostMessageW(self.hwnd, WM_ACTIVATE, WA_ACTIVE, fg)
-                _USER32.PostMessageW(self.hwnd, WM_SETFOCUS, fg, 0)
-            lparam = (client_x & 0xFFFF) | ((client_y & 0xFFFF) << 16)
-            _USER32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, lparam)
-            _USER32.PostMessageW(
-                self.hwnd,
-                win32con.WM_LBUTTONDOWN,
-                win32con.MK_LBUTTON,
-                lparam,
-            )
-            _USER32.PostMessageW(
-                self.hwnd, win32con.WM_LBUTTONUP, 0, lparam
-            )
-        except Exception:
-            pass
-
-    def _check_once_background(self) -> None:
-        if self.roi_norm is None:
-            return
-        try:
-            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
-            cw, ch = int(right - left), int(bottom - top)
-            if cw <= 0 or ch <= 0:
-                self.result.emit(
-                    None, None, "客户区尺寸无效，跳过疲劳检测。"
-                )
-                return
-            roi = roi_from_norm(self.roi_norm, cw, ch)
-        except Exception as exc:
-            self.result.emit(
-                None,
-                None,
-                f"疲劳区域无效：{type(exc).__name__}: {exc}",
-            )
-            return
-
-        client_x = max(1, min(cw - 2, roi[0] + roi[2] // 2))
-        client_y = max(1, min(ch - 2, roi[1] + roi[3] // 2))
-        self._bg_click(client_x, client_y)
-        if self._stop_event.wait(1.0):
-            return
-        cap, cap_err = capture_client_bgra(self.hwnd)
-        self._process_capture(cap, cap_err)
-
-    def _process_capture(self, cap, cap_err: str) -> None:
+    def _read_capture(self, cap, cap_err: str):
+        """OCR 截图，返回 (current, maximum, message)；已停止时 message 为空。"""
         if self._stop_event.is_set():
-            return
+            return None, None, ""
         if cap is None:
-            self.result.emit(None, None, cap_err or "疲劳截图失败")
-            return
-
+            return None, None, cap_err or "疲劳截图失败"
         w, h, data = cap
         try:
             roi = roi_from_norm(self.roi_norm, w, h)
-            current, maximum, msg = ocr_fatigue_from_bgra(data, w, h, roi)
+            return ocr_fatigue_from_bgra(data, w, h, roi)
         except Exception as exc:
-            self.result.emit(None, None, f"疲劳识别异常：{type(exc).__name__}: {exc}")
-            return
+            return None, None, f"疲劳识别异常：{type(exc).__name__}: {exc}"
 
+    def _emit_result(self, current, maximum, msg: str) -> None:
+        if self._stop_event.is_set():
+            return
         if current is None or maximum is None:
-            self.result.emit(None, None, msg)
+            self.result.emit(None, None, msg or "疲劳截图失败")
             return
 
         self.result.emit(int(current), int(maximum), msg)
@@ -3248,8 +3361,8 @@ class RegionSelectDialog(QDialog):
         title_text = title_text or "框选疲劳提示区域"
         info_text = info_text or (
             "框住游戏右下角那个会弹出“当前疲劳值:xxx/xxx”的图标/按钮区域。"
-            "不需要框文字或疲劳条；程序之后每 30 秒会在该区域内短暂点击一下，"
-            "再读取弹出来的提示。"
+            "不需要框文字或疲劳条；程序之后每 30 秒会在该区域内做一次后台点击"
+            "（PostMessage，不移动真实鼠标、不切前台），读取弹出的疲劳值。"
             "如果截图里看不到这个区域，点“重新截图”，程序会先把鼠标移到游戏右下角再截图。"
         )
         self.setWindowTitle(title_text)
@@ -3619,6 +3732,36 @@ QDialog QCheckBox::indicator:checked {
 QDialog QScrollArea {
     background: transparent;
 }
+/* 顶部页标签：白底黑字（原来深色底上灰字看不清） */
+QTabWidget#mainTabs > QTabBar {
+    background: #ffffff;
+}
+QTabWidget#mainTabs > QTabBar::tab {
+    background: #ffffff;
+    color: #000000;
+    font-weight: 700;
+    font-size: 13px;
+    border: 1px solid #9aa0a8;
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    padding: 8px 20px;
+    margin-right: 4px;
+    min-width: 96px;
+}
+QTabWidget#mainTabs > QTabBar::tab:selected {
+    background: #ffffff;
+    color: #000000;
+    border-bottom: 3px solid #16a34a;
+}
+QTabWidget#mainTabs > QTabBar::tab:!selected {
+    background: #eceff3;
+    color: #000000;
+}
+QTabWidget#mainTabs > QTabBar::tab:hover {
+    background: #f5f7fa;
+    color: #000000;
+}
 """
 
 START_BUTTON_STYLES = {
@@ -3713,6 +3856,13 @@ class MainWindow(QMainWindow):
         except Exception:
             threshold = DEFAULT_FATIGUE_THRESHOLD
         self._fatigue_threshold = max(50, min(1000, threshold))
+        # 疲劳检测默认只用后台点击；“借用鼠标”是用户显式开启的兜底
+        try:
+            self._fatigue_borrow_mouse = self._bool_setting(
+                self._settings.value("fatigue_borrow_mouse", False)
+            )
+        except Exception:
+            self._fatigue_borrow_mouse = False
         self._timer_next_mono: Optional[float] = None
         self._timer_next_dt: Optional[datetime.datetime] = None
 
@@ -3966,8 +4116,8 @@ class MainWindow(QMainWindow):
 
         self.chk_fatigue = QCheckBox("疲劳检测（每 30 秒）")
         self.chk_fatigue.setToolTip(
-            "开始发送后每 30 秒检测一次；检测时会在你框选的区域短暂点击一下，"
-            "读取弹出的“当前疲劳值:xxx/xxx”，随后自动恢复鼠标和前台窗口"
+            "开始发送后每 30 秒检测一次；检测时用 PostMessage 后台点击你框选的区域，"
+            "不移动真实鼠标、不抢前台，读取弹出的“当前疲劳值:xxx/xxx”。"
         )
         self.chk_fatigue.toggled.connect(self._on_fatigue_toggled)
         self.lbl_fatigue = QLabel("上次: --")
@@ -3981,7 +4131,9 @@ class MainWindow(QMainWindow):
         self.btn_fatigue_region.clicked.connect(self._select_fatigue_region)
         self.btn_fatigue_test = QPushButton("测试检测")
         self.btn_fatigue_test.setFixedWidth(92)
-        self.btn_fatigue_test.setToolTip("立即执行一次疲劳检测（会短暂移动鼠标）")
+        self.btn_fatigue_test.setToolTip(
+            "立即执行一次疲劳检测（后台点击，不移动鼠标）"
+        )
         self.btn_fatigue_test.clicked.connect(self._test_fatigue_check)
         aux.addWidget(self.chk_fatigue, 2, 0)
         aux.addWidget(self.lbl_fatigue, 2, 1, 1, 2)
@@ -4006,6 +4158,20 @@ class MainWindow(QMainWindow):
         aux.addWidget(QLabel("疲劳阈值 ±"), 3, 0)
         aux.addWidget(self.spin_fatigue_threshold, 3, 1)
         aux.addWidget(self.lbl_threshold_hint, 3, 2, 1, 3)
+
+        self.chk_fatigue_borrow_mouse = QCheckBox(
+            "后台点击读不到时短暂借用鼠标（会闪一下光标）"
+        )
+        self.chk_fatigue_borrow_mouse.setChecked(self._fatigue_borrow_mouse)
+        self.chk_fatigue_borrow_mouse.setToolTip(
+            "默认关闭：疲劳检测只用 PostMessage 后台点击，绝不移动鼠标。\n"
+            "如果游戏不处理后鼠标消息、读不到疲劳值，可勾选此项：\n"
+            "后台点击失败时才切前台真实点一下（约 1 秒），随后立刻还原光标和窗口。"
+        )
+        self.chk_fatigue_borrow_mouse.toggled.connect(
+            self._on_fatigue_borrow_toggled
+        )
+        aux.addWidget(self.chk_fatigue_borrow_mouse, 4, 0, 1, 4)
 
         self.chk_timer = QCheckBox("定时提醒")
         self.chk_timer.setToolTip("开启后按倒计时或指定时刻弹出提醒")
@@ -4042,21 +4208,21 @@ class MainWindow(QMainWindow):
         timer_row.addWidget(self.time_timer)
         timer_row.addWidget(self.lbl_timer_next, 1)
         timer_row.addWidget(self.btn_notice_test)
-        aux.addWidget(self.chk_timer, 4, 0)
-        aux.addWidget(timer_wrap, 4, 1, 1, 3)
+        aux.addWidget(self.chk_timer, 5, 0)
+        aux.addWidget(timer_wrap, 5, 1, 1, 3)
 
         self.chk_background_mode = QCheckBox("后台模式（不抢鼠标键盘）")
         self.chk_background_mode.setChecked(True)
         self.chk_background_mode.setToolTip(
-            "疲劳检测、BOSS/导航/返回回放都改用 PostMessage 发送，"
-            "不移动真实鼠标、不抢前台，可以边挂机边用电脑。"
+            "BOSS/导航/返回回放都改用 PostMessage 发送，不移动真实鼠标、不抢前台，"
+            "可以边挂机边用电脑（疲劳检测始终用后台点击，不受本开关影响）。"
             "部分游戏不处理后鼠标消息，建议先“试放一次”验证；"
             "无效时取消勾选，会恢复前台真实鼠标键盘回放。"
         )
         self.chk_background_mode.toggled.connect(
             self._on_background_mode_toggled
         )
-        aux.addWidget(self.chk_background_mode, 5, 0, 1, 2)
+        aux.addWidget(self.chk_background_mode, 6, 0, 1, 2)
 
         self.chk_relative_mouse = QCheckBox("前台相对鼠标（会抢鼠标）")
         self.chk_relative_mouse.setChecked(False)
@@ -4068,7 +4234,7 @@ class MainWindow(QMainWindow):
         self.chk_relative_mouse.toggled.connect(
             self._on_relative_mouse_toggled
         )
-        aux.addWidget(self.chk_relative_mouse, 5, 2, 1, 2)
+        aux.addWidget(self.chk_relative_mouse, 6, 2, 1, 2)
 
         self.chk_keyboard_only = QCheckBox(
             "静止鼠标 / 仅键盘（防抢）"
@@ -4082,7 +4248,7 @@ class MainWindow(QMainWindow):
         self.chk_keyboard_only.toggled.connect(
             self._on_keyboard_only_toggled
         )
-        aux.addWidget(self.chk_keyboard_only, 6, 0, 1, 4)
+        aux.addWidget(self.chk_keyboard_only, 7, 0, 1, 4)
 
         self.chk_single_hp_potion = QCheckBox(
             "血量低于阈值自动吃药（Q+W）"
@@ -4095,8 +4261,8 @@ class MainWindow(QMainWindow):
         self.chk_single_hp_potion.toggled.connect(
             self._on_single_hp_potion_toggled
         )
-        aux.addWidget(self.chk_single_hp_potion, 7, 0, 1, 2)
-        aux.addWidget(QLabel("血量阈值"), 7, 2)
+        aux.addWidget(self.chk_single_hp_potion, 8, 0, 1, 2)
+        aux.addWidget(QLabel("血量阈值"), 8, 2)
         self.spin_single_hp_potion_threshold = QSpinBox()
         self.spin_single_hp_potion_threshold.setRange(1, 100000)
         self.spin_single_hp_potion_threshold.setValue(1600)
@@ -4106,7 +4272,7 @@ class MainWindow(QMainWindow):
         self.spin_single_hp_potion_threshold.valueChanged.connect(
             lambda _=0: self._save_boss_settings()
         )
-        aux.addWidget(self.spin_single_hp_potion_threshold, 7, 3)
+        aux.addWidget(self.spin_single_hp_potion_threshold, 8, 3)
 
         self.btn_single_hp_roi = QPushButton("框选血量区域")
         self.btn_single_hp_roi.setFixedWidth(110)
@@ -4115,18 +4281,18 @@ class MainWindow(QMainWindow):
         self.lbl_single_hp_roi.setObjectName("muted")
         self.lbl_single_hp_value = QLabel("血量: --")
         self.lbl_single_hp_value.setObjectName("muted")
-        aux.addWidget(self.btn_single_hp_roi, 8, 0)
-        aux.addWidget(self.lbl_single_hp_roi, 8, 1)
-        aux.addWidget(self.lbl_single_hp_value, 8, 2, 1, 2)
+        aux.addWidget(self.btn_single_hp_roi, 9, 0)
+        aux.addWidget(self.lbl_single_hp_roi, 9, 1)
+        aux.addWidget(self.lbl_single_hp_value, 9, 2, 1, 2)
 
         aux_note = QLabel(
-            "技能 / 喝药在“开始发送”后生效；疲劳检测会在你框选的区域短暂点击并读取提示；"
+            "技能 / 喝药在“开始发送”后生效；疲劳检测只用后台 PostMessage 点击，不移动鼠标、不抢前台；"
             "定时提醒独立生效，最小化到托盘也会弹窗。"
             "游戏窗口最小化时只继续后台按键，疲劳检测会暂停。"
         )
         aux_note.setObjectName("muted")
         aux_note.setWordWrap(True)
-        aux.addWidget(aux_note, 9, 0, 1, 4)
+        aux.addWidget(aux_note, 10, 0, 1, 4)
 
         basic_root.addWidget(box_aux)
         basic_root.addWidget(self._build_boss_group())
@@ -4141,6 +4307,24 @@ class MainWindow(QMainWindow):
         self.tabs.setObjectName("mainTabs")
         self.tabs.addTab(scroll, "单开挂机")
         self.tabs.addTab(self._build_multi_tab(), "多开挂机")
+        try:
+            from dungeon_ui import DungeonTab
+
+            self.dungeon_tab = DungeonTab(self)
+            self.tabs.addTab(self.dungeon_tab, "副本流程")
+            self._log_startup(
+                f"副本流程页已加载（tab 序号 {self.tabs.indexOf(self.dungeon_tab)}）"
+            )
+        except Exception as exc:  # 副本页加载失败不影响主流程
+            self.dungeon_tab = None
+            import traceback
+
+            detail = traceback.format_exc()
+            self._log_startup(
+                f"副本流程页加载失败：{type(exc).__name__}: {exc}"
+                + chr(10) + detail
+            )
+            print(f"[警告] 副本流程页加载失败：{type(exc).__name__}: {exc}")
         root.addWidget(self.tabs, 1)
 
         self.hint_label = QLabel(
@@ -6520,6 +6704,9 @@ class MainWindow(QMainWindow):
                 self.chk_multi_background.isChecked()
                 or self.chk_multi_keyboard_only.isChecked()
             ),
+            "borrow_mouse": bool(
+                self.chk_fatigue_borrow_mouse.isChecked()
+            ),
             "relative_mouse": bool(
                 self.chk_multi_relative_mouse.isChecked()
             ),
@@ -6608,6 +6795,9 @@ class MainWindow(QMainWindow):
             "background": bool(
                 self.chk_multi_background.isChecked()
                 or self.chk_multi_keyboard_only.isChecked()
+            ),
+            "borrow_mouse": bool(
+                self.chk_fatigue_borrow_mouse.isChecked()
             ),
             "relative_mouse": bool(
                 self.chk_multi_relative_mouse.isChecked()
@@ -7509,6 +7699,7 @@ class MainWindow(QMainWindow):
         self._set_bound_label(f"已绑定: {title} [0x{hwnd:X}]", "ok")
         self._set_status(f"已绑定窗口：{title} [0x{hwnd:X}]", "ok")
         self._update_bind_button_state()
+        self._refresh_dungeon_tab()
 
     def _clear_binding(self, update_status: bool = True) -> None:
         self.target_hwnd = None
@@ -7517,6 +7708,26 @@ class MainWindow(QMainWindow):
         if update_status:
             self._set_status("绑定已清除，请重新选择目标窗口。", "warn")
         self._update_bind_button_state()
+        self._refresh_dungeon_tab()
+
+    def _refresh_dungeon_tab(self) -> None:
+        tab = getattr(self, "dungeon_tab", None)
+        if tab is not None:
+            try:
+                tab._refresh_all()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _log_startup(text: str) -> None:
+        """把启动信息写到 startup.log，方便排查“某个页/功能没出来”。"""
+        try:
+            path = os.path.join(_data_folder(), "startup.log")
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"[{stamp}] {text}" + chr(10))
+        except Exception:
+            pass
 
     def _set_bound_label(self, text: str, state: str) -> None:
         self.bound_label.setText(text)
@@ -8187,7 +8398,8 @@ class MainWindow(QMainWindow):
             one_shot=False,
             alert_below=-float(self._fatigue_threshold),
             alert_above=float(self._fatigue_threshold),
-            background=self.chk_background_mode.isChecked(),
+            background=True,
+            borrow_mouse=self.chk_fatigue_borrow_mouse.isChecked(),
             parent=self,
         )
         monitor.result.connect(self._on_fatigue_result)
@@ -8270,6 +8482,26 @@ class MainWindow(QMainWindow):
         self._popup.show_message("疲劳值提醒", message, seconds=20)
         self.lbl_fatigue.setStyleSheet("color: #ff6b6b; padding: 0;")
 
+    def _on_fatigue_borrow_toggled(self, checked: bool) -> None:
+        self._fatigue_borrow_mouse = bool(checked)
+        try:
+            self._settings.setValue("fatigue_borrow_mouse", bool(checked))
+        except Exception:
+            pass
+        # 正在做疲劳检测时，用新模式重启监控
+        if self._fatigue_monitor is not None:
+            self._stop_fatigue_monitor()
+            self._start_fatigue_monitor()
+        if checked:
+            self._set_status(
+                "疲劳检测：后台点击读不到时会短暂借用鼠标（约 1 秒，随后还原）",
+                "warn",
+            )
+        else:
+            self._set_status(
+                "疲劳检测：只用后台点击，不会移动鼠标、不抢前台", "ok"
+            )
+
     def _test_fatigue_check(self) -> None:
         if self.target_hwnd is None or not self._window_alive(self.target_hwnd):
             self._notify(
@@ -8289,7 +8521,7 @@ class MainWindow(QMainWindow):
         if self._fatigue_monitor is not None:
             self._fatigue_monitor.request_check()
             self._set_status(
-                "正在执行疲劳检测（会在框选区域短暂点击并读取提示）…", "warn"
+                "正在执行疲劳检测（后台点击，不移动鼠标）…", "warn"
             )
             return
         if self._test_monitor is not None:
@@ -8302,7 +8534,8 @@ class MainWindow(QMainWindow):
             one_shot=True,
             alert_below=-float(self._fatigue_threshold),
             alert_above=float(self._fatigue_threshold),
-            background=self.chk_background_mode.isChecked(),
+            background=True,
+            borrow_mouse=self.chk_fatigue_borrow_mouse.isChecked(),
             parent=self,
         )
         monitor.result.connect(self._on_fatigue_result)

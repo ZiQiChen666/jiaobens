@@ -30,7 +30,8 @@ def _app():
 
 
 # 所有多开槽位共用一个“前台操作排队器”：
-# 录制回放、疲劳检测点击都需要独占前台鼠标键盘，必须一个一个来；
+# 录制回放需要独占前台鼠标键盘，必须一个一个来；
+# 疲劳检测已改成纯后台 PostMessage 点击，不再需要排队抢前台。
 # 多个窗口同时请求时，按每个窗口设置的优先级决定谁先执行。
 class ForegroundArbiter:
     def __init__(self, coalesce_seconds: float = 0.8) -> None:
@@ -672,11 +673,8 @@ class SlotRunner(QObject):
         # 回血请求排队期间不要再插前台检测，避免抢走 heal 的优先级
         if self._heal_pending or self._playing_heal:
             return
-        if self.config.get("background"):
-            self._do_check_fatigue()
-            return
-        if not self._request_foreground("monitor"):
-            return
+        # 疲劳检测点击已改为纯后台 PostMessage（不移动鼠标、不抢前台），
+        # 无论是否勾选后台模式都不再借前台。
         self._do_check_fatigue()
 
     def _do_check_fatigue(self) -> None:
@@ -706,7 +704,8 @@ class SlotRunner(QObject):
                 self.hwnd,
                 roi_norm,
                 one_shot=True,
-                background=bool(self.config.get("background")),
+                background=True,
+                borrow_mouse=bool(self.config.get("borrow_mouse")),
                 parent=self,
             )
         except Exception as exc:
