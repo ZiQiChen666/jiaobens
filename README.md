@@ -1,4 +1,4 @@
-# CreatureCurios 后台按键器 v3.9.1
+# CreatureCurios 后台按键器 v3.9.2
 
 Windows 桌面小工具：绑定 `CreatureCurios` 窗口后，在后台循环投递 `A`
 （可选空格拾取），可选技能、喝药、疲劳检测、定时提醒，支持**自动打BOSS**、**后台回放（不抢鼠标键盘）**，
@@ -528,6 +528,21 @@ python -m PyInstaller --noconfirm --clean CreatureCuriosKeyer.spec
 
 弹窗识别用**锚点相似度**（不用 OCR、不吃 CPU），4 开也不卡；血量才用 OCR，
 而且只有框了血量区域才会去读。
+
+### 进本（走到副本口却不进去？）
+
+进本这一步现在有三层保险：
+
+1. **可选「副本门口/NPC」点**：有的游戏走到门口还要点一下传送门/NPC 才弹窗 ——
+   标上这个点，程序到门口会先点它一次；
+2. **放宽阈值二次识别**：严格阈值没匹配到弹窗时，会把相似度自动放宽 0.2 再看 6 秒
+   （应对弹窗淡入/闪烁）；
+3. **兜底盲点**：还是没识别到，就照着你标的「进入游戏」按钮点一次，
+   同时存一张截图到 `%APPDATA%\CreatureCuriosKeyer
+   同时存一张截图到 `%APPDATA%\CreatureCuriosKeyer\runs\enter_dialog_miss_*.png`，
+   方便回看当时画面。
+
+失败会整轮重试（重新开图再点副本入口），日志都会写清楚卡在哪一步。
 
 ### 骑乘检查（每次寻路前按 S）
 

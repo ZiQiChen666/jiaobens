@@ -542,6 +542,7 @@ class DungeonTab(QWidget):
         self.btn_pt = {}
         items = [
             ("dungeon_pt", "① 副本入口（地图1）", "map"),
+            ("entry_pt", "① 副本门口/NPC（可选，走到后点它）", "shot"),
             ("enter_confirm", "① 弹窗「进入游戏」按钮", "shot"),
             ("farm_pt", "② 打怪点（地图2，在这里读疲劳）", "map"),
             ("boss_pt", "② BOSS 点（地图2）", "map"),
@@ -568,36 +569,37 @@ class DungeonTab(QWidget):
         btn_dialog.clicked.connect(self._pick_dialog)
         self.lbl_dialog = QLabel("未设置")
         self.lbl_dialog.setObjectName("muted")
-        g.addWidget(QLabel("① 进本弹窗识别区域（区分「进入游戏」弹窗）"), 8, 0)
-        g.addWidget(self.lbl_dialog, 8, 1)
-        g.addWidget(btn_dialog, 8, 2)
+        row0 = len(items) + 1
+        g.addWidget(QLabel("① 进本弹窗识别区域（区分「进入游戏」弹窗）"), row0, 0)
+        g.addWidget(self.lbl_dialog, row0, 1)
+        g.addWidget(btn_dialog, row0, 2)
 
         btn_exit_dialog = QPushButton("框选")
         btn_exit_dialog.setFixedWidth(72)
         btn_exit_dialog.clicked.connect(self._pick_exit_dialog)
         self.lbl_exit_dialog = QLabel("未设置")
         self.lbl_exit_dialog.setObjectName("muted")
-        g.addWidget(QLabel("③ 退出确认弹窗识别区域（区分「确认退出」弹窗）"), 9, 0)
-        g.addWidget(self.lbl_exit_dialog, 9, 1)
-        g.addWidget(btn_exit_dialog, 9, 2)
+        g.addWidget(QLabel("③ 退出确认弹窗识别区域（区分「确认退出」弹窗）"), row0 + 1, 0)
+        g.addWidget(self.lbl_exit_dialog, row0 + 1, 1)
+        g.addWidget(btn_exit_dialog, row0 + 1, 2)
 
         btn_mount_dialog = QPushButton("框选")
         btn_mount_dialog.setFixedWidth(72)
         btn_mount_dialog.clicked.connect(lambda: self._pick_mount_roi("dialog"))
         self.lbl_mount_dialog = QLabel("未设置")
         self.lbl_mount_dialog.setObjectName("muted")
-        g.addWidget(QLabel("⑤ 骑乘弹窗区域（按 S 弹出来的窗）"), 10, 0)
-        g.addWidget(self.lbl_mount_dialog, 10, 1)
-        g.addWidget(btn_mount_dialog, 10, 2)
+        g.addWidget(QLabel("⑤ 骑乘弹窗区域（按 S 弹出来的窗）"), row0 + 2, 0)
+        g.addWidget(self.lbl_mount_dialog, row0 + 2, 1)
+        g.addWidget(btn_mount_dialog, row0 + 2, 2)
 
         btn_mount_state = QPushButton("框选")
         btn_mount_state.setFixedWidth(72)
         btn_mount_state.clicked.connect(lambda: self._pick_mount_roi("state"))
         self.lbl_mount_state = QLabel("未设置")
         self.lbl_mount_state.setObjectName("muted")
-        g.addWidget(QLabel("⑤ 骑乘状态标记（看图能判断「已骑乘」的那块）"), 11, 0)
-        g.addWidget(self.lbl_mount_state, 11, 1)
-        g.addWidget(btn_mount_state, 11, 2)
+        g.addWidget(QLabel("⑤ 骑乘状态标记（看图能判断「已骑乘」的那块）"), row0 + 3, 0)
+        g.addWidget(self.lbl_mount_state, row0 + 3, 1)
+        g.addWidget(btn_mount_state, row0 + 3, 2)
         return box
 
     def _build_farm(self) -> QWidget:
@@ -944,6 +946,7 @@ class DungeonTab(QWidget):
                 "fatigue_pt": ((p.get("fatigue") or {}).get("pt"), "④ 疲劳图标"),
                 "farm_pt": (farm.get("farm_pt"), "② 打怪点"),
                 "mount_pt": ((p.get("mount") or {}).get("mount_pt"), "⑤ 骑乘按钮"),
+                "entry_pt": (enter.get("entry_pt"), "① 副本门口/NPC"),
             }
             for key, (pt, _name) in states.items():
                 lbl = self.lbl_pt[key]
@@ -1065,6 +1068,8 @@ class DungeonTab(QWidget):
             "fatigue_pt": "点一下游戏里那个能弹出疲劳值的图标/按钮位置。",
             "farm_pt": "打开地图2（副本地图），点一下「打怪点」位置（在这里读疲劳）。",
             "mount_pt": "按 S 打开骑乘窗口，点一下里面的「骑乘」按钮。",
+            "entry_pt": ("可选：走到副本门口后，如果还要点一下传送门/NPC 才弹窗，"
+                         "把那个位置点上（不标就直接等弹窗）。"),
         }.get(key, "")
         if kind == "map":
             info += chr(10) + f"（点「重新截图」会先按一次开图键「{map_key}」）"
@@ -1086,6 +1091,8 @@ class DungeonTab(QWidget):
             current = (p.get("farm") or {}).get("farm_pt")
         elif key == "mount_pt":
             current = (p.get("mount") or {}).get("mount_pt")
+        elif key == "entry_pt":
+            current = (p.get("enter") or {}).get("entry_pt")
 
         pt = pick_point(self, hwnd, title, info, open_key, current)
         if not pt:
@@ -1106,6 +1113,8 @@ class DungeonTab(QWidget):
             p.setdefault("farm", {})["farm_pt"] = pt
         elif key == "mount_pt":
             p.setdefault("mount", {})["mount_pt"] = pt
+        elif key == "entry_pt":
+            p.setdefault("enter", {})["entry_pt"] = pt
         self._save()
         self._load_ui()
         self._log(f"已设置：{title} → {pt}")

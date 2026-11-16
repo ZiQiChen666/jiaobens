@@ -18,6 +18,7 @@ PT_BOSS = (0.70, 0.40)
 PT_EXIT = (0.94, 0.05)
 PT_EXIT_OK = (0.55, 0.68)
 PT_FATIGUE = (0.10, 0.90)
+PT_ENTRY = (0.50, 0.80)   # 副本门口/NPC
 ROI_ENTER = [0.32, 0.20, 0.36, 0.16]   # 进本弹窗：x 64..136, y 24..43
 ROI_EXIT = [0.32, 0.60, 0.36, 0.16]    # 退出弹窗：x 64..136, y 72..91
 ROI_MOUNT = [0.02, 0.02, 0.28, 0.16]   # 骑乘弹窗：x 4..60, y 2..21
@@ -41,7 +42,8 @@ def make_frame(enter_dialog=False, exit_dialog=False,
 
 
 class FakeGame:
-    def __init__(self, enter_appears=True, exit_appears=True):
+    def __init__(self, enter_appears=True, exit_appears=True,
+                 need_entry_click=False):
         self.t = 0.0
         self.actions = []
         self.last_error = ""
@@ -49,6 +51,8 @@ class FakeGame:
                       "mount_dialog": False, "mounted": False}
         self.enter_appears = enter_appears
         self.exit_appears = exit_appears
+        self.need_entry_click = need_entry_click
+        self.entry_clicked = False
         self.enter_popup_at = None
         self.confirm_at = None
         self.confirm_count = 0
@@ -71,9 +75,14 @@ class FakeGame:
     def click_norm(self, point):
         pt = tuple(round(float(v), 3) for v in point)
         self.actions.append(("click", pt))
-        if pt == PT_DUNGEON and self.enter_appears:
+        if pt == PT_DUNGEON and self.enter_appears and not self.need_entry_click:
             self.state["enter"] = True
             self.enter_popup_at = self.t
+        elif pt == PT_ENTRY:
+            self.entry_clicked = True
+            if self.need_entry_click and self.enter_appears:
+                self.state["enter"] = True
+                self.enter_popup_at = self.t
         elif pt == PT_CONFIRM or pt == PT_EXIT_OK:
             if pt == PT_CONFIRM:
                 self.state["enter"] = False
@@ -464,6 +473,65 @@ r16.decide_action = lambda: "farm"
 r16.run_loops()
 clicks16 = [a[1] for a in game16.actions if a[0] == "click"]
 check("fatigue_every=0 时不换分支", PT_BOSS not in clicks16, str(clicks16[-6:]))
+
+# ---- 11c) 进本：门口点 / 放宽阈值 / 兜底 ----------------------------
+p17 = build_profile()
+p17["mount"]["enabled"] = False
+p17["enter"]["entry_pt"] = list(PT_ENTRY)
+game17 = FakeGame(need_entry_click=True)
+logs17 = []
+r17 = df.DungeonRunner(game17, p17, log=logs17.append)
+ok17 = r17.enter_dungeon()
+clicks17 = [a[1] for a in game17.actions if a[0] == "click"]
+check("需要点门口才弹窗时：点了门口", PT_ENTRY in clicks17, str(clicks17))
+check("需要点门口才弹窗时：成功进本", ok17 is True)
+check("进本日志提到门口点", any("副本门口" in l for l in logs17), str(logs17[-4:]))
+
+# 放宽阈值：把 sim 设成 1.0（严格），实测相似度略低 → 严识别失败，放宽后命中
+p18 = build_profile()
+p18["mount"]["enabled"] = False
+p18["enter"]["dialog"]["sim"] = 1.0
+game18 = FakeGame()
+logs18 = []
+r18 = df.DungeonRunner(game18, p18, log=logs18.append)
+
+_real_wait = r18._wait_dialog
+def fake_wait(timeout, poll, sim=None, desc="进本弹窗"):
+    if sim is None:
+        return False          # 严格阈值假装没匹配到
+    return True               # 放宽后命中
+r18._wait_dialog = fake_wait
+ok18 = r18.enter_dungeon()
+clicks18 = [a[1] for a in game18.actions if a[0] == "click"]
+check("严格阈值失败 → 放宽阈值后仍能进本",
+      ok18 is True and PT_CONFIRM in clicks18, str(clicks18))
+check("放宽阈值有日志", any("放宽" in l for l in logs18), str(logs18[-4:]))
+
+# 兜底：识别不到弹窗也要点一次「进入游戏」
+p19 = build_profile()
+p19["mount"]["enabled"] = False
+game19 = FakeGame(enter_appears=False)
+logs19 = []
+r19 = df.DungeonRunner(game19, p19, log=logs19.append)
+r19._wait_dialog = lambda *a, **k: False
+ok19 = r19.enter_dungeon()
+clicks19 = [a[1] for a in game19.actions if a[0] == "click"]
+check("识别不到弹窗 → 兜底点一次「进入游戏」", PT_CONFIRM in clicks19, str(clicks19))
+check("兜底有日志说明", any("兜底点一次" in l for l in logs19), str(logs19[-5:]))
+check("兜底也会存截图", any(a[0] == "snap" for a in game19.actions))
+
+# 骑乘没标区域时，不应该按 S
+p20 = build_profile()
+p20["mount"] = {"enabled": True, "key": "s", "dialog": {"roi": None, "sig": []},
+                "state": {"roi": None, "sig": []}, "mount_pt": None}
+game20 = FakeGame()
+logs20 = []
+r20 = df.DungeonRunner(game20, p20, log=logs20.append)
+r20.ensure_mount()
+check("骑乘没标区域 → 不按 S",
+      not any(a == ("tap", "s") for a in game20.actions), str(game20.actions[:4]))
+check("骑乘没标区域 → 有日志说明",
+      any("没标骑乘区域" in l for l in logs20), str(logs20))
 
 # ---- 12) 保存要包含所有参数（轮数/循环/骑乘）-------------------------
 p14 = build_profile()

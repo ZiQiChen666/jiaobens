@@ -48,6 +48,8 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     if answers.get("confirm_pt"):
         enter["confirm_pt"] = [round(float(v), 5) for v in answers["confirm_pt"]]
     enter["load_wait"] = float(answers.get("load_wait") or 10.0)
+    if answers.get("entry_pt"):
+        enter["entry_pt"] = [round(float(v), 5) for v in answers["entry_pt"]]
 
     farm = p.setdefault("farm", {})
     if answers.get("boss_pt"):
@@ -193,6 +195,7 @@ class DungeonWizard(QDialog):
             "entry_wait": float(enter.get("travel_wait", 40.0)),
             "dialog_timeout": float(enter.get("dialog_timeout", 20.0)),
             "retry": int(enter.get("retry", 3) or 3),
+            "entry_pt": enter.get("entry_pt"),
             "confirm_pt": enter.get("confirm_pt"),
             "load_wait": float(enter.get("load_wait", 10.0)),
             "boss_pt": farm.get("boss_pt"),
@@ -414,6 +417,15 @@ class DungeonWizard(QDialog):
         row2.addWidget(self.lbl_confirm, 1)
         lay.addLayout(row2)
 
+        row2b = QHBoxLayout()
+        btn_entry = QPushButton("可选：点「副本门口/NPC」的位置")
+        btn_entry.setToolTip("有的游戏走到门口还要点一下传送门/NPC 才弹窗；没有就跳过")
+        btn_entry.clicked.connect(self._pick_entry_pt)
+        self.lbl_entry_pt = QLabel(self._pt_text(self.answers.get("entry_pt")))
+        row2b.addWidget(btn_entry)
+        row2b.addWidget(self.lbl_entry_pt, 1)
+        lay.addLayout(row2b)
+
         row3 = QHBoxLayout()
         row3.addWidget(QLabel("等弹窗最多"))
         self.spin_dialog_timeout = self._dspin(3.0, 300.0, self.answers["dialog_timeout"])
@@ -448,6 +460,12 @@ class DungeonWizard(QDialog):
                            "进本弹窗区域",
                            "框住弹窗里固定不变的部分（标题/按钮区），别框会闪的动画"):
             self._refresh_dialog_state()
+
+    def _pick_entry_pt(self) -> None:
+        self._pick_point("entry_pt", "点「副本门口/NPC」",
+                         "走到副本门口后还要点一下的那个传送门/NPC 位置（可选）。",
+                         False)
+        self.lbl_entry_pt.setText(self._pt_text(self.answers.get("entry_pt")))
 
     def _pick_confirm(self) -> None:
         self._pick_point("confirm_pt", "点「进入游戏」按钮",
