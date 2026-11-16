@@ -75,7 +75,18 @@ DEFAULT_PROFILE: dict = {
         "load_wait": 10.0,         # 点完确认后的加载时间
         "retry": 3,                # 没识别到弹窗 → 重新开图重点，最多几次
     },
+    "mount": {
+        "enabled": True,           # 每次寻路前按一下 S，检查宠物是否骑乘
+        "key": "s",
+        "dialog": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},  # 骑乘弹窗
+        "state": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},   # 已骑乘标记
+        "mount_pt": None,          # 未骑乘时点这个「骑乘」按钮
+        "wait": 4.0,               # 等骑乘弹窗出现
+        "settle": 1.2,             # 点完骑乘等多久
+        "close_key": "",           # 关弹窗的键（空 = 再按一次 key）
+    },
     "farm": {
+        "farm_pt": None,           # 地图2 上的「打怪点」[nx, ny]（在这里判断疲劳）
         "boss_pt": None,           # 地图2 上的 BOSS 点 [nx, ny]
         "travel_wait": 30.0,       # 点完后等自动寻路到 BOSS 附近
         "seconds": 30.0,           # 挂机多久（多开时每个窗口可不同）
@@ -89,6 +100,13 @@ DEFAULT_PROFILE: dict = {
         "potion_keys": ["q", "w"],
         "potion_every": 6.0,       # 喝药间隔（低于阈值时每 6 秒喝一次）
         "pickup_every": 8.0,       # 挂机期间每隔几秒按一次拾取
+    },
+    "loop": {
+        "trash_seconds": 60.0,     # 打怪循环：打多久
+        "trash_rounds": 1,         # 打怪循环：打几轮
+        "boss_seconds": 30.0,      # BOSS 循环：每只打多久
+        "boss_rounds": 1,          # BOSS 循环：打几只
+        "default_action": "boss",  # 疲劳在中间区间时做哪个：boss / farm
     },
     "exit": {
         "exit_pt": None,           # 「退出副本」按钮（第一下）[nx, ny]
@@ -633,6 +651,55 @@ class DungeonRunner:
             out["hp"] = hp
         return out
 
+    # -- 骑乘检查 --
+    def mount_ok(self) -> bool:
+        """看当前帧的「骑乘状态」区域：True=已骑乘。"""
+        cfg = self.p.get("mount") or {}
+        spec = cfg.get("state") or {}
+        if not (spec or {}).get("roi"):
+            return True  # 没标「骑乘状态」就当已经骑好了
+        frame = self.grab()
+        if frame is None:
+            return True
+        return self.anchor_visible(spec, frame)
+
+    def ensure_mount(self) -> None:
+        """每次寻路前按一下 S，看宠物是否骑乘；没骑就点「骑乘」再关弹窗。"""
+        cfg = self.p.get("mount") or {}
+        if not cfg.get("enabled", True):
+            return
+        key = str(cfg.get("key") or "s")
+        close_key = str(cfg.get("close_key") or key)
+        dialog = cfg.get("dialog") or {}
+        poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
+        self.log(f"按「{key}」检查宠物骑乘状态")
+        self.game.tap(key)
+        appeared = False
+        if (dialog or {}).get("roi"):
+            appeared = self.wait_anchor(
+                dialog, float(cfg.get("wait", 4.0)), poll, "骑乘弹窗"
+            )
+            if not appeared:
+                self.log("没识别到骑乘弹窗，跳过骑乘检查")
+                return
+        else:
+            self.game.sleep(1.0)
+
+        mounted = self.mount_ok()
+        self.log("骑乘状态：" + ("已骑乘 ✓" if mounted else "未骑乘 ✗"))
+        if not mounted:
+            mount_pt = cfg.get("mount_pt")
+            if mount_pt:
+                self.log("点「骑乘」按钮")
+                self.game.click_norm(mount_pt)
+                self.game.sleep(float(cfg.get("settle", 1.2)))
+                self.log("骑乘后状态：" + ("已骑乘 ✓" if self.mount_ok() else "仍未骑乘"))
+            else:
+                self.log("没标「骑乘」按钮，无法自动骑乘")
+        # 关掉弹窗
+        self.game.tap(close_key)
+        self.game.sleep(0.6)
+
     # -- 动作 --
     def open_map(self) -> None:
         key = self._key("open_map", "m")
@@ -644,6 +711,7 @@ class DungeonRunner:
         if not point:
             self.log(f"「{desc}」没有标定，跳过")
             return False
+        self.ensure_mount()
         self.log(f"点「{desc}」({float(point[0]):.3f}, {float(point[1]):.3f})"
                  f" → 等自动寻路 {wait:.0f}s")
         self.open_map()
@@ -698,6 +766,59 @@ class DungeonRunner:
     def _wait_dialog(self, timeout: float, poll: float) -> bool:
         """等进本弹窗出现。"""
         return self.wait_anchor(self.enter_dialog_spec(), timeout, poll, "进本弹窗")
+
+    # -- ② 打怪点：看疲劳决定去 BOSS 还是打怪 --
+    def decide_action(self) -> str:
+        """在打怪点读疲劳：< -阈值 打BOSS；> +阈值 打怪；中间用默认。"""
+        cfg = self.p.get("fatigue") or {}
+        loop = self.p.get("loop") or {}
+        default = str(loop.get("default_action") or "boss")
+        if not cfg.get("enabled", True):
+            return default
+        current, maximum, msg = self.fatigue_check()
+        if current is None:
+            self.log(f"疲劳读不到（{msg}），按默认做：{default}")
+            return default
+        threshold = abs(int(cfg.get("threshold", 800) or 0))
+        self.log(f"当前疲劳 {current}/{maximum}（阈值 ±{threshold}）")
+        if threshold and current < -threshold:
+            self.log(f"疲劳 {current} < -{threshold} → 循环打 BOSS")
+            return "boss"
+        if threshold and current > threshold:
+            self.log(f"疲劳 {current} > +{threshold} → 循环打怪")
+            return "farm"
+        self.log(f"疲劳在 ±{threshold} 之间 → 按默认做：{default}")
+        return default
+
+    def run_loops(self) -> bool:
+        """按 decide_action 的结果跑循环。"""
+        farm = self._farm()
+        loop = self.p.get("loop") or {}
+        action = self.decide_action()
+        if action == "boss":
+            rounds = max(1, int(loop.get("boss_rounds", 1) or 1))
+            seconds = float(loop.get("boss_seconds", farm.get("seconds", 30.0)) or 30.0)
+            for idx in range(1, rounds + 1):
+                if self._stopping():
+                    return False
+                if not self._goto(farm.get("boss_pt"),
+                                  float(farm.get("travel_wait", 30.0)),
+                                  f"BOSS 点({idx}/{rounds})"):
+                    return False
+                if not self.combat(seconds, desc=f"打BOSS{idx}/{rounds}"):
+                    return False
+        else:
+            rounds = max(1, int(loop.get("trash_rounds", 1) or 1))
+            seconds = float(loop.get("trash_seconds", 60.0) or 60.0)
+            if not self._goto(farm.get("farm_pt"),
+                              float(farm.get("travel_wait", 30.0)), "打怪点"):
+                self.log("没标「打怪点」，就在原地打")
+            for idx in range(1, rounds + 1):
+                if self._stopping():
+                    return False
+                if not self.combat(seconds, desc=f"打怪{idx}/{rounds}"):
+                    return False
+        return True
 
     # -- ② BOSS 点挂机 --
     def farm_at_boss(self, seconds: Optional[float] = None) -> bool:
@@ -875,11 +996,20 @@ class DungeonRunner:
                 pass
         if not self.enter_dungeon():
             return self._failed("进本失败")
-        if not self.farm_at_boss(seconds):
-            return self._failed("没走到 BOSS 点")
+        farm = self._farm()
+        # 先到「打怪点」，在那里读疲劳决定做什么
+        if farm.get("farm_pt"):
+            if not self._goto(farm.get("farm_pt"),
+                              float(farm.get("travel_wait", 30.0)), "打怪点"):
+                return self._failed("没走到打怪点")
+        if seconds is not None:
+            # 命令行 --farm-seconds：直接按固定时长打 BOSS 点（老行为）
+            if not self.farm_at_boss(seconds):
+                return self._failed("没走到 BOSS 点")
+        elif not self.run_loops():
+            return self._failed("打怪/BOSS 循环失败")
         if not self.exit_dungeon():
             return self._failed("退出副本失败")
-        self.after_exit_fatigue()
         return True
 
     def _failed(self, reason: str) -> bool:

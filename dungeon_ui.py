@@ -160,6 +160,11 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
         profile.setdefault("farm", {})["hp_roi"] = roi_norm
     elif where == "fatigue.roi":
         profile.setdefault("fatigue", {})["roi"] = roi_norm
+    elif where in ("mount.dialog", "mount.state"):
+        sig = df.signature(df.crop_norm(f, roi_norm), 12)
+        profile.setdefault("mount", {})[where.split(".")[1]] = {
+            "roi": roi_norm, "grid": 12, "sig": sig, "sim": 0.90,
+        }
     elif where == "exit.dialog":
         sig = df.signature(df.crop_norm(f, roi_norm), 12)
         profile.setdefault("exit", {})["dialog"] = {
@@ -538,10 +543,12 @@ class DungeonTab(QWidget):
         items = [
             ("dungeon_pt", "① 副本入口（地图1）", "map"),
             ("enter_confirm", "① 弹窗「进入游戏」按钮", "shot"),
+            ("farm_pt", "② 打怪点（地图2，在这里读疲劳）", "map"),
             ("boss_pt", "② BOSS 点（地图2）", "map"),
             ("exit_pt", "③「退出副本」按钮（第一下）", "shot"),
             ("exit_confirm", "③「确认」按钮（第二下）", "shot"),
             ("fatigue_pt", "④ 疲劳图标（点一下弹疲劳值）", "shot"),
+            ("mount_pt", "⑤「骑乘」按钮（未骑乘时点它）", "shot"),
         ]
         for i, (key, title, kind) in enumerate(items):
             btn = QPushButton("设置")
@@ -570,9 +577,27 @@ class DungeonTab(QWidget):
         btn_exit_dialog.clicked.connect(self._pick_exit_dialog)
         self.lbl_exit_dialog = QLabel("未设置")
         self.lbl_exit_dialog.setObjectName("muted")
-        g.addWidget(QLabel("③ 退出确认弹窗识别区域（区分「确认退出」弹窗）"), 7, 0)
-        g.addWidget(self.lbl_exit_dialog, 7, 1)
-        g.addWidget(btn_exit_dialog, 7, 2)
+        g.addWidget(QLabel("③ 退出确认弹窗识别区域（区分「确认退出」弹窗）"), 8, 0)
+        g.addWidget(self.lbl_exit_dialog, 8, 1)
+        g.addWidget(btn_exit_dialog, 8, 2)
+
+        btn_mount_dialog = QPushButton("框选")
+        btn_mount_dialog.setFixedWidth(72)
+        btn_mount_dialog.clicked.connect(lambda: self._pick_mount_roi("dialog"))
+        self.lbl_mount_dialog = QLabel("未设置")
+        self.lbl_mount_dialog.setObjectName("muted")
+        g.addWidget(QLabel("⑤ 骑乘弹窗区域（按 S 弹出来的窗）"), 9, 0)
+        g.addWidget(self.lbl_mount_dialog, 9, 1)
+        g.addWidget(btn_mount_dialog, 9, 2)
+
+        btn_mount_state = QPushButton("框选")
+        btn_mount_state.setFixedWidth(72)
+        btn_mount_state.clicked.connect(lambda: self._pick_mount_roi("state"))
+        self.lbl_mount_state = QLabel("未设置")
+        self.lbl_mount_state.setObjectName("muted")
+        g.addWidget(QLabel("⑤ 骑乘状态标记（看图能判断「已骑乘」的那块）"), 10, 0)
+        g.addWidget(self.lbl_mount_state, 10, 1)
+        g.addWidget(btn_mount_state, 10, 2)
         return box
 
     def _build_farm(self) -> QWidget:
@@ -654,9 +679,44 @@ class DungeonTab(QWidget):
         self.spin_rounds = QSpinBox()
         self.spin_rounds.setRange(0, 9999)
         self.spin_rounds.setFixedWidth(80)
+        self.spin_rounds.valueChanged.connect(self._save_from_ui)
         row.addWidget(self.spin_rounds)
+        row.addWidget(QLabel("骑乘键"))
+        self.edit_mount_key = QLineEdit()
+        self.edit_mount_key.setFixedWidth(44)
+        self.edit_mount_key.editingFinished.connect(self._save_from_ui)
+        row.addWidget(self.edit_mount_key)
+        self.chk_mount = QCheckBox("每次寻路前按 S 检查骑乘")
+        self.chk_mount.setChecked(True)
+        self.chk_mount.toggled.connect(self._save_from_ui)
+        row.addWidget(self.chk_mount)
         row.addStretch(1)
         g.addLayout(row, 3, 0, 1, 8)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("疲劳 < -阈值 打BOSS"))
+        self.spin_boss_seconds = self._dspin(5.0, 600.0, 30.0, None, 0, 0)
+        row2.addWidget(self.spin_boss_seconds)
+        row2.addWidget(QLabel("秒 ×"))
+        self.spin_boss_rounds = QSpinBox()
+        self.spin_boss_rounds.setRange(1, 99)
+        self.spin_boss_rounds.setFixedWidth(60)
+        self.spin_boss_rounds.valueChanged.connect(self._save_from_ui)
+        row2.addWidget(self.spin_boss_rounds)
+        row2.addWidget(QLabel("只"))
+        row2.addSpacing(16)
+        row2.addWidget(QLabel("疲劳 > +阈值 打怪"))
+        self.spin_trash_seconds = self._dspin(5.0, 1800.0, 60.0, None, 0, 0)
+        row2.addWidget(self.spin_trash_seconds)
+        row2.addWidget(QLabel("秒 ×"))
+        self.spin_trash_rounds = QSpinBox()
+        self.spin_trash_rounds.setRange(1, 99)
+        self.spin_trash_rounds.setFixedWidth(60)
+        self.spin_trash_rounds.valueChanged.connect(self._save_from_ui)
+        row2.addWidget(self.spin_trash_rounds)
+        row2.addWidget(QLabel("轮"))
+        row2.addStretch(1)
+        g.addLayout(row2, 4, 0, 1, 8)
         return box
 
     def _dspin(self, low: float, high: float, value: float,
@@ -667,7 +727,8 @@ class DungeonTab(QWidget):
         spin.setValue(value)
         spin.setFixedWidth(100)
         spin.valueChanged.connect(self._save_from_ui)
-        grid.addWidget(spin, row, col)
+        if grid is not None:
+            grid.addWidget(spin, row, col)
         return spin
 
     def _build_exit(self) -> QWidget:
@@ -797,8 +858,14 @@ class DungeonTab(QWidget):
         self.log.appendPlainText(f"[{datetime.datetime.now():%H:%M:%S}] {text}")
 
     def _save(self) -> None:
+        """有命名的副本方案就存进那个方案（这样“默认就是那个副本”），
+        否则写默认标定文件。"""
         try:
-            df.save_profile(self.profile)
+            name = df.active_name()
+            if name:
+                df.save_dungeon(name, self.profile)
+            else:
+                df.save_profile(self.profile)
         except Exception as exc:
             self._log(f"[警告] 保存失败：{exc}")
 
@@ -831,6 +898,25 @@ class DungeonTab(QWidget):
             self.spin_potion.setValue(float(farm.get("potion_every", 6.0)))
             self.spin_pickup.setValue(float(farm.get("pickup_every", 8.0)))
             self.chk_skills.setChecked(bool(farm.get("use_skills", True)))
+            mount = p.get("mount") or {}
+            loop = p.get("loop") or {}
+            self.chk_mount.setChecked(bool(mount.get("enabled", True)))
+            self.edit_mount_key.setText(str(mount.get("key", "s")))
+            self.spin_boss_seconds.setValue(float(loop.get("boss_seconds", 30.0)))
+            self.spin_boss_rounds.setValue(int(loop.get("boss_rounds", 1) or 1))
+            self.spin_trash_seconds.setValue(float(loop.get("trash_seconds", 60.0)))
+            self.spin_trash_rounds.setValue(int(loop.get("trash_rounds", 1) or 1))
+            self.spin_rounds.setValue(int((p.get("retry") or {}).get("rounds", 0) or 0))
+            for name, spec, label in (
+                ("骑乘弹窗", mount.get("dialog") or {}, self.lbl_mount_dialog),
+                ("骑乘状态", mount.get("state") or {}, self.lbl_mount_state),
+            ):
+                if (spec or {}).get("roi"):
+                    label.setText("已设置 ✓")
+                    label.setStyleSheet("color: #15803d; font-weight: 600;")
+                else:
+                    label.setText("未设置")
+                    label.setStyleSheet("color: #444444;")
             self.chk_foreground.setChecked(
                 str(p.get("input_mode", "foreground")) != "background"
             )
@@ -850,6 +936,8 @@ class DungeonTab(QWidget):
                 "exit_pt": (exit_cfg.get("exit_pt"), "③ 退出副本"),
                 "exit_confirm": (exit_cfg.get("confirm_pt"), "③ 确认"),
                 "fatigue_pt": ((p.get("fatigue") or {}).get("pt"), "④ 疲劳图标"),
+                "farm_pt": (farm.get("farm_pt"), "② 打怪点"),
+                "mount_pt": ((p.get("mount") or {}).get("mount_pt"), "⑤ 骑乘按钮"),
             }
             for key, (pt, _name) in states.items():
                 lbl = self.lbl_pt[key]
@@ -915,6 +1003,17 @@ class DungeonTab(QWidget):
             "threshold": int(self.spin_fatigue.value()),
             "farm_seconds": float(self.spin_fatigue_farm.value()),
         })
+        p.setdefault("mount", {}).update({
+            "enabled": bool(self.chk_mount.isChecked()),
+            "key": self.edit_mount_key.text().strip() or "s",
+        })
+        p.setdefault("loop", {}).update({
+            "boss_seconds": float(self.spin_boss_seconds.value()),
+            "boss_rounds": int(self.spin_boss_rounds.value()),
+            "trash_seconds": float(self.spin_trash_seconds.value()),
+            "trash_rounds": int(self.spin_trash_rounds.value()),
+        })
+        p.setdefault("retry", {})["rounds"] = int(self.spin_rounds.value())
         p["input_mode"] = "foreground" if self.chk_foreground.isChecked() else "background"
         p.setdefault("retry", {})["gap"] = float(self.spin_gap.value())
         self._save()
@@ -957,6 +1056,8 @@ class DungeonTab(QWidget):
             "exit_pt": "在副本里打开退出菜单，点「退出副本」按钮。",
             "exit_confirm": "把确认弹窗显示出来，点「确认/确定」按钮（第二下）。",
             "fatigue_pt": "点一下游戏里那个能弹出疲劳值的图标/按钮位置。",
+            "farm_pt": "打开地图2（副本地图），点一下「打怪点」位置（在这里读疲劳）。",
+            "mount_pt": "按 S 打开骑乘窗口，点一下里面的「骑乘」按钮。",
         }.get(key, "")
         if kind == "map":
             info += chr(10) + f"（点「重新截图」会先按一次开图键「{map_key}」）"
@@ -974,6 +1075,10 @@ class DungeonTab(QWidget):
             current = (p.get("exit") or {}).get("confirm_pt")
         elif key == "fatigue_pt":
             current = (p.get("fatigue") or {}).get("pt")
+        elif key == "farm_pt":
+            current = (p.get("farm") or {}).get("farm_pt")
+        elif key == "mount_pt":
+            current = (p.get("mount") or {}).get("mount_pt")
 
         pt = pick_point(self, hwnd, title, info, open_key, current)
         if not pt:
@@ -990,6 +1095,10 @@ class DungeonTab(QWidget):
             p.setdefault("exit", {})["confirm_pt"] = pt
         elif key == "fatigue_pt":
             p.setdefault("fatigue", {})["pt"] = pt
+        elif key == "farm_pt":
+            p.setdefault("farm", {})["farm_pt"] = pt
+        elif key == "mount_pt":
+            p.setdefault("mount", {})["mount_pt"] = pt
         self._save()
         self._load_ui()
         self._log(f"已设置：{title} → {pt}")
@@ -1006,6 +1115,23 @@ class DungeonTab(QWidget):
         ):
             self._load_ui()
             self._log("已设置：进本弹窗识别区域")
+
+    def _pick_mount_roi(self, which: str) -> None:
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有绑定窗口", "请先绑定游戏窗口。")
+            return
+        if which == "dialog":
+            title = "骑乘弹窗区域"
+            info = ("按 S 把骑乘窗口弹出来再截图，框住这个弹窗里固定不变的部分"
+                    "（用来判断「按 S 后弹窗出来了没有」）")
+        else:
+            title = "骑乘状态标记"
+            info = ("在弹窗里框住「已骑乘时才有的那块」（坐骑头像/骑乘字样），"
+                    "程序用它判断是不是已经骑上了")
+        if pick_region(self, hwnd, self.profile, f"mount.{which}", title, info):
+            self._load_ui()
+            self._log(f"已设置：{title}")
 
     def _pick_exit_dialog(self) -> None:
         hwnd = self._hwnd()

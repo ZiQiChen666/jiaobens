@@ -20,15 +20,23 @@ PT_EXIT_OK = (0.55, 0.68)
 PT_FATIGUE = (0.10, 0.90)
 ROI_ENTER = [0.32, 0.20, 0.36, 0.16]   # 进本弹窗：x 64..136, y 24..43
 ROI_EXIT = [0.32, 0.60, 0.36, 0.16]    # 退出弹窗：x 64..136, y 72..91
+ROI_MOUNT = [0.02, 0.02, 0.28, 0.16]   # 骑乘弹窗：x 4..60, y 2..21
+ROI_MOUNT_STATE = [0.02, 0.70, 0.22, 0.14]  # 骑乘状态：x 4..48, y 84..100
+PT_MOUNT = (0.50, 0.20)
 
 
-def make_frame(enter_dialog=False, exit_dialog=False):
+def make_frame(enter_dialog=False, exit_dialog=False,
+               mount_dialog=False, mounted=False):
     arr = np.full((H, W, 4), 40, np.uint8)
     arr[..., 3] = 255
     if enter_dialog:
         arr[26:41, 70:130] = [60, 120, 220, 255]
     if exit_dialog:
         arr[74:89, 70:130] = [220, 90, 60, 255]
+    if mount_dialog:
+        arr[4:19, 8:56] = [120, 200, 90, 255]
+    if mounted:
+        arr[86:98, 8:44] = [250, 220, 60, 255]
     return (W, H, arr.tobytes())
 
 
@@ -37,7 +45,8 @@ class FakeGame:
         self.t = 0.0
         self.actions = []
         self.last_error = ""
-        self.state = {"enter": False, "exit": False}
+        self.state = {"enter": False, "exit": False,
+                      "mount_dialog": False, "mounted": False}
         self.enter_appears = enter_appears
         self.exit_appears = exit_appears
         self.enter_popup_at = None
@@ -52,7 +61,9 @@ class FakeGame:
 
     def grab(self):
         return make_frame(enter_dialog=self.state["enter"],
-                          exit_dialog=self.state["exit"])
+                          exit_dialog=self.state["exit"],
+                          mount_dialog=self.state["mount_dialog"],
+                          mounted=self.state["mounted"])
 
     def snapshot(self, tag):
         self.actions.append(("snap", tag))
@@ -73,10 +84,14 @@ class FakeGame:
                 self.state["exit"] = False
         elif pt == PT_EXIT and self.exit_appears:
             self.state["exit"] = True
+        elif pt == PT_MOUNT:
+            self.state["mounted"] = True
         return True
 
     def tap(self, name):
         self.actions.append(("tap", name))
+        if name == "s":
+            self.state["mount_dialog"] = not self.state["mount_dialog"]
         return True
 
 
@@ -167,7 +182,7 @@ logs = []
 runner = df.DungeonRunner(game, build_profile(), log=logs.append)
 runner.hp_now = lambda: 1000
 _real_ocr = app.ocr_fatigue_from_bgra
-app.ocr_fatigue_from_bgra = lambda data, w, h, roi: (900, 1000, "当前疲劳值 900/1000")
+app.ocr_fatigue_from_bgra = lambda data, w, h, roi: (-900, 1000, "当前疲劳值 -900/1000")
 try:
     ok = runner.run_round()
 finally:
@@ -187,7 +202,9 @@ check("识别到退出确认弹窗的日志", any("识别到退出确认弹窗" 
 check("退出只点了一次确认", game.confirm_count == 1, str(game.confirm_count))
 check("打过平A / 技能 / 拾取", "a" in taps and "1" in taps and "space" in taps)
 check("血量低会喝药", "q" in taps and "w" in taps)
-check("点过疲劳图标", PT_FATIGUE in clicks)
+check("点过疲劳图标（打怪点读疲劳）", PT_FATIGUE in clicks)
+check("疲劳 -900 → 打 BOSS（日志有分流说明）",
+      any("循环打 BOSS" in l for l in logs), str(logs[-6:]))
 
 # ---- 3) 退出弹窗一直不出现 → 重点退出按钮 → 判失败 --------------------
 game2 = FakeGame(exit_appears=False)
@@ -234,19 +251,29 @@ check("没框进本弹窗：进本盲点一次、退出仍然识别",
       ok4 and clicks4.count(PT_CONFIRM) == 1 and clicks4.count(PT_EXIT_OK) == 1,
       str(clicks4))
 
-# ---- 6) 疲劳：不足时普通打怪；充足时直接下一轮 -----------------------
+# ---- 6) 疲劳 +900 → 在打怪点打怪（不去 BOSS 点）----------------------
+p6b = build_profile()
+p6b["mount"]["enabled"] = False
+p6b["farm"]["farm_pt"] = [0.6, 0.6]
+p6b["loop"] = {"boss_seconds": 1.0, "boss_rounds": 1,
+               "trash_seconds": 1.0, "trash_rounds": 1,
+               "default_action": "boss"}
 game5 = FakeGame()
 logs5 = []
-runner5 = df.DungeonRunner(game5, build_profile(), log=logs5.append)
+runner5 = df.DungeonRunner(game5, p6b, log=logs5.append)
 runner5.hp_now = lambda: 5000
-app.ocr_fatigue_from_bgra = lambda data, w, h, roi: (300, 1000, "当前疲劳值 300/1000")
+app.ocr_fatigue_from_bgra = lambda data, w, h, roi: (900, 1000, "当前疲劳值 900/1000")
 try:
     runner5.run_round()
 finally:
     app.ocr_fatigue_from_bgra = _real_ocr
 taps5 = [a[1] for a in game5.actions if a[0] == "tap"]
-check("疲劳不足 → 普通挂机打怪", any("疲劳不足" in l for l in logs5))
-check("普通挂机真的在按 A", taps5.count("a") > 250, str(taps5.count("a")))
+clicks5 = [a[1] for a in game5.actions if a[0] == "click"]
+check("疲劳 +900 → 走打怪分支（日志）", any("循环打怪" in l for l in logs5),
+      str(logs5[-6:]))
+check("疲劳 +900 → 去了打怪点", (0.6, 0.6) in clicks5, str(clicks5))
+check("疲劳 +900 → 不去 BOSS 点", PT_BOSS not in clicks5)
+check("打怪循环真的在按 A", taps5.count("a") >= 8, str(taps5.count("a")))
 
 # ---- 7) 多开秒数独立 / 停止 ------------------------------------------
 a = df.copy_profile_for_slot(build_profile(), 45)
@@ -310,6 +337,99 @@ try:
     check("删除不存在的方案返回 False", df.delete_dungeon("没有这个") is False)
 finally:
     df._base_dir = _real_base
+
+# ---- 10) 骑乘检查（每次寻路前）---------------------------------------
+p10 = build_profile()
+p10["mount"] = {
+    "enabled": True, "key": "s",
+    "dialog": {"roi": ROI_MOUNT,
+               "sig": df.signature(df.crop_norm(make_frame(mount_dialog=True), ROI_MOUNT), 12),
+               "grid": 12, "sim": 0.90},
+    "state": {"roi": ROI_MOUNT_STATE,
+              "sig": df.signature(df.crop_norm(make_frame(mounted=True), ROI_MOUNT_STATE), 12),
+              "grid": 12, "sim": 0.90},
+    "mount_pt": list(PT_MOUNT), "wait": 2.0, "settle": 0.5,
+}
+game10 = FakeGame()
+logs10 = []
+r10 = df.DungeonRunner(game10, p10, log=logs10.append)
+r10.ensure_mount()
+taps10 = [a[1] for a in game10.actions if a[0] == "tap"]
+clicks10 = [a[1] for a in game10.actions if a[0] == "click"]
+check("未骑乘：按了 S", taps10.count("s") >= 1, str(taps10))
+check("未骑乘：识别到骑乘弹窗",
+      any("识别到骑乘弹窗" in l for l in logs10), str(logs10))
+check("未骑乘：点了「骑乘」按钮", PT_MOUNT in clicks10, str(clicks10))
+check("骑乘后状态变成已骑乘", game10.state["mounted"] is True)
+check("骑乘后弹窗被关掉", game10.state["mount_dialog"] is False)
+
+game11 = FakeGame()
+game11.state["mounted"] = True
+logs11 = []
+r11 = df.DungeonRunner(game11, p10, log=logs11.append)
+r11.ensure_mount()
+taps11 = [a[1] for a in game11.actions if a[0] == "tap"]
+clicks11 = [a[1] for a in game11.actions if a[0] == "click"]
+check("已骑乘：不再点「骑乘」按钮", PT_MOUNT not in clicks11, str(clicks11))
+check("已骑乘：日志显示已骑乘", any("已骑乘" in l for l in logs11), str(logs11))
+check("已骑乘：弹窗也关掉了", game11.state["mount_dialog"] is False)
+
+# ---- 11) 打怪点按疲劳分流 --------------------------------------------
+p11 = build_profile()
+p11["mount"]["enabled"] = False
+p11["loop"] = {"boss_seconds": 1.0, "boss_rounds": 2,
+               "trash_seconds": 1.0, "trash_rounds": 1,
+               "default_action": "boss"}
+r11b = df.DungeonRunner(FakeGame(), p11, log=lambda _s: None)
+r11b.fatigue_check = lambda: (-900, 1000, "")
+check("疲劳 -900（< -800）→ 打BOSS", r11b.decide_action() == "boss")
+r11b.fatigue_check = lambda: (900, 1000, "")
+check("疲劳 +900（> +800）→ 打怪", r11b.decide_action() == "farm")
+r11b.fatigue_check = lambda: (100, 1000, "")
+check("疲劳在中间 → 用默认动作", r11b.decide_action() == "boss")
+
+# BOSS 循环按次数跑
+game12 = FakeGame()
+logs12 = []
+r12 = df.DungeonRunner(game12, p11, log=logs12.append)
+r12.hp_now = lambda: 5000
+r12.fatigue_check = lambda: (-900, 1000, "")
+ok12 = r12.run_loops()
+clicks12 = [a[1] for a in game12.actions if a[0] == "click"]
+check("BOSS 循环按 boss_rounds 跑 2 次",
+      clicks12.count(PT_BOSS) == 2, str(clicks12.count(PT_BOSS)))
+check("BOSS 循环跑成功", ok12 is True)
+
+# 打怪循环
+p13 = build_profile()
+p13["mount"]["enabled"] = False
+p13["farm"]["farm_pt"] = [0.6, 0.6]
+p13["loop"] = {"boss_seconds": 1.0, "boss_rounds": 1,
+               "trash_seconds": 1.0, "trash_rounds": 2,
+               "default_action": "boss"}
+game13 = FakeGame()
+logs13 = []
+r13 = df.DungeonRunner(game13, p13, log=logs13.append)
+r13.hp_now = lambda: 5000
+r13.fatigue_check = lambda: (900, 1000, "")
+r13.run_loops()
+clicks13 = [a[1] for a in game13.actions if a[0] == "click"]
+check("疲劳高 → 走到了打怪点", (0.6, 0.6) in clicks13, str(clicks13))
+check("疲劳高 → 不去 BOSS 点", PT_BOSS not in clicks13)
+check("打怪循环跑 2 轮（日志有 打怪2/2）",
+      any("打怪2/2" in l for l in logs13), str(logs13[-4:]))
+
+# ---- 12) 保存要包含所有参数（轮数/循环/骑乘）-------------------------
+p14 = build_profile()
+p14.setdefault("retry", {})["rounds"] = 7
+check("轮数能存进 profile", p14["retry"]["rounds"] == 7)
+check("循环参数在默认配置里",
+      all(k in df.DEFAULT_PROFILE["loop"]
+          for k in ("boss_seconds", "boss_rounds", "trash_seconds", "trash_rounds")))
+check("骑乘配置在默认配置里",
+      all(k in df.DEFAULT_PROFILE["mount"]
+          for k in ("enabled", "key", "dialog", "state", "mount_pt")))
+check("打怪点字段存在", "farm_pt" in df.DEFAULT_PROFILE["farm"])
 
 print()
 if fails:

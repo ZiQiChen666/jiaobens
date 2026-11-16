@@ -40,6 +40,14 @@ answers = {
     "fatigue_threshold": 600,
     "fatigue_farm_seconds": 240.0,
     "fatigue_pt": [0.10, 0.90],
+    "farm_pt": [0.60, 0.60],
+    "boss_seconds": 30.0,
+    "boss_rounds": 2,
+    "trash_seconds": 45.0,
+    "trash_rounds": 3,
+    "mount_enabled": True,
+    "mount_key": "s",
+    "mount_pt": [0.50, 0.20],
     "exit_pt": [0.94, 0.05],
     "exit_confirm_pt": [0.55, 0.68],
     "exit_settle": 10.0,
@@ -102,12 +110,12 @@ try:
     hwnd = wins[0][0] if wins else 0
 
     wiz = dw.DungeonWizard(hwnd, df.load_profile("__no_such_profile__.json"))
-    check("向导页数 = 8（介绍/进本/弹窗/BOSS/挂机/疲劳/退出/汇总）",
-          len(wiz._pages) == 8, str(len(wiz._pages)))
+    check("向导页数 = 9（介绍/进本/弹窗/BOSS/挂机/疲劳/骑乘/退出/汇总）",
+          len(wiz._pages) == 9, str(len(wiz._pages)))
 
     wiz.answers.update({
         "entry_pt": [0.30, 0.55], "confirm_pt": [0.50, 0.55],
-        "boss_pt": [0.70, 0.40], "exit_pt": [0.94, 0.05],
+        "boss_pt": [0.70, 0.40], "farm_pt": [0.60, 0.60], "exit_pt": [0.94, 0.05],
         "exit_confirm_pt": [0.55, 0.68], "fatigue_pt": [0.10, 0.90],
     })
     wiz.spin_entry_wait.setValue(40.0)
@@ -124,6 +132,12 @@ try:
     wiz.spin_fatigue_farm.setValue(300.0)
     wiz.spin_exit_settle.setValue(10.0)
     wiz.spin_gap.setValue(8.0)
+    wiz.spin_boss_seconds.setValue(30.0)
+    wiz.spin_boss_rounds.setValue(2)
+    wiz.spin_trash_seconds.setValue(45.0)
+    wiz.spin_trash_rounds.setValue(3)
+    wiz.chk_mount.setChecked(True)
+    wiz.edit_mount_key.setText("s")
 
     guard = 0
     while wiz.index < len(wiz._pages) - 1 and guard < 20:
@@ -144,6 +158,11 @@ try:
     check("保存疲劳设置", saved["fatigue"]["enabled"] is True
           and saved["fatigue"]["threshold"] == 800
           and saved["fatigue"]["pt"] == [0.1, 0.9])
+    check("保存了打怪点", saved["farm"]["farm_pt"] == [0.6, 0.6])
+    check("保存了循环参数",
+          saved["loop"]["boss_rounds"] == 2 and saved["loop"]["trash_rounds"] == 3)
+    check("保存了骑乘设置",
+          saved["mount"]["enabled"] is True and saved["mount"]["key"] == "s")
     check("保存两个退出点", saved["exit"]["exit_pt"] == [0.94, 0.05]
           and saved["exit"]["confirm_pt"] == [0.55, 0.68])
 except Exception:

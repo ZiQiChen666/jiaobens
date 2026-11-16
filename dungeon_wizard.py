@@ -59,6 +59,23 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     farm["pickup_every"] = max(0.0, float(answers.get("pickup_every") or 8.0))
     farm["use_skills"] = bool(answers.get("use_skills", True))
 
+    loop = p.setdefault("loop", {})
+    loop["boss_seconds"] = max(5.0, float(answers.get("boss_seconds") or 30.0))
+    loop["boss_rounds"] = max(1, int(answers.get("boss_rounds") or 1))
+    loop["trash_seconds"] = max(5.0, float(answers.get("trash_seconds") or 60.0))
+    loop["trash_rounds"] = max(1, int(answers.get("trash_rounds") or 1))
+
+    farm["farm_pt"] = (
+        [round(float(v), 5) for v in answers["farm_pt"]]
+        if answers.get("farm_pt") else farm.get("farm_pt")
+    )
+
+    mount = p.setdefault("mount", {})
+    mount["enabled"] = bool(answers.get("mount_enabled", True))
+    mount["key"] = (answers.get("mount_key") or mount.get("key") or "s").strip()
+    if answers.get("mount_pt"):
+        mount["mount_pt"] = [round(float(v), 5) for v in answers["mount_pt"]]
+
     exit_cfg = p.setdefault("exit", {})
     if answers.get("exit_pt"):
         exit_cfg["exit_pt"] = [round(float(v), 5) for v in answers["exit_pt"]]
@@ -91,6 +108,17 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     else:
         plan.append("① 还没标副本入口：进本这一步会跳过")
     hp = farm.get("hp_threshold") or 0
+    if mount.get("enabled", True):
+        plan.append(
+            f"每次寻路前按「{mount.get('key', 's')}」检查骑乘：弹窗出现 → 看状态 → "
+            "没骑就点「骑乘」→ 关弹窗"
+        )
+    plan.append(
+        f"打怪点按疲劳分流：< -{fatigue['threshold']} 打BOSS "
+        f"({loop['boss_seconds']:.0f}s × {loop['boss_rounds']} 只)；"
+        f"> +{fatigue['threshold']} 打怪 "
+        f"({loop['trash_seconds']:.0f}s × {loop['trash_rounds']} 轮)"
+    )
     plan.append(
         f"② 开地图2 → 点 BOSS 点 → 等 {farm['travel_wait']:.0f}s → 挂机 {farm['seconds']:.0f}s"
         f"（喝药 {farm['potion_every']:.0f}s"
@@ -175,6 +203,14 @@ class DungeonWizard(QDialog):
             "fatigue_threshold": int(fatigue.get("threshold", 800) or 0),
             "fatigue_farm_seconds": float(fatigue.get("farm_seconds", 300.0)),
             "fatigue_pt": fatigue.get("pt"),
+            "boss_seconds": float((self.profile.get("loop") or {}).get("boss_seconds", 30.0)),
+            "boss_rounds": int((self.profile.get("loop") or {}).get("boss_rounds", 1) or 1),
+            "trash_seconds": float((self.profile.get("loop") or {}).get("trash_seconds", 60.0)),
+            "trash_rounds": int((self.profile.get("loop") or {}).get("trash_rounds", 1) or 1),
+            "farm_pt": (self.profile.get("farm") or {}).get("farm_pt"),
+            "mount_enabled": bool((self.profile.get("mount") or {}).get("enabled", True)),
+            "mount_key": (self.profile.get("mount") or {}).get("key", "s"),
+            "mount_pt": (self.profile.get("mount") or {}).get("mount_pt"),
             "exit_pt": exit_cfg.get("exit_pt"),
             "exit_confirm_pt": exit_cfg.get("confirm_pt"),
             "exit_settle": float(exit_cfg.get("settle", 10.0)),
@@ -211,6 +247,7 @@ class DungeonWizard(QDialog):
             self._page_boss(),
             self._page_farm(),
             self._page_fatigue(),
+            self._page_mount(),
             self._page_exit(),
             self._page_summary(),
         ):
@@ -255,6 +292,12 @@ class DungeonWizard(QDialog):
         self.answers["fatigue_enabled"] = bool(self.chk_fatigue.isChecked())
         self.answers["fatigue_threshold"] = int(self.spin_fatigue.value())
         self.answers["fatigue_farm_seconds"] = float(self.spin_fatigue_farm.value())
+        self.answers["boss_seconds"] = float(self.spin_boss_seconds.value())
+        self.answers["boss_rounds"] = int(self.spin_boss_rounds.value())
+        self.answers["trash_seconds"] = float(self.spin_trash_seconds.value())
+        self.answers["trash_rounds"] = int(self.spin_trash_rounds.value())
+        self.answers["mount_enabled"] = bool(self.chk_mount.isChecked())
+        self.answers["mount_key"] = self.edit_mount_key.text().strip() or "s"
         self.answers["exit_settle"] = float(self.spin_exit_settle.value())
         self.answers["gap"] = float(self.spin_gap.value())
 
@@ -410,15 +453,27 @@ class DungeonWizard(QDialog):
     def _page_boss(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.addWidget(_title("第 3 步：地图2 的「BOSS 点」"))
+        lay.addWidget(_title("第 3 步：地图2 的「打怪点」和「BOSS 点」"))
         lay.addWidget(_hint(
-            "进到副本里以后打开副本地图（地图2），点按钮截图，再在图上点 BOSS 位置。"
+            "进到副本里以后打开副本地图（地图2）：先点「打怪点」——"
+            "程序会先跑到那里读疲劳值，再决定是打 BOSS 还是打怪；"
+            "然后再点 BOSS 所在的位置。"
         ))
-        self.lbl_boss = QLabel(self._pt_text(self.answers.get("boss_pt")))
-        lay.addWidget(self.lbl_boss)
-        btn = QPushButton("截图并在图上点 BOSS 点")
+        row_farm = QHBoxLayout()
+        btn_farm = QPushButton("① 截图并点「打怪点」")
+        btn_farm.clicked.connect(self._pick_farm_pt)
+        self.lbl_farm_pt = QLabel(self._pt_text(self.answers.get("farm_pt")))
+        row_farm.addWidget(btn_farm)
+        row_farm.addWidget(self.lbl_farm_pt, 1)
+        lay.addLayout(row_farm)
+
+        row_boss = QHBoxLayout()
+        btn = QPushButton("② 截图并点「BOSS 点」")
         btn.clicked.connect(self._pick_boss)
-        lay.addWidget(btn)
+        self.lbl_boss = QLabel(self._pt_text(self.answers.get("boss_pt")))
+        row_boss.addWidget(btn)
+        row_boss.addWidget(self.lbl_boss, 1)
+        lay.addLayout(row_boss)
         row = QHBoxLayout()
         row.addWidget(QLabel("点完后等寻路"))
         self.spin_boss_wait = self._dspin(1.0, 600.0, self.answers["boss_wait"])
@@ -427,6 +482,11 @@ class DungeonWizard(QDialog):
         lay.addLayout(row)
         lay.addStretch(1)
         return page
+
+    def _pick_farm_pt(self) -> None:
+        self._pick_point("farm_pt", "点打怪点",
+                         "这里显示的是地图2（副本地图）。点一下「打怪点」位置。", True)
+        self.lbl_farm_pt.setText(self._pt_text(self.answers.get("farm_pt")))
 
     def _pick_boss(self) -> None:
         self._pick_point("boss_pt", "点 BOSS 点",
@@ -452,6 +512,28 @@ class DungeonWizard(QDialog):
         self.chk_skills = QCheckBox("放技能 1/2")
         self.chk_skills.setChecked(bool(self.answers["use_skills"]))
         g.addWidget(self.chk_skills, 1, 4, 1, 2)
+
+        g.addWidget(QLabel("打BOSS"), 2, 0)
+        self.spin_boss_seconds = self._dspin(5.0, 600.0, self.answers["boss_seconds"])
+        g.addWidget(self.spin_boss_seconds, 2, 1)
+        g.addWidget(QLabel("秒 ×"), 2, 2)
+        self.spin_boss_rounds = QSpinBox()
+        self.spin_boss_rounds.setRange(1, 99)
+        self.spin_boss_rounds.setValue(int(self.answers["boss_rounds"]))
+        self.spin_boss_rounds.setFixedWidth(60)
+        g.addWidget(self.spin_boss_rounds, 2, 3)
+        g.addWidget(QLabel("只"), 2, 4)
+
+        g.addWidget(QLabel("打怪"), 3, 0)
+        self.spin_trash_seconds = self._dspin(5.0, 1800.0, self.answers["trash_seconds"])
+        g.addWidget(self.spin_trash_seconds, 3, 1)
+        g.addWidget(QLabel("秒 ×"), 3, 2)
+        self.spin_trash_rounds = QSpinBox()
+        self.spin_trash_rounds.setRange(1, 99)
+        self.spin_trash_rounds.setValue(int(self.answers["trash_rounds"]))
+        self.spin_trash_rounds.setFixedWidth(60)
+        g.addWidget(self.spin_trash_rounds, 3, 3)
+        g.addWidget(QLabel("轮"), 3, 4)
         lay.addLayout(g)
 
         row = QHBoxLayout()
@@ -549,6 +631,81 @@ class DungeonWizard(QDialog):
                            "疲劳提示区域",
                            "先点疲劳图标让提示弹出来，再框住「当前疲劳值:xxx/xxx」那块文字"):
             self._refresh_fatigue_roi()
+
+    def _page_mount(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.addWidget(_title("第 6 步：宠物骑乘（每次寻路前按 S 检查）"))
+        lay.addWidget(_hint(
+            "按 S 会弹出骑乘窗口：程序先识别「弹窗出现了没有」，"
+            "再看「骑乘状态标记」判断是不是已经骑上了；没骑就点「骑乘」按钮，"
+            "然后关掉弹窗继续寻路。"
+        ))
+        row0 = QHBoxLayout()
+        self.chk_mount = QCheckBox("每次寻路前检查骑乘")
+        self.chk_mount.setChecked(bool(self.answers["mount_enabled"]))
+        row0.addWidget(self.chk_mount)
+        row0.addWidget(QLabel("检查键"))
+        self.edit_mount_key = QLineEdit(str(self.answers["mount_key"]))
+        self.edit_mount_key.setFixedWidth(50)
+        row0.addWidget(self.edit_mount_key)
+        row0.addStretch(1)
+        lay.addLayout(row0)
+
+        row = QHBoxLayout()
+        btn_dialog = QPushButton("① 框住「骑乘弹窗」区域")
+        btn_dialog.clicked.connect(lambda: self._pick_mount_roi("dialog"))
+        self.lbl_mount_dialog = QLabel("未设置")
+        row.addWidget(btn_dialog)
+        row.addWidget(self.lbl_mount_dialog, 1)
+        lay.addLayout(row)
+
+        row2 = QHBoxLayout()
+        btn_state = QPushButton("② 框住「已骑乘」状态标记")
+        btn_state.clicked.connect(lambda: self._pick_mount_roi("state"))
+        self.lbl_mount_state = QLabel("未设置")
+        row2.addWidget(btn_state)
+        row2.addWidget(self.lbl_mount_state, 1)
+        lay.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        btn_pt = QPushButton("③ 点「骑乘」按钮的位置")
+        btn_pt.clicked.connect(self._pick_mount_pt)
+        self.lbl_mount_pt = QLabel(self._pt_text(self.answers.get("mount_pt")))
+        row3.addWidget(btn_pt)
+        row3.addWidget(self.lbl_mount_pt, 1)
+        lay.addLayout(row3)
+        self._refresh_mount_state()
+        lay.addStretch(1)
+        return page
+
+    def _refresh_mount_state(self) -> None:
+        mount = self.profile.get("mount") or {}
+        for spec, label in (
+            (mount.get("dialog") or {}, self.lbl_mount_dialog),
+            (mount.get("state") or {}, self.lbl_mount_state),
+        ):
+            if (spec or {}).get("roi"):
+                label.setText("已设置 ✓")
+                label.setStyleSheet("color: #15803d; font-weight: 600;")
+            else:
+                label.setText("未设置")
+                label.setStyleSheet("color: #444444;")
+
+    def _pick_mount_roi(self, which: str) -> None:
+        if which == "dialog":
+            title, info = ("骑乘弹窗区域",
+                           "按 S 把骑乘窗口弹出来再截图，框住这个弹窗里固定不变的部分")
+        else:
+            title, info = ("骑乘状态标记",
+                           "在弹窗里框住「已骑乘时才有的那块」（坐骑头像/骑乘字样）")
+        if dui.pick_region(self, self.hwnd, self.profile, f"mount.{which}", title, info):
+            self._refresh_mount_state()
+
+    def _pick_mount_pt(self) -> None:
+        self._pick_point("mount_pt", "点「骑乘」按钮",
+                         "按 S 打开骑乘窗口，点一下窗口里的「骑乘」按钮。", False)
+        self.lbl_mount_pt.setText(self._pt_text(self.answers.get("mount_pt")))
 
     def _page_exit(self) -> QWidget:
         page = QWidget()
