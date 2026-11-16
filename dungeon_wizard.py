@@ -76,6 +76,10 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     mount = p.setdefault("mount", {})
     mount["enabled"] = bool(answers.get("mount_enabled", True))
     mount["key"] = (answers.get("mount_key") or mount.get("key") or "s").strip()
+    mount["mount_text"] = (answers.get("mount_text")
+                           or mount.get("mount_text") or "骑乘").strip()
+    mount["rest_text"] = (answers.get("rest_text")
+                          or mount.get("rest_text") or "休息").strip()
     if answers.get("mount_pt"):
         mount["mount_pt"] = [round(float(v), 5) for v in answers["mount_pt"]]
 
@@ -217,6 +221,8 @@ class DungeonWizard(QDialog):
             "farm_pt": (self.profile.get("farm") or {}).get("farm_pt"),
             "mount_enabled": bool((self.profile.get("mount") or {}).get("enabled", True)),
             "mount_key": (self.profile.get("mount") or {}).get("key", "s"),
+            "mount_text": (self.profile.get("mount") or {}).get("mount_text", "骑乘"),
+            "rest_text": (self.profile.get("mount") or {}).get("rest_text", "休息"),
             "mount_pt": (self.profile.get("mount") or {}).get("mount_pt"),
             "exit_pt": exit_cfg.get("exit_pt"),
             "exit_confirm_pt": exit_cfg.get("confirm_pt"),
@@ -306,6 +312,8 @@ class DungeonWizard(QDialog):
         self.answers["fatigue_every"] = float(self.spin_fatigue_every.value())
         self.answers["mount_enabled"] = bool(self.chk_mount.isChecked())
         self.answers["mount_key"] = self.edit_mount_key.text().strip() or "s"
+        self.answers["mount_text"] = self.edit_mount_text.text().strip() or "骑乘"
+        self.answers["rest_text"] = self.edit_rest_text.text().strip() or "休息"
         self.answers["exit_settle"] = float(self.spin_exit_settle.value())
         self.answers["gap"] = float(self.spin_gap.value())
 
@@ -690,12 +698,24 @@ class DungeonWizard(QDialog):
         lay.addLayout(row)
 
         row2 = QHBoxLayout()
-        btn_state = QPushButton("② 框住「已骑乘」状态标记")
-        btn_state.clicked.connect(lambda: self._pick_mount_roi("state"))
+        btn_text = QPushButton("② 框住宠物文本区域（OCR 读「骑乘/休息」）")
+        btn_text.clicked.connect(lambda: self._pick_mount_roi("text"))
         self.lbl_mount_state = QLabel("未设置")
-        row2.addWidget(btn_state)
+        row2.addWidget(btn_text)
         row2.addWidget(self.lbl_mount_state, 1)
         lay.addLayout(row2)
+
+        row2b = QHBoxLayout()
+        row2b.addWidget(QLabel("未骑乘文字"))
+        self.edit_mount_text = QLineEdit("骑乘")
+        self.edit_mount_text.setFixedWidth(70)
+        row2b.addWidget(self.edit_mount_text)
+        row2b.addWidget(QLabel("已骑乘文字"))
+        self.edit_rest_text = QLineEdit("休息")
+        self.edit_rest_text.setFixedWidth(70)
+        row2b.addWidget(self.edit_rest_text)
+        row2b.addStretch(1)
+        lay.addLayout(row2b)
 
         row3 = QHBoxLayout()
         btn_pt = QPushButton("③ 点「骑乘」按钮的位置")
@@ -710,9 +730,11 @@ class DungeonWizard(QDialog):
 
     def _refresh_mount_state(self) -> None:
         mount = self.profile.get("mount") or {}
+        self.edit_mount_text.setText(str(mount.get("mount_text", "骑乘")))
+        self.edit_rest_text.setText(str(mount.get("rest_text", "休息")))
         for spec, label in (
             (mount.get("dialog") or {}, self.lbl_mount_dialog),
-            (mount.get("state") or {}, self.lbl_mount_state),
+            ({"roi": mount.get("text_roi")}, self.lbl_mount_state),
         ):
             if (spec or {}).get("roi"):
                 label.setText("已设置 ✓")
@@ -725,9 +747,11 @@ class DungeonWizard(QDialog):
         if which == "dialog":
             title, info = ("骑乘弹窗区域",
                            "按 S 把骑乘窗口弹出来再截图，框住这个弹窗里固定不变的部分")
+        elif which == "text":
+            title, info = ("宠物文本区域",
+                           "框住宠物那一行文字：没骑时是「骑乘」，骑上后变「休息」")
         else:
-            title, info = ("骑乘状态标记",
-                           "在弹窗里框住「已骑乘时才有的那块」（坐骑头像/骑乘字样）")
+            title, info = ("骑乘状态标记", "旧版用，可不标")
         if dui.pick_region(self, self.hwnd, self.profile, f"mount.{which}", title, info):
             self._refresh_mount_state()
 

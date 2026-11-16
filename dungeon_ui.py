@@ -160,6 +160,8 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
         profile.setdefault("farm", {})["hp_roi"] = roi_norm
     elif where == "fatigue.roi":
         profile.setdefault("fatigue", {})["roi"] = roi_norm
+    elif where == "mount.text":
+        profile.setdefault("mount", {})["text_roi"] = roi_norm
     elif where in ("mount.dialog", "mount.state"):
         sig = df.signature(df.crop_norm(f, roi_norm), 12)
         profile.setdefault("mount", {})[where.split(".")[1]] = {
@@ -592,14 +594,29 @@ class DungeonTab(QWidget):
         g.addWidget(self.lbl_mount_dialog, row0 + 2, 1)
         g.addWidget(btn_mount_dialog, row0 + 2, 2)
 
-        btn_mount_state = QPushButton("框选")
-        btn_mount_state.setFixedWidth(72)
-        btn_mount_state.clicked.connect(lambda: self._pick_mount_roi("state"))
+        btn_mount_text = QPushButton("框选")
+        btn_mount_text.setFixedWidth(72)
+        btn_mount_text.clicked.connect(lambda: self._pick_mount_roi("text"))
         self.lbl_mount_state = QLabel("未设置")
         self.lbl_mount_state.setObjectName("muted")
-        g.addWidget(QLabel("⑤ 骑乘状态标记（看图能判断「已骑乘」的那块）"), row0 + 3, 0)
+        g.addWidget(QLabel("⑤ 宠物文本区域（OCR：未骑乘写「骑乘」，已骑乘写「休息」）"),
+                    row0 + 3, 0)
         g.addWidget(self.lbl_mount_state, row0 + 3, 1)
-        g.addWidget(btn_mount_state, row0 + 3, 2)
+        g.addWidget(btn_mount_text, row0 + 3, 2)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("未骑乘文字"))
+        self.edit_mount_text = QLineEdit("骑乘")
+        self.edit_mount_text.setFixedWidth(70)
+        self.edit_mount_text.editingFinished.connect(self._save_from_ui)
+        row.addWidget(self.edit_mount_text)
+        row.addWidget(QLabel("已骑乘文字"))
+        self.edit_rest_text = QLineEdit("休息")
+        self.edit_rest_text.setFixedWidth(70)
+        self.edit_rest_text.editingFinished.connect(self._save_from_ui)
+        row.addWidget(self.edit_rest_text)
+        row.addWidget(_hint("读到「未骑乘文字」才点「骑乘」；读到「已骑乘文字」就不点"), 1)
+        g.addLayout(row, row0 + 4, 0, 1, 3)
         return box
 
     def _build_farm(self) -> QWidget:
@@ -915,9 +932,11 @@ class DungeonTab(QWidget):
             self.spin_trash_rounds.setValue(int(loop.get("trash_rounds", 1) or 1))
             self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 60.0)))
             self.spin_rounds.setValue(int((p.get("retry") or {}).get("rounds", 0) or 0))
+            self.edit_mount_text.setText(str(mount.get("mount_text", "骑乘")))
+            self.edit_rest_text.setText(str(mount.get("rest_text", "休息")))
             for name, spec, label in (
                 ("骑乘弹窗", mount.get("dialog") or {}, self.lbl_mount_dialog),
-                ("骑乘状态", mount.get("state") or {}, self.lbl_mount_state),
+                ("宠物文本", {"roi": mount.get("text_roi")}, self.lbl_mount_state),
             ):
                 if (spec or {}).get("roi"):
                     label.setText("已设置 ✓")
@@ -1015,6 +1034,8 @@ class DungeonTab(QWidget):
         p.setdefault("mount", {}).update({
             "enabled": bool(self.chk_mount.isChecked()),
             "key": self.edit_mount_key.text().strip() or "s",
+            "mount_text": self.edit_mount_text.text().strip() or "骑乘",
+            "rest_text": self.edit_rest_text.text().strip() or "休息",
         })
         p.setdefault("loop", {}).update({
             "boss_seconds": float(self.spin_boss_seconds.value()),
@@ -1141,10 +1162,13 @@ class DungeonTab(QWidget):
             title = "骑乘弹窗区域"
             info = ("按 S 把骑乘窗口弹出来再截图，框住这个弹窗里固定不变的部分"
                     "（用来判断「按 S 后弹窗出来了没有」）")
+        elif which == "text":
+            title = "宠物文本区域"
+            info = ("框住宠物/坐骑那一行文字（没骑时是「骑乘」，骑上后变「休息」），"
+                    "程序 OCR 读它来判断要不要点")
         else:
             title = "骑乘状态标记"
-            info = ("在弹窗里框住「已骑乘时才有的那块」（坐骑头像/骑乘字样），"
-                    "程序用它判断是不是已经骑上了")
+            info = "（旧版用，可不标）框住「已骑乘时才有的那块」"
         if pick_region(self, hwnd, self.profile, f"mount.{which}", title, info):
             self._load_ui()
             self._log(f"已设置：{title}")

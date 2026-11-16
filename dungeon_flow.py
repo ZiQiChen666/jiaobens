@@ -80,7 +80,10 @@ DEFAULT_PROFILE: dict = {
         "enabled": True,           # 每次寻路前按一下 S，检查宠物是否骑乘
         "key": "s",
         "dialog": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},  # 骑乘弹窗
-        "state": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},   # 已骑乘标记
+        "text_roi": None,          # 宠物文本区域（OCR：未骑乘写「骑乘」，已骑乘写「休息」）
+        "mount_text": "骑乘",      # 文本里出现它 = 还没骑，需要点
+        "rest_text": "休息",       # 文本里出现它 = 已经骑了，不用点
+        "state": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},   # 旧的：图形标记（可不标）
         "mount_pt": None,          # 未骑乘时点这个「骑乘」按钮
         "wait": 4.0,               # 等骑乘弹窗出现
         "settle": 1.2,             # 点完骑乘等多久
@@ -656,59 +659,105 @@ class DungeonRunner:
         return out
 
     # -- 骑乘检查 --
-    def mount_ok(self) -> bool:
-        """看当前帧的「骑乘状态」区域：True=已骑乘。"""
+    def mount_text_now(self) -> str:
+        """OCR 宠物文本区域，返回识别到的文字（没标区域 / 失败返回空）。"""
         cfg = self.p.get("mount") or {}
-        spec = cfg.get("state") or {}
-        if not (spec or {}).get("roi"):
-            return True  # 没标「骑乘状态」就当已经骑好了
-        frame = self.grab()
+        roi = cfg.get("text_roi")
+        if not roi:
+            return ""
+        frame = self._last_frame or self.grab()
         if frame is None:
-            return True
-        return self.anchor_visible(spec, frame)
+            return ""
+        w, h, data = frame
+        try:
+            rect = app.roi_from_norm(tuple(float(v) for v in roi), w, h)
+            return (app.ocr_text_from_bgra(data, w, h, rect) or "").strip()
+        except Exception as exc:
+            self.log(f"骑乘文本识别异常：{type(exc).__name__}: {exc}")
+            return ""
+
+    def mount_state(self):
+        """返回 'mounted' / 'need_mount' / 'unknown'。
+
+        规则（按你说的）：宠物文本上写「骑乘」= 还没骑，要点；
+        写「休息」= 已经在骑，不用点。
+        """
+        cfg = self.p.get("mount") or {}
+        need = str(cfg.get("mount_text") or "骑乘")
+        rest = str(cfg.get("rest_text") or "休息")
+        text = self.mount_text_now()
+        if text:
+            compact = "".join(text.split())
+            self.log(f"宠物文本：{compact}")
+            if rest and rest in compact:
+                return "mounted"
+            if need and need in compact:
+                return "need_mount"
+            self.log(f"文本「{compact}」里既没有「{need}」也没有「{rest}」，按未骑乘处理")
+            return "need_mount"
+        # 没框文本区域：退回旧的图形标记判断
+        spec = cfg.get("state") or {}
+        if (spec or {}).get("roi"):
+            frame = self._last_frame or self.grab()
+            if frame is not None and self.anchor_visible(spec, frame):
+                return "mounted"
+            return "need_mount"
+        return "unknown"
+
+    def mount_ok(self) -> bool:
+        """True = 已经骑乘（文本是「休息」）。"""
+        return self.mount_state() == "mounted"
 
     def ensure_mount(self) -> None:
-        """每次寻路前按一下 S，看宠物是否骑乘；没骑就点「骑乘」再关弹窗。"""
+        """每次寻路前按一下 S，看宠物文本：写「骑乘」就点一下，写「休息」就不动。"""
         cfg = self.p.get("mount") or {}
         if not cfg.get("enabled", True):
             return
-        if not ((cfg.get("state") or {}).get("roi")
-                or (cfg.get("dialog") or {}).get("roi")):
-            # 没标「骑乘弹窗/骑乘状态」就不按 S，免得把游戏界面搞乱
-            self.log("没标骑乘区域，跳过骑乘检查")
+        has_text = bool(cfg.get("text_roi"))
+        has_anchor = bool((cfg.get("state") or {}).get("roi")
+                          or (cfg.get("dialog") or {}).get("roi"))
+        if not (has_text or has_anchor):
+            self.log("没标骑乘文本区域，跳过骑乘检查")
             return
+
         key = str(cfg.get("key") or "s")
         close_key = str(cfg.get("close_key") or key)
         dialog = cfg.get("dialog") or {}
         poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
-        self.log(f"按「{key}」检查宠物骑乘状态")
+        mount_pt = cfg.get("mount_pt")
+        settle = float(cfg.get("settle", 1.2))
+
+        self.log(f"按「{key}」打开骑乘面板，看宠物文本")
         self.game.tap(key)
-        appeared = False
         if (dialog or {}).get("roi"):
-            appeared = self.wait_anchor(
-                dialog, float(cfg.get("wait", 4.0)), poll, "骑乘弹窗"
-            )
-            if not appeared:
+            if not self.wait_anchor(dialog, float(cfg.get("wait", 4.0)), poll,
+                                    "骑乘弹窗"):
                 self.log("没识别到骑乘弹窗，跳过骑乘检查")
                 return
         else:
             self.game.sleep(1.0)
 
-        mounted = self.mount_ok()
-        self.log("骑乘状态：" + ("已骑乘 ✓" if mounted else "未骑乘 ✗"))
-        if not mounted:
-            mount_pt = cfg.get("mount_pt")
+        state = self.mount_state()
+        if state == "mounted":
+            self.log("宠物文本是「休息」→ 已经骑乘，不用点")
+        elif state == "need_mount":
             if mount_pt:
-                self.log("点「骑乘」按钮")
-                self.game.click_norm(mount_pt)
-                self.game.sleep(float(cfg.get("settle", 1.2)))
-                self.log("骑乘后状态：" + ("已骑乘 ✓" if self.mount_ok() else "仍未骑乘"))
+                self.log("宠物文本是「骑乘」→ 点一下骑乘")
+                if not self.game.click_norm(mount_pt):
+                    self.log("点「骑乘」失败（窗口可能不在前台）")
+                self.game.sleep(settle)
+                self.log("骑乘后："
+                         + ("宠物文本是「休息」✓" if self.mount_ok()
+                            else "文本还不是「休息」，下一轮再查"))
             else:
-                self.log("没标「骑乘」按钮，无法自动骑乘")
-        # 关掉弹窗
+                self.log("文档是「骑乘」但没标「骑乘」按钮位置，无法自动骑")
+        else:
+            self.log("没标骑乘文本区域，跳过")
+
         self.game.tap(close_key)
         self.game.sleep(0.6)
 
+    # -- 动作 --
     # -- 动作 --
     def open_map(self) -> None:
         key = self._key("open_map", "m")

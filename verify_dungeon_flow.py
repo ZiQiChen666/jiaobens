@@ -380,8 +380,74 @@ r11.ensure_mount()
 taps11 = [a[1] for a in game11.actions if a[0] == "tap"]
 clicks11 = [a[1] for a in game11.actions if a[0] == "click"]
 check("已骑乘：不再点「骑乘」按钮", PT_MOUNT not in clicks11, str(clicks11))
-check("已骑乘：日志显示已骑乘", any("已骑乘" in l for l in logs11), str(logs11))
+check("已骑乘：日志显示已骑乘", any("已经骑乘" in l for l in logs11), str(logs11))
 check("已骑乘：弹窗也关掉了", game11.state["mount_dialog"] is False)
+
+# ---- 10b) 骑乘判断改成读文本：骑乘=要点 / 休息=不用点 -----------------
+ROI_MOUNT_TEXT = [0.02, 0.70, 0.22, 0.14]
+p_text = build_profile()
+p_text["mount"] = {
+    "enabled": True, "key": "s",
+    "dialog": {"roi": ROI_MOUNT,
+               "sig": df.signature(df.crop_norm(make_frame(mount_dialog=True), ROI_MOUNT), 12),
+               "grid": 12, "sim": 0.90},
+    "text_roi": ROI_MOUNT_TEXT, "mount_text": "骑乘", "rest_text": "休息",
+    "mount_pt": list(PT_MOUNT), "wait": 2.0, "settle": 0.5,
+}
+_real_ocr_text = app.ocr_text_from_bgra
+
+# 文本是「骑乘」→ 未骑乘 → 应该点按钮
+app.ocr_text_from_bgra = lambda data, w, h, roi: "骑乘"
+try:
+    g_a = FakeGame()
+    logs_a = []
+    r_a = df.DungeonRunner(g_a, p_text, log=logs_a.append)
+    r_a.ensure_mount()
+finally:
+    app.ocr_text_from_bgra = _real_ocr_text
+clicks_a = [a[1] for a in g_a.actions if a[0] == "click"]
+check("文本「骑乘」→ 点了骑乘按钮", PT_MOUNT in clicks_a, str(clicks_a))
+check("文本「骑乘」→ 日志说明", any("宠物文本是「骑乘」" in l for l in logs_a), str(logs_a[-4:]))
+
+# 文本是「休息」→ 已骑乘 → 不点
+app.ocr_text_from_bgra = lambda data, w, h, roi: "休息"
+try:
+    g_b = FakeGame()
+    logs_b = []
+    r_b = df.DungeonRunner(g_b, p_text, log=logs_b.append)
+    r_b.ensure_mount()
+finally:
+    app.ocr_text_from_bgra = _real_ocr_text
+clicks_b = [a[1] for a in g_b.actions if a[0] == "click"]
+check("文本「休息」→ 不点按钮", PT_MOUNT not in clicks_b, str(clicks_b))
+check("文本「休息」→ 日志说已骑乘",
+      any("已经骑乘" in l or "休息" in l for l in logs_b), str(logs_b[-4:]))
+
+# 文本乱码 → 按未骑乘处理（点一次）
+app.ocr_text_from_bgra = lambda data, w, h, roi: "????"
+try:
+    g_c = FakeGame()
+    logs_c = []
+    r_c = df.DungeonRunner(g_c, p_text, log=logs_c.append)
+    r_c.ensure_mount()
+finally:
+    app.ocr_text_from_bgra = _real_ocr_text
+clicks_c = [a[1] for a in g_c.actions if a[0] == "click"]
+check("文本读不出来 → 按未骑乘处理并提示",
+      PT_MOUNT in clicks_c and any("按未骑乘处理" in l for l in logs_c),
+      str(clicks_c))
+
+# 没标文本区域 → 不按 S
+p_no = build_profile()
+p_no["mount"] = {"enabled": True, "key": "s", "dialog": {"roi": None, "sig": []},
+                 "text_roi": None, "state": {"roi": None, "sig": []},
+                 "mount_pt": None}
+g_d = FakeGame()
+logs_d = []
+r_d = df.DungeonRunner(g_d, p_no, log=logs_d.append)
+r_d.ensure_mount()
+check("没标骑乘文本区域 → 不按 S",
+      not any(a == ("tap", "s") for a in g_d.actions), str(g_d.actions[:4]))
 
 # ---- 11) 打怪点按疲劳分流 --------------------------------------------
 p11 = build_profile()
@@ -531,7 +597,7 @@ r20.ensure_mount()
 check("骑乘没标区域 → 不按 S",
       not any(a == ("tap", "s") for a in game20.actions), str(game20.actions[:4]))
 check("骑乘没标区域 → 有日志说明",
-      any("没标骑乘区域" in l for l in logs20), str(logs20))
+      any("没标骑乘文本区域" in l for l in logs20), str(logs20))
 
 # ---- 12) 保存要包含所有参数（轮数/循环/骑乘）-------------------------
 p14 = build_profile()
