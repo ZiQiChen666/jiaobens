@@ -1187,42 +1187,96 @@ class TapSender(KeySender):
 # ---------------------------------------------------------------------------
 
 
-def _force_foreground_window(hwnd: int) -> None:
-    """把目标窗口切到前台（检测时点击游戏需要它可见/在最上层）。"""
+def _is_foreground(hwnd: int) -> bool:
     try:
+        return int(win32gui.GetForegroundWindow() or 0) == int(hwnd)
+    except Exception:
+        return False
+
+
+def _tap_alt() -> None:
+    """按一下 Alt 再松开：让本进程获得“可以切前台”的权限（Windows 限制）。"""
+    try:
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        time.sleep(0.03)
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.03)
+    except Exception:
+        pass
+
+
+def _force_foreground_window(hwnd: int) -> bool:
+    """把目标窗口切到前台，返回是否成功。
+
+    依次尝试：直接设前台 → AttachThreadInput → SwitchToThisWindow /
+    BringWindowToTop → “按一下 Alt 拿权限”后再设一次；每步都验证结果。
+    """
+    hwnd = int(hwnd)
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
         if win32gui.IsIconic(hwnd):
             try:
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                 time.sleep(0.2)
             except Exception:
                 pass
-        current = int(win32gui.GetForegroundWindow() or 0)
-        if current == hwnd:
-            return
-        attached = False
-        fg_tid = 0
+        if _is_foreground(hwnd):
+            return True
+
         my_tid = int(win32api.GetCurrentThreadId())
-        if current:
-            pid = wt.DWORD()
-            fg_tid = int(_USER32.GetWindowThreadProcessId(current, ctypes.byref(pid)))
-        if fg_tid and fg_tid != my_tid:
-            try:
-                attached = bool(_USER32.AttachThreadInput(my_tid, fg_tid, True))
-            except Exception:
-                attached = False
-        try:
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-            except Exception:
-                _USER32.SwitchToThisWindow(hwnd, True)
-        finally:
-            if attached:
+        pid = wt.DWORD()
+        for attempt in range(2):
+            current = int(win32gui.GetForegroundWindow() or 0)
+            if current == hwnd:
+                return True
+            fg_tid = 0
+            if current:
                 try:
-                    _USER32.AttachThreadInput(my_tid, fg_tid, False)
+                    fg_tid = int(
+                        _USER32.GetWindowThreadProcessId(current, ctypes.byref(pid))
+                    )
                 except Exception:
-                    pass
+                    fg_tid = 0
+            attached = False
+            if fg_tid and fg_tid != my_tid:
+                try:
+                    attached = bool(
+                        _USER32.AttachThreadInput(my_tid, fg_tid, True)
+                    )
+                except Exception:
+                    attached = False
+            try:
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    try:
+                        _USER32.SwitchToThisWindow(hwnd, True)
+                    except Exception:
+                        pass
+                if not _is_foreground(hwnd):
+                    try:
+                        _USER32.BringWindowToTop(hwnd)
+                    except Exception:
+                        pass
+            finally:
+                if attached:
+                    try:
+                        _USER32.AttachThreadInput(my_tid, fg_tid, False)
+                    except Exception:
+                        pass
+            if _is_foreground(hwnd):
+                return True
+            if attempt == 0:
+                _tap_alt()
+                time.sleep(0.05)
+        for _ in range(6):
+            if _is_foreground(hwnd):
+                return True
+            time.sleep(0.05)
+        return _is_foreground(hwnd)
     except Exception:
-        pass
+        return False
 
 
 def _restore_foreground_window(prev_fg: int, game_hwnd: int) -> None:
@@ -1414,6 +1468,119 @@ def _send_mouse_button(button: str, down: bool) -> None:
 
 def _send_mouse_wheel(delta: int) -> None:
     _send_mouse_input(_MOUSEEVENTF_WHEEL, data=int(delta) * 120)
+
+
+_SPI_GETMOUSE = 0x0003
+_SPI_SETMOUSE = 0x0004
+_SPI_GETMOUSESPEED = 0x0070
+_SPI_SETMOUSESPEED = 0x0071
+_SPIF_UPDATEINIFILE = 0x01
+_SPIF_SENDCHANGE = 0x02
+_USER32.SystemParametersInfoW.argtypes = [
+    wt.UINT, wt.UINT, ctypes.c_void_p, wt.UINT
+]
+_USER32.SystemParametersInfoW.restype = wt.BOOL
+
+
+def _get_mouse_accel() -> Optional[tuple[int, int, int]]:
+    """读系统鼠标加速参数（第 3 个为 1 表示“提高指针精确度”开着）。"""
+    try:
+        arr = (ctypes.c_int * 3)()
+        if _USER32.SystemParametersInfoW(_SPI_GETMOUSE, 0, ctypes.byref(arr), 0):
+            return (int(arr[0]), int(arr[1]), int(arr[2]))
+    except Exception:
+        pass
+    return None
+
+
+def _get_mouse_speed() -> Optional[int]:
+    """系统“指针移动速度”（1~20，10 = 1:1）。"""
+    try:
+        value = ctypes.c_int(0)
+        if _USER32.SystemParametersInfoW(
+            _SPI_GETMOUSESPEED, 0, ctypes.byref(value), 0
+        ):
+            return int(value.value)
+    except Exception:
+        pass
+    return None
+
+
+def _set_mouse_speed(speed: int) -> bool:
+    try:
+        return bool(
+            _USER32.SystemParametersInfoW(
+                _SPI_SETMOUSESPEED, 0, ctypes.c_void_p(int(speed)),
+                _SPIF_UPDATEINIFILE | _SPIF_SENDCHANGE,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _set_mouse_accel(values) -> bool:
+    try:
+        v0, v1, v2 = (int(v) for v in values)
+        arr = (ctypes.c_int * 3)(v0, v1, v2)
+        return bool(
+            _USER32.SystemParametersInfoW(
+                _SPI_SETMOUSE, 0, ctypes.byref(arr),
+                _SPIF_UPDATEINIFILE | _SPIF_SENDCHANGE,
+            )
+        )
+    except Exception:
+        return False
+
+
+class MouseAccelGuard:
+    """回放相对鼠标期间临时关掉指针加速，结束后恢复原设置。
+
+    为什么必须关：Windows 的“提高指针精确度”会把 SendInput 的相对位移
+    按速度放大（实测 dx=20 → 37px，dx=100 → 322px，最多 3.3 倍），
+    而录制时抓的是 Raw Input 的原始位移，两边一放大镜头就转飞了。
+    """
+
+    def __init__(self, debug=None):
+        self._debug = debug or (lambda _t: None)
+        self._saved = None
+        self._saved_speed = None
+        self._disabled = False
+
+    def disable(self) -> None:
+        """临时关掉加速 + 把指针速度调到 1:1（10），回放结束恢复。"""
+        self._saved = _get_mouse_accel()
+        self._saved_speed = _get_mouse_speed()
+        changed = False
+        if self._saved and self._saved[2] != 0:
+            if _set_mouse_accel((self._saved[0], self._saved[1], 0)):
+                changed = True
+            else:
+                self._debug(f"ACCEL 关闭失败 {self._saved}")
+        if self._saved_speed not in (None, 10):
+            if _set_mouse_speed(10):
+                changed = True
+            else:
+                self._debug(f"指针速度调整失败 {self._saved_speed}")
+        self._disabled = changed
+        self._debug(
+            f"ACCEL 回放期间关加速/速度→10（原 accel={self._saved} "
+            f"speed={self._saved_speed}）"
+        )
+
+    def restore(self) -> None:
+        if not self._disabled:
+            return
+        try:
+            if self._saved:
+                _set_mouse_accel(self._saved)
+            if self._saved_speed:
+                _set_mouse_speed(self._saved_speed)
+            self._debug(
+                f"ACCEL 恢复 accel={self._saved} speed={self._saved_speed}"
+            )
+        except Exception:
+            pass
+        self._disabled = False
 
 
 _SPECIAL_VK = {
@@ -2116,6 +2283,17 @@ class MacroPlayer(QThread):
 
         return mapper
 
+    def _point_ready(self, x: int, y: int, tries: int = 5) -> bool:
+        """目标点是不是已经落到游戏窗口上（被别的窗口压住时多试几次）。"""
+        if self._point_belongs_to_game(x, y):
+            return True
+        for _ in range(max(1, tries)):
+            _force_foreground_window(self.game_hwnd)
+            time.sleep(0.12)
+            if self._point_belongs_to_game(x, y):
+                return True
+        return False
+
     def _point_belongs_to_game(self, x: int, y: int) -> bool:
         try:
             under = int(win32gui.WindowFromPoint((int(x), int(y))) or 0)
@@ -2407,6 +2585,7 @@ class MacroPlayer(QThread):
         prev_fg = 0
         pressed_keys: set[str] = set()
         pressed_buttons: set[str] = set()
+        accel_guard = MouseAccelGuard(self._debug)
         try:
             if not self.events:
                 raise RuntimeError("没有录制内容。")
@@ -2426,6 +2605,14 @@ class MacroPlayer(QThread):
                 e.get("type") == "raw_move" for e in self.events
             )
             rel_last: Optional[tuple[int, int]] = None
+            if relative and has_raw:
+                # 关掉“提高指针精确度”，否则注入的相对位移会被放大 2~3 倍
+                accel_guard.disable()
+                if accel_guard._disabled:
+                    self._log(
+                        "已临时关闭系统鼠标加速（提高指针精确度），"
+                        "回放结束会自动恢复"
+                    )
             if relative:
                 try:
                     _l, _t, cur_w, cur_h = win32gui.GetClientRect(
@@ -2529,10 +2716,7 @@ class MacroPlayer(QThread):
                             self._send_mouse_relative(dx, dy)
                             rel_last = (int(px), int(py))
                         continue
-                    if not self._point_belongs_to_game(px, py):
-                        _force_foreground_window(self.game_hwnd)
-                        time.sleep(0.1)
-                    if not self._point_belongs_to_game(px, py):
+                    if not self._point_ready(px, py):
                         raise RuntimeError(
                             "鼠标目标点被其它窗口覆盖，已停止回放，"
                             "避免点到浏览器/桌面。"
@@ -2542,10 +2726,7 @@ class MacroPlayer(QThread):
                 elif typ in ("down", "up"):
                     button = str(event.get("button", "left")).lower()
                     px, py = map_event(event)
-                    if not self._point_belongs_to_game(px, py):
-                        _force_foreground_window(self.game_hwnd)
-                        time.sleep(0.1)
-                    if not self._point_belongs_to_game(px, py):
+                    if not self._point_ready(px, py):
                         raise RuntimeError(
                             "鼠标目标点被其它窗口覆盖，已停止回放，"
                             "避免点到浏览器/桌面。"
@@ -2562,10 +2743,7 @@ class MacroPlayer(QThread):
                         pressed_buttons.discard(button)
                 elif typ == "wheel":
                     px, py = map_event(event)
-                    if not self._point_belongs_to_game(px, py):
-                        _force_foreground_window(self.game_hwnd)
-                        time.sleep(0.1)
-                    if not self._point_belongs_to_game(px, py):
+                    if not self._point_ready(px, py):
                         raise RuntimeError(
                             "鼠标目标点被其它窗口覆盖，已停止回放，"
                             "避免点到浏览器/桌面。"
@@ -2599,6 +2777,7 @@ class MacroPlayer(QThread):
                     _send_mouse_button(button, False)
                 except Exception:
                     pass
+            accel_guard.restore()
             if not self._stop_event.is_set():
                 _restore_foreground_window(prev_fg, self.game_hwnd)
             # 相对鼠标回放不要恢复光标：SetCursorPos 可能被游戏当成一次镜头转动

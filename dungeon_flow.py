@@ -406,21 +406,12 @@ class WinGame:
                 self.sleep(0.25)
         except Exception:
             pass
-        app._force_foreground_window(self.hwnd)
-        self.sleep(0.15)
-        try:
-            ok = int(win32gui.GetForegroundWindow() or 0) == self.hwnd
-        except Exception:
-            ok = False
+        ok = bool(app._force_foreground_window(self.hwnd))
         if not ok:
-            app._force_foreground_window(self.hwnd)
-            self.sleep(0.15)
-            try:
-                ok = int(win32gui.GetForegroundWindow() or 0) == self.hwnd
-            except Exception:
-                ok = False
+            self.sleep(0.2)
+            ok = bool(app._force_foreground_window(self.hwnd))
         if not ok:
-            self.log("警告：没能把游戏切到前台（前台模式可能点空）")
+            self.log("警告：没能把游戏切到前台，本次不点击（避免点到别的窗口）")
         return ok
 
     def _client_to_screen(self, client_x: int, client_y: int):
@@ -457,7 +448,9 @@ class WinGame:
             return True
         if self.foreground_mode():
             # 真实鼠标（宏方式）：切到游戏 → 移动光标 → 左键按下/松开
-            self.activate()
+            if not self.activate():
+                self.last_error = "游戏窗口不在前台，已跳过这次点击"
+                return False
             sx, sy = self._client_to_screen(x, y)
             try:
                 win32api.SetCursorPos((sx, sy))
