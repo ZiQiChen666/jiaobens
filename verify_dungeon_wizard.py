@@ -77,9 +77,9 @@ check("步骤表 3 步 + 疲劳说明", len(plan) >= 3
       and any("②" in l for l in plan)
       and any("③" in l for l in plan)
       and any("疲劳" in l for l in plan), str(plan))
-check("页面默认值：40/20/10/30/30/10",
+check("页面默认值：40/24/10/30/30/10",
       df.DEFAULT_PROFILE["enter"]["travel_wait"] == 40.0
-      and df.DEFAULT_PROFILE["enter"]["dialog_timeout"] == 20.0
+      and df.DEFAULT_PROFILE["enter"]["dialog_timeout"] == 24.0
       and df.DEFAULT_PROFILE["enter"]["load_wait"] == 10.0
       and df.DEFAULT_PROFILE["farm"]["travel_wait"] == 30.0
       and df.DEFAULT_PROFILE["farm"]["seconds"] == 30.0
@@ -119,7 +119,7 @@ try:
         "exit_confirm_pt": [0.55, 0.68], "fatigue_pt": [0.10, 0.90],
     })
     wiz.spin_entry_wait.setValue(40.0)
-    wiz.spin_dialog_timeout.setValue(20.0)
+    wiz.spin_dialog_timeout.setValue(24.0)
     wiz.spin_retry.setValue(3)
     wiz.spin_load_wait.setValue(10.0)
     wiz.spin_boss_wait.setValue(30.0)
@@ -150,7 +150,7 @@ try:
     wiz._next()  # 完成 → 保存
     saved = df.load_profile(tmp)
     check("保存走进副本 40s", saved["enter"]["travel_wait"] == 40.0)
-    check("保存等弹窗 20s", saved["enter"]["dialog_timeout"] == 20.0)
+    check("保存等弹窗 24s", saved["enter"]["dialog_timeout"] == 24.0)
     check("保存进本加载 10s", saved["enter"]["load_wait"] == 10.0)
     check("保存跑向 BOSS 30s", saved["farm"]["travel_wait"] == 30.0)
     check("保存挂机 30s", saved["farm"]["seconds"] == 30.0)

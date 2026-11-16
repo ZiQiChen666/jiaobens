@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(3, 10, 0, 0),
-    prodvers=(3, 10, 0, 0),
+    filevers=(3, 11, 0, 0),
+    prodvers=(3, 11, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -13,12 +13,12 @@ VSVersionInfo(
     StringFileInfo([
       StringTable('080404B0', [
         StringStruct('CompanyName', 'CreatureCurios'),
-        StringStruct('FileDescription', 'CreatureCurios 后台按键器 v3.10.0（骑乘判断改成 OCR 读宠物文本：骑乘/休息）'),
-        StringStruct('FileVersion', '3.10.0.0'),
+        StringStruct('FileDescription', 'CreatureCurios 后台按键器 v3.11.0（全部等待改成判定条件驱动：弹窗一出现立刻进本，24s 没弹窗重新寻路）'),
+        StringStruct('FileVersion', '3.11.0.0'),
         StringStruct('InternalName', 'CreatureCuriosKeyer'),
         StringStruct('OriginalFilename', 'CreatureCuriosKeyer.exe'),
         StringStruct('ProductName', 'CreatureCurios 后台按键器'),
-        StringStruct('ProductVersion', '3.10.0.0')
+        StringStruct('ProductVersion', '3.11.0.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])

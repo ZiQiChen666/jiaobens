@@ -23,11 +23,14 @@ ROI_ENTER = [0.32, 0.20, 0.36, 0.16]   # 进本弹窗：x 64..136, y 24..43
 ROI_EXIT = [0.32, 0.60, 0.36, 0.16]    # 退出弹窗：x 64..136, y 72..91
 ROI_MOUNT = [0.02, 0.02, 0.28, 0.16]   # 骑乘弹窗：x 4..60, y 2..21
 ROI_MOUNT_STATE = [0.02, 0.70, 0.22, 0.14]  # 骑乘状态：x 4..48, y 84..100
+ROI_LOADED = [0.70, 0.02, 0.24, 0.14]   # 加载完成标记：x 140..188, y 2..18
+ROI_ARRIVED = [0.70, 0.80, 0.24, 0.14]  # 到达标记：x 140..188, y 96..112
 PT_MOUNT = (0.50, 0.20)
 
 
 def make_frame(enter_dialog=False, exit_dialog=False,
-               mount_dialog=False, mounted=False):
+               mount_dialog=False, mounted=False,
+               loaded=False, arrived=False):
     arr = np.full((H, W, 4), 40, np.uint8)
     arr[..., 3] = 255
     if enter_dialog:
@@ -38,12 +41,17 @@ def make_frame(enter_dialog=False, exit_dialog=False,
         arr[4:19, 8:56] = [120, 200, 90, 255]
     if mounted:
         arr[86:98, 8:44] = [250, 220, 60, 255]
+    if loaded:
+        arr[4:18, 142:186] = [90, 220, 200, 255]
+    if arrived:
+        arr[98:110, 142:186] = [200, 120, 250, 255]
     return (W, H, arr.tobytes())
 
 
 class FakeGame:
     def __init__(self, enter_appears=True, exit_appears=True,
-                 need_entry_click=False):
+                 need_entry_click=False, enter_delay=0.0,
+                 load_delay=0.0, arrive_delay=0.0):
         self.t = 0.0
         self.actions = []
         self.last_error = ""
@@ -53,6 +61,12 @@ class FakeGame:
         self.exit_appears = exit_appears
         self.need_entry_click = need_entry_click
         self.entry_clicked = False
+        self.enter_delay = float(enter_delay)
+        self.load_delay = float(load_delay)
+        self.arrive_delay = float(arrive_delay)
+        self.enter_due = None
+        self.loaded_due = None
+        self.arrived_due = None
         self.enter_popup_at = None
         self.confirm_at = None
         self.confirm_count = 0
@@ -64,10 +78,17 @@ class FakeGame:
         self.t += max(0.0, float(seconds))
 
     def grab(self):
+        if self.enter_due is not None and self.t >= self.enter_due:
+            self.state["enter"] = True
+            if self.enter_popup_at is None:
+                self.enter_popup_at = self.t
+        loaded = self.loaded_due is not None and self.t >= self.loaded_due
+        arrived = self.arrived_due is not None and self.t >= self.arrived_due
         return make_frame(enter_dialog=self.state["enter"],
                           exit_dialog=self.state["exit"],
                           mount_dialog=self.state["mount_dialog"],
-                          mounted=self.state["mounted"])
+                          mounted=self.state["mounted"],
+                          loaded=loaded, arrived=arrived)
 
     def snapshot(self, tag):
         self.actions.append(("snap", tag))
@@ -76,8 +97,11 @@ class FakeGame:
         pt = tuple(round(float(v), 3) for v in point)
         self.actions.append(("click", pt))
         if pt == PT_DUNGEON and self.enter_appears and not self.need_entry_click:
-            self.state["enter"] = True
-            self.enter_popup_at = self.t
+            if self.enter_delay > 0:
+                self.enter_due = self.t + self.enter_delay
+            else:
+                self.state["enter"] = True
+                self.enter_popup_at = self.t
         elif pt == PT_ENTRY:
             self.entry_clicked = True
             if self.need_entry_click and self.enter_appears:
@@ -86,6 +110,10 @@ class FakeGame:
         elif pt == PT_CONFIRM or pt == PT_EXIT_OK:
             if pt == PT_CONFIRM:
                 self.state["enter"] = False
+                if self.load_delay > 0:
+                    self.loaded_due = self.t + self.load_delay
+                else:
+                    self.loaded_due = self.t
             if pt == PT_EXIT_OK:
                 if self.confirm_at is None:
                     self.confirm_at = self.t
@@ -95,6 +123,11 @@ class FakeGame:
             self.state["exit"] = True
         elif pt == PT_MOUNT:
             self.state["mounted"] = True
+        if pt in (PT_BOSS, PT_DUNGEON):
+            if self.arrive_delay > 0:
+                self.arrived_due = self.t + self.arrive_delay
+            else:
+                self.arrived_due = self.t
         return True
 
     def tap(self, name):
@@ -561,12 +594,11 @@ game18 = FakeGame()
 logs18 = []
 r18 = df.DungeonRunner(game18, p18, log=logs18.append)
 
-_real_wait = r18._wait_dialog
-def fake_wait(timeout, poll, sim=None, desc="进本弹窗"):
-    if sim is None:
+def fake_wait(spec, timeout, desc, need=2):
+    if float((spec or {}).get("sim", 0.9)) >= 0.99:
         return False          # 严格阈值假装没匹配到
-    return True               # 放宽后命中
-r18._wait_dialog = fake_wait
+    return True               # 放宽阈值命中
+r18.wait_until = fake_wait
 ok18 = r18.enter_dungeon()
 clicks18 = [a[1] for a in game18.actions if a[0] == "click"]
 check("严格阈值失败 → 放宽阈值后仍能进本",
@@ -579,7 +611,7 @@ p19["mount"]["enabled"] = False
 game19 = FakeGame(enter_appears=False)
 logs19 = []
 r19 = df.DungeonRunner(game19, p19, log=logs19.append)
-r19._wait_dialog = lambda *a, **k: False
+r19.wait_until = lambda *a, **k: False
 ok19 = r19.enter_dungeon()
 clicks19 = [a[1] for a in game19.actions if a[0] == "click"]
 check("识别不到弹窗 → 兜底点一次「进入游戏」", PT_CONFIRM in clicks19, str(clicks19))
@@ -598,6 +630,67 @@ check("骑乘没标区域 → 不按 S",
       not any(a == ("tap", "s") for a in game20.actions), str(game20.actions[:4]))
 check("骑乘没标区域 → 有日志说明",
       any("没标骑乘文本区域" in l for l in logs20), str(logs20))
+
+# ---- 11d) 判定条件驱动：弹窗一出现立刻进本 / 24s 没弹窗重来 ---------
+# (a) 弹窗 3 秒就出现 → 不等满 24 秒就进去
+p21 = build_profile(enter={"dialog_timeout": 24.0, "travel_wait": 40.0})
+p21["mount"]["enabled"] = False
+game21 = FakeGame(enter_delay=3.0, load_delay=2.0)
+logs21 = []
+r21 = df.DungeonRunner(game21, p21, log=logs21.append)
+ok21 = r21.enter_dungeon()
+check("弹窗提前出现 → 立刻进本（不等 24s）", ok21 is True)
+check("进本总耗时远小于 24s", game21.t < 12.0, f"t={game21.t:.1f}")
+check("日志说明是“立刻点”", any("立刻点「进入游戏」" in l for l in logs21),
+      str(logs21[-4:]))
+
+# (b) 24 秒都没弹窗 → 重新寻路（点副本入口 ≥2 次）
+p22 = build_profile(enter={"dialog_timeout": 24.0, "travel_wait": 40.0, "retry": 2})
+p22["mount"]["enabled"] = False
+game22 = FakeGame(enter_appears=False)
+logs22 = []
+r22 = df.DungeonRunner(game22, p22, log=logs22.append)
+r22.wait_until = lambda *a, **k: False     # 始终没弹窗
+ok22 = r22.enter_dungeon()
+clicks22 = [a[1] for a in game22.actions if a[0] == "click"]
+check("没弹窗 → 重新寻路（点副本入口 2 次）",
+      clicks22.count(PT_DUNGEON) == 2, str(clicks22.count(PT_DUNGEON)))
+check("没弹窗 → 最后一次会兜底盲点确认", ok22 is True and
+      any("兜底点一次" in l for l in logs22), str(logs22[-3:]))
+check("日志写清“24s 没进本→重来”",
+      any("没进本 → 重新开地图" in l for l in logs22), str(logs22[-4:]))
+
+# (c) 有「加载完成标记」→ 加载等待提前结束
+p23 = build_profile(enter={"load_wait": 30.0})
+p23["mount"]["enabled"] = False
+p23["enter"]["loaded"] = {
+    "roi": ROI_LOADED,
+    "sig": df.signature(df.crop_norm(make_frame(loaded=True), ROI_LOADED), 12),
+    "grid": 12, "sim": 0.90,
+}
+game23 = FakeGame(load_delay=2.0)
+logs23 = []
+r23 = df.DungeonRunner(game23, p23, log=logs23.append)
+r23.enter_dungeon()
+check("识别到加载完成 → 提前结束（远小于 30s）", game23.t < 15.0, f"t={game23.t:.1f}")
+check("日志有“副本加载完成”", any("副本加载完成" in l for l in logs23),
+      str(logs23[-4:]))
+
+# (d) 有「到达标记」→ 寻路等待提前结束
+p24 = build_profile()
+p24["mount"]["enabled"] = False
+p24["farm"]["travel_wait"] = 30.0
+p24["farm"]["arrived"] = {
+    "roi": ROI_ARRIVED,
+    "sig": df.signature(df.crop_norm(make_frame(arrived=True), ROI_ARRIVED), 12),
+    "grid": 12, "sim": 0.90,
+}
+game24 = FakeGame(arrive_delay=2.0)
+logs24 = []
+r24 = df.DungeonRunner(game24, p24, log=logs24.append)
+ok24 = r24._goto(PT_BOSS, 30.0, "BOSS 点", arrived_spec=r24._arrived_spec())
+check("识别到到达标记 → 不等满 30s", ok24 and game24.t < 12.0, f"t={game24.t:.1f}")
+check("日志有“到达标记”", any("到达标记" in l for l in logs24), str(logs24[-4:]))
 
 # ---- 12) 保存要包含所有参数（轮数/循环/骑乘）-------------------------
 p14 = build_profile()

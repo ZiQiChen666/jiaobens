@@ -72,7 +72,8 @@ DEFAULT_PROFILE: dict = {
         "dialog": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},
         "entry_pt": None,          # 可选：走到副本口后要点的「门口/传送门/NPC」位置
         "confirm_pt": None,        # 弹窗里「进入游戏」按钮 [nx, ny]
-        "dialog_timeout": 20.0,    # 等弹窗最多多久
+        "dialog_timeout": 24.0,    # 点完副本入口后，这么久还没弹窗就重新寻路
+        "loaded": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},  # 可选：进本后特征
         "load_wait": 10.0,         # 点完确认后的加载时间
         "retry": 3,                # 没识别到弹窗 → 重新开图重点，最多几次
     },
@@ -92,7 +93,8 @@ DEFAULT_PROFILE: dict = {
     "farm": {
         "farm_pt": None,           # 地图2 上的「打怪点」[nx, ny]（在这里判断疲劳）
         "boss_pt": None,           # 地图2 上的 BOSS 点 [nx, ny]
-        "travel_wait": 30.0,       # 点完后等自动寻路到 BOSS 附近
+        "travel_wait": 30.0,       # 点完后等自动寻路（有「到达标记」就提前结束）
+        "arrived": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},  # 可选：到达标记
         "seconds": 30.0,           # 挂机多久（多开时每个窗口可不同）
         "interval_ms": 250,
         "use_skills": True,
@@ -765,19 +767,52 @@ class DungeonRunner:
         self.game.tap(key)
         self.game.sleep(0.8)
 
-    def _goto(self, point, wait: float, desc: str) -> bool:
+    def wait_until(self, spec: Optional[dict], timeout: float, desc: str,
+                   need: int = 2) -> bool:
+        """边等边看：区域内连续 need 次命中就立刻返回 True；超时返回 False。"""
+        if not (spec or {}).get("roi"):
+            return False
+        poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
+        start = self.game.now()
+        hits = 0
+        while not self._stopping() and self.game.now() - start < timeout:
+            frame = self.grab()
+            if frame is not None and self.anchor_visible(spec, frame):
+                hits += 1
+                if hits >= max(1, int(need)):
+                    self.log(f"识别到{desc}（{self.game.now() - start:.1f}s）")
+                    return True
+            else:
+                hits = 0
+            self.game.sleep(poll)
+        return False
+
+    def _goto(self, point, wait: float, desc: str,
+              arrived_spec: Optional[dict] = None) -> bool:
+        """点地图点位 → 等自动寻路。有「到达标记」就一到就走，不等满。"""
         if not point:
             self.log(f"「{desc}」没有标定，跳过")
             return False
         self.ensure_mount()
         self.log(f"点「{desc}」({float(point[0]):.3f}, {float(point[1]):.3f})"
-                 f" → 等自动寻路 {wait:.0f}s")
+                 f" → 等自动寻路（最多 {wait:.0f}s）")
         self.open_map()
         if not self.game.click_norm(point):
             self.log(f"点击「{desc}」失败")
             return False
-        self.game.sleep(wait)
+        if (arrived_spec or {}).get("roi"):
+            if self.wait_until(arrived_spec, wait, f"{desc}到达标记"):
+                return True
+            self.log(f"没识别到「{desc}」到达标记，按时间继续")
+        else:
+            self.game.sleep(wait)
         return True
+
+    def _arrived_spec(self) -> dict:
+        return (self._farm().get("arrived") or {})
+
+    def _loaded_spec(self) -> dict:
+        return ((self.p.get("enter") or {}).get("loaded") or {})
 
     # -- ① 进本 --
     def _wait_dialog(self, timeout: float, poll: float,
@@ -789,47 +824,43 @@ class DungeonRunner:
             spec["sim"] = float(sim)
         return self.wait_anchor(spec, timeout, poll, desc)
 
-    def _try_enter_popup(self, timeout: float, poll: float,
-                         confirm_pt) -> bool:
-        """识别弹窗并点「进入游戏」；识别不到就放宽阈值再试，最后兜底点一次。"""
-        spec = self.enter_dialog_spec() or {}
-        load_wait = float((self.p.get("enter") or {}).get("load_wait", 10.0))
+    def _confirm_enter(self, confirm_pt, load_wait: float) -> bool:
+        if not self.game.click_norm(confirm_pt):
+            self.log("点「进入游戏」失败（窗口可能不在前台）")
+            return False
+        self._wait_loaded(load_wait)
+        return True
 
-        if self._wait_dialog(timeout, poll, desc="进本弹窗"):
-            self.log("识别到进本弹窗 → 点「进入游戏」")
-            self.game.click_norm(confirm_pt)
+    def _wait_loaded(self, load_wait: float) -> None:
+        """点完「进入游戏」后等加载：有「加载完成标记」就一到就走。"""
+        spec = self._loaded_spec()
+        if (spec or {}).get("roi"):
+            start = self.game.now()
+            if not self.wait_until(spec, load_wait, "副本加载完成"):
+                left = load_wait - (self.game.now() - start)
+                self.log(f"没识别到「加载完成标记」，再等 {max(0.0, left):.0f}s")
+                if left > 0:
+                    self.game.sleep(left)
+        else:
             self.game.sleep(load_wait)
-            return True
-
-        if spec.get("roi"):
-            base = float(spec.get("sim", 0.90))
-            relaxed = max(0.55, base - 0.20)
-            self.log(f"严格阈值没匹配到，用放宽阈值 {relaxed:.2f} 再看 6 秒…")
-            if self._wait_dialog(6.0, poll, sim=relaxed, desc="进本弹窗(放宽)"):
-                self.log("放宽阈值识别到弹窗 → 点「进入游戏」")
-                self.game.click_norm(confirm_pt)
-                self.game.sleep(load_wait)
-                return True
-
-        # 兜底：很多游戏弹窗其实已经出来了，只是没匹配上 → 盲点一次
-        self.log("没识别到弹窗 → 兜底点一次「进入游戏」（日志会存一张截图）")
-        try:
-            self.game.snapshot("enter_dialog_miss")
-        except Exception:
-            pass
-        ok_click = bool(self.game.click_norm(confirm_pt))
-        self.game.sleep(load_wait)
-        return ok_click
 
     def enter_dungeon(self) -> bool:
-        """① 进本：点副本入口 → 等自动寻路 →（可选点门口）→ 识别弹窗 → 点「进入游戏」。"""
+        """① 进本：点副本入口后**边等边看**弹窗。
+
+        · 弹窗一出现 → 立刻点「进入游戏」（不再傻等）
+        · 等到 dialog_timeout（默认24s）还没弹窗 → 重新开地图再点一次
+        · 最后一次还没弹窗 → 放宽阈值再试 + 兜底盲点一次（存截图）
+        """
         enter = self.p.get("enter") or {}
         confirm_pt = enter.get("confirm_pt")
         entry_pt = enter.get("entry_pt")
         travel = float(enter.get("travel_wait", 40.0))
-        timeout = float(enter.get("dialog_timeout", 20.0))
+        timeout = float(enter.get("dialog_timeout", 24.0))
+        watch = min(travel, timeout) if timeout > 0 else travel
+        grace = float(enter.get("entry_grace", 8.0))
+        load_wait = float(enter.get("load_wait", 10.0))
         attempts = max(1, int(enter.get("retry", 3) or 1))
-        poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
+        spec = self.enter_dialog_spec() or {}
 
         if not enter.get("dungeon_pt"):
             self.log("没有标定「副本入口」，跳过进本这一步")
@@ -841,18 +872,56 @@ class DungeonRunner:
         for attempt in range(1, attempts + 1):
             if self._stopping():
                 return False
-            self.log(f"进本第 {attempt}/{attempts} 次：点副本入口")
-            if not self._goto(enter.get("dungeon_pt"), travel, "副本入口"):
+            self.log(f"进本第 {attempt}/{attempts} 次：点副本入口"
+                     f"（{watch:.0f}s 内没弹窗就重来）")
+            self.ensure_mount()
+            self.open_map()
+            if not self.game.click_norm(enter.get("dungeon_pt")):
+                self.log("点「副本入口」失败")
                 return False
+
+            # 边寻路边看弹窗：一出来就点进去，不等剩余时间
+            if (spec or {}).get("roi"):
+                if self.wait_until(spec, watch, "进本弹窗"):
+                    self.log("弹窗出现了 → 立刻点「进入游戏」（不等剩余时间）")
+                    if self._confirm_enter(confirm_pt, load_wait):
+                        return True
+                    return False
+            else:
+                self.game.sleep(watch)
+
+            # 到门口还要点一下 NPC/传送门的情况
             if entry_pt:
-                # 有的游戏到门口还要点一下传送门/NPC 才弹窗
-                self.log(f"到了 → 点一次「副本门口/NPC」"
-                         f"({float(entry_pt[0]):.3f}, {float(entry_pt[1]):.3f})")
+                self.log("先点一次「副本门口/NPC」再等等看")
                 self.game.click_norm(entry_pt)
-                self.game.sleep(1.2)
-            if self._try_enter_popup(timeout, poll, confirm_pt):
-                return True
-            self.log(f"这次没进去，重新开地图再点一次（{attempt}/{attempts}）")
+                if self.wait_until(spec, grace, "进本弹窗(点门口后)"):
+                    self.log("点门口后弹窗出现了 → 点「进入游戏」")
+                    if self._confirm_enter(confirm_pt, load_wait):
+                        return True
+                    return False
+
+            # 最后一次机会：放宽阈值 + 兜底盲点
+            if attempt >= attempts:
+                if (spec or {}).get("roi"):
+                    base = float(spec.get("sim", 0.90))
+                    relaxed = max(0.55, base - 0.20)
+                    self.log(f"最后一次：放宽阈值 {relaxed:.2f} 再看 {grace:.0f}s")
+                    if self.wait_until({**spec, "sim": relaxed}, grace,
+                                       "进本弹窗(放宽)"):
+                        if self._confirm_enter(confirm_pt, load_wait):
+                            return True
+                        return False
+                self.log("实在没识别到弹窗 → 兜底点一次「进入游戏」（存截图）")
+                try:
+                    self.game.snapshot("enter_dialog_miss")
+                except Exception:
+                    pass
+                if self._confirm_enter(confirm_pt, load_wait):
+                    self.log("兜底点完继续；如果没进本，下一轮会重试")
+                    return True
+                return False
+
+            self.log(f"{watch:.0f}s 没进本 → 重新开地图再点一次（{attempt}/{attempts}）")
         self.log(f"进本失败：{attempts} 次都没能进去")
         return False
 
@@ -916,7 +985,8 @@ class DungeonRunner:
                     return False
                 if not self._goto(farm.get("boss_pt"),
                                   float(farm.get("travel_wait", 30.0)),
-                                  f"BOSS 点({idx}/{rounds})"):
+                                  f"BOSS 点({idx}/{rounds})",
+                                  arrived_spec=self._arrived_spec()):
                     return False
                 if not self.combat(seconds, desc=f"打BOSS{idx}/{rounds}",
                                    action=action):
@@ -925,7 +995,8 @@ class DungeonRunner:
             rounds = max(1, int(loop.get("trash_rounds", 1) or 1))
             seconds = float(loop.get("trash_seconds", 60.0) or 60.0)
             if not self._goto(farm.get("farm_pt"),
-                              float(farm.get("travel_wait", 30.0)), "打怪点"):
+                              float(farm.get("travel_wait", 30.0)), "打怪点",
+                              arrived_spec=self._arrived_spec()):
                 self.log("没标「打怪点」，就在原地打")
             for idx in range(1, rounds + 1):
                 if self._stopping():
@@ -1142,7 +1213,8 @@ class DungeonRunner:
         # 先到「打怪点」，在那里读疲劳决定做什么
         if farm.get("farm_pt"):
             if not self._goto(farm.get("farm_pt"),
-                              float(farm.get("travel_wait", 30.0)), "打怪点"):
+                              float(farm.get("travel_wait", 30.0)), "打怪点",
+                              arrived_spec=self._arrived_spec()):
                 return self._failed("没走到打怪点")
         if seconds is not None:
             # 命令行 --farm-seconds：直接按固定时长打 BOSS 点（老行为）

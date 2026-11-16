@@ -160,6 +160,16 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
         profile.setdefault("farm", {})["hp_roi"] = roi_norm
     elif where == "fatigue.roi":
         profile.setdefault("fatigue", {})["roi"] = roi_norm
+    elif where == "enter.loaded":
+        sig = df.signature(df.crop_norm(f, roi_norm), 12)
+        profile.setdefault("enter", {})["loaded"] = {
+            "roi": roi_norm, "grid": 12, "sig": sig, "sim": 0.90,
+        }
+    elif where == "farm.arrived":
+        sig = df.signature(df.crop_norm(f, roi_norm), 12)
+        profile.setdefault("farm", {})["arrived"] = {
+            "roi": roi_norm, "grid": 12, "sig": sig, "sim": 0.90,
+        }
     elif where == "mount.text":
         profile.setdefault("mount", {})["text_roi"] = roi_norm
     elif where in ("mount.dialog", "mount.state"):
@@ -604,6 +614,26 @@ class DungeonTab(QWidget):
         g.addWidget(self.lbl_mount_state, row0 + 3, 1)
         g.addWidget(btn_mount_text, row0 + 3, 2)
 
+        btn_loaded = QPushButton("框选")
+        btn_loaded.setFixedWidth(72)
+        btn_loaded.clicked.connect(lambda: self._pick_extra_roi("enter.loaded"))
+        self.lbl_loaded = QLabel("未设置")
+        self.lbl_loaded.setObjectName("muted")
+        g.addWidget(QLabel("① 加载完成标记（可选：进本后一眼能看出已进本的块）"),
+                    row0 + 5, 0)
+        g.addWidget(self.lbl_loaded, row0 + 5, 1)
+        g.addWidget(btn_loaded, row0 + 5, 2)
+
+        btn_arrived = QPushButton("框选")
+        btn_arrived.setFixedWidth(72)
+        btn_arrived.clicked.connect(lambda: self._pick_extra_roi("farm.arrived"))
+        self.lbl_arrived = QLabel("未设置")
+        self.lbl_arrived.setObjectName("muted")
+        g.addWidget(QLabel("② 到达标记（可选：跑到点位后才会出现的块）"),
+                    row0 + 6, 0)
+        g.addWidget(self.lbl_arrived, row0 + 6, 1)
+        g.addWidget(btn_arrived, row0 + 6, 2)
+
         row = QHBoxLayout()
         row.addWidget(QLabel("未骑乘文字"))
         self.edit_mount_text = QLineEdit("骑乘")
@@ -616,7 +646,7 @@ class DungeonTab(QWidget):
         self.edit_rest_text.editingFinished.connect(self._save_from_ui)
         row.addWidget(self.edit_rest_text)
         row.addWidget(_hint("读到「未骑乘文字」才点「骑乘」；读到「已骑乘文字」就不点"), 1)
-        g.addLayout(row, row0 + 4, 0, 1, 3)
+        g.addLayout(row, row0 + 7, 0, 1, 3)
         return box
 
     def _build_farm(self) -> QWidget:
@@ -626,7 +656,7 @@ class DungeonTab(QWidget):
         self.spin_entry_wait = self._dspin(1.0, 600.0, 40.0, g, 0, 1)
 
         g.addWidget(QLabel("等弹窗最多"), 0, 2)
-        self.spin_dialog_timeout = self._dspin(3.0, 300.0, 20.0, g, 0, 3)
+        self.spin_dialog_timeout = self._dspin(3.0, 300.0, 24.0, g, 0, 3)
 
         g.addWidget(QLabel("没弹窗重试"), 0, 4)
         self.spin_retry = QSpinBox()
@@ -985,6 +1015,16 @@ class DungeonTab(QWidget):
                 else:
                     label.setText("未设置")
                     label.setStyleSheet("color: #444444;")
+            for spec, label in (
+                (enter.get("loaded") or {}, self.lbl_loaded),
+                (farm.get("arrived") or {}, self.lbl_arrived),
+            ):
+                if (spec or {}).get("roi"):
+                    label.setText("已设置 ✓")
+                    label.setStyleSheet("color: #15803d; font-weight: 600;")
+                else:
+                    label.setText("未设置（可选）")
+                    label.setStyleSheet("color: #444444;")
             hp_roi = farm.get("hp_roi")
             if hp_roi:
                 self.lbl_hp.setText("已设置 ✓")
@@ -1152,6 +1192,22 @@ class DungeonTab(QWidget):
         ):
             self._load_ui()
             self._log("已设置：进本弹窗识别区域")
+
+    def _pick_extra_roi(self, where: str) -> None:
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有绑定窗口", "请先绑定游戏窗口。")
+            return
+        titles = {
+            "enter.loaded": ("副本加载完成标记",
+                             "进本加载完之后才会出现的块（小地图/副本内 UI 都行）"),
+            "farm.arrived": ("到达标记",
+                             "跑到地图点位后才会出现/变成的块（比如 BOSS 血条、光环）"),
+        }
+        title, info = titles.get(where, ("识别区域", ""))
+        if pick_region(self, hwnd, self.profile, where, title, info):
+            self._load_ui()
+            self._log(f"已设置：{title}")
 
     def _pick_mount_roi(self, which: str) -> None:
         hwnd = self._hwnd()
