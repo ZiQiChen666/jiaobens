@@ -568,36 +568,36 @@ class DungeonTab(QWidget):
         btn_dialog.clicked.connect(self._pick_dialog)
         self.lbl_dialog = QLabel("未设置")
         self.lbl_dialog.setObjectName("muted")
-        g.addWidget(QLabel("① 进本弹窗识别区域（区分「进入游戏」弹窗）"), 6, 0)
-        g.addWidget(self.lbl_dialog, 6, 1)
-        g.addWidget(btn_dialog, 6, 2)
+        g.addWidget(QLabel("① 进本弹窗识别区域（区分「进入游戏」弹窗）"), 8, 0)
+        g.addWidget(self.lbl_dialog, 8, 1)
+        g.addWidget(btn_dialog, 8, 2)
 
         btn_exit_dialog = QPushButton("框选")
         btn_exit_dialog.setFixedWidth(72)
         btn_exit_dialog.clicked.connect(self._pick_exit_dialog)
         self.lbl_exit_dialog = QLabel("未设置")
         self.lbl_exit_dialog.setObjectName("muted")
-        g.addWidget(QLabel("③ 退出确认弹窗识别区域（区分「确认退出」弹窗）"), 8, 0)
-        g.addWidget(self.lbl_exit_dialog, 8, 1)
-        g.addWidget(btn_exit_dialog, 8, 2)
+        g.addWidget(QLabel("③ 退出确认弹窗识别区域（区分「确认退出」弹窗）"), 9, 0)
+        g.addWidget(self.lbl_exit_dialog, 9, 1)
+        g.addWidget(btn_exit_dialog, 9, 2)
 
         btn_mount_dialog = QPushButton("框选")
         btn_mount_dialog.setFixedWidth(72)
         btn_mount_dialog.clicked.connect(lambda: self._pick_mount_roi("dialog"))
         self.lbl_mount_dialog = QLabel("未设置")
         self.lbl_mount_dialog.setObjectName("muted")
-        g.addWidget(QLabel("⑤ 骑乘弹窗区域（按 S 弹出来的窗）"), 9, 0)
-        g.addWidget(self.lbl_mount_dialog, 9, 1)
-        g.addWidget(btn_mount_dialog, 9, 2)
+        g.addWidget(QLabel("⑤ 骑乘弹窗区域（按 S 弹出来的窗）"), 10, 0)
+        g.addWidget(self.lbl_mount_dialog, 10, 1)
+        g.addWidget(btn_mount_dialog, 10, 2)
 
         btn_mount_state = QPushButton("框选")
         btn_mount_state.setFixedWidth(72)
         btn_mount_state.clicked.connect(lambda: self._pick_mount_roi("state"))
         self.lbl_mount_state = QLabel("未设置")
         self.lbl_mount_state.setObjectName("muted")
-        g.addWidget(QLabel("⑤ 骑乘状态标记（看图能判断「已骑乘」的那块）"), 10, 0)
-        g.addWidget(self.lbl_mount_state, 10, 1)
-        g.addWidget(btn_mount_state, 10, 2)
+        g.addWidget(QLabel("⑤ 骑乘状态标记（看图能判断「已骑乘」的那块）"), 11, 0)
+        g.addWidget(self.lbl_mount_state, 11, 1)
+        g.addWidget(btn_mount_state, 11, 2)
         return box
 
     def _build_farm(self) -> QWidget:
@@ -659,7 +659,7 @@ class DungeonTab(QWidget):
             "不勾：只用 PostMessage 后台消息（不抢鼠标），但有些游戏不认，会出现“开了地图就不动”。"
         )
         self.chk_foreground.toggled.connect(self._save_from_ui)
-        g.addWidget(self.chk_foreground, 4, 0, 1, 8)
+        g.addWidget(self.chk_foreground, 5, 0, 1, 8)
 
         row = QHBoxLayout()
         self.chk_skills = QCheckBox("放技能 1/2")
@@ -715,6 +715,11 @@ class DungeonTab(QWidget):
         self.spin_trash_rounds.valueChanged.connect(self._save_from_ui)
         row2.addWidget(self.spin_trash_rounds)
         row2.addWidget(QLabel("轮"))
+        row2.addSpacing(16)
+        row2.addWidget(QLabel("打怪时每"))
+        self.spin_fatigue_every = self._dspin(0.0, 600.0, 60.0, None, 0, 0)
+        row2.addWidget(self.spin_fatigue_every)
+        row2.addWidget(QLabel("秒查疲劳(0=不查)"))
         row2.addStretch(1)
         g.addLayout(row2, 4, 0, 1, 8)
         return box
@@ -906,6 +911,7 @@ class DungeonTab(QWidget):
             self.spin_boss_rounds.setValue(int(loop.get("boss_rounds", 1) or 1))
             self.spin_trash_seconds.setValue(float(loop.get("trash_seconds", 60.0)))
             self.spin_trash_rounds.setValue(int(loop.get("trash_rounds", 1) or 1))
+            self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 60.0)))
             self.spin_rounds.setValue(int((p.get("retry") or {}).get("rounds", 0) or 0))
             for name, spec, label in (
                 ("骑乘弹窗", mount.get("dialog") or {}, self.lbl_mount_dialog),
@@ -1012,6 +1018,7 @@ class DungeonTab(QWidget):
             "boss_rounds": int(self.spin_boss_rounds.value()),
             "trash_seconds": float(self.spin_trash_seconds.value()),
             "trash_rounds": int(self.spin_trash_rounds.value()),
+            "fatigue_every": float(self.spin_fatigue_every.value()),
         })
         p.setdefault("retry", {})["rounds"] = int(self.spin_rounds.value())
         p["input_mode"] = "foreground" if self.chk_foreground.isChecked() else "background"

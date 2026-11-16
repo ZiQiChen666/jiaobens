@@ -102,6 +102,8 @@ DEFAULT_PROFILE: dict = {
         "pickup_every": 8.0,       # 挂机期间每隔几秒按一次拾取
     },
     "loop": {
+        "fatigue_every": 60.0,     # 打怪/打BOSS 期间每隔几秒查一次疲劳（0=不查）
+        "max_switch": 3,           # 疲劳变化导致换分支，最多切几次（防来回跳）
         "trash_seconds": 60.0,     # 打怪循环：打多久
         "trash_rounds": 1,         # 打怪循环：打几轮
         "boss_seconds": 30.0,      # BOSS 循环：每只打多久
@@ -535,6 +537,7 @@ class DungeonRunner:
         self.stats = {"ok": 0, "fail": 0, "failed_streak": 0}
         self.stopped = False
         self._last_frame = None
+        self._switch_to: Optional[str] = None
 
     # -- 日志 / 工具 --
     def log(self, text: str) -> None:
@@ -768,33 +771,57 @@ class DungeonRunner:
         return self.wait_anchor(self.enter_dialog_spec(), timeout, poll, "进本弹窗")
 
     # -- ② 打怪点：看疲劳决定去 BOSS 还是打怪 --
-    def decide_action(self) -> str:
-        """在打怪点读疲劳：< -阈值 打BOSS；> +阈值 打怪；中间用默认。"""
+    def action_for_fatigue(self, current) -> str:
+        """疲劳值 → 该做哪个：< -阈值 打BOSS；> +阈值 打怪；其余用默认。"""
         cfg = self.p.get("fatigue") or {}
         loop = self.p.get("loop") or {}
         default = str(loop.get("default_action") or "boss")
-        if not cfg.get("enabled", True):
+        threshold = abs(int(cfg.get("threshold", 800) or 0))
+        if current is None or not threshold:
             return default
+        if current < -threshold:
+            return "boss"
+        if current > threshold:
+            return "farm"
+        return default
+
+    def decide_action(self) -> str:
+        """在打怪点读疲劳：< -阈值 打BOSS；> +阈值 打怪；中间用默认。"""
+        cfg = self.p.get("fatigue") or {}
+        if not cfg.get("enabled", True):
+            return str((self.p.get("loop") or {}).get("default_action") or "boss")
         current, maximum, msg = self.fatigue_check()
         if current is None:
+            default = str((self.p.get("loop") or {}).get("default_action") or "boss")
             self.log(f"疲劳读不到（{msg}），按默认做：{default}")
             return default
         threshold = abs(int(cfg.get("threshold", 800) or 0))
-        self.log(f"当前疲劳 {current}/{maximum}（阈值 ±{threshold}）")
-        if threshold and current < -threshold:
-            self.log(f"疲劳 {current} < -{threshold} → 循环打 BOSS")
-            return "boss"
-        if threshold and current > threshold:
-            self.log(f"疲劳 {current} > +{threshold} → 循环打怪")
-            return "farm"
-        self.log(f"疲劳在 ±{threshold} 之间 → 按默认做：{default}")
-        return default
+        action = self.action_for_fatigue(current)
+        self.log(f"当前疲劳 {current}/{maximum}（阈值 ±{threshold}）→ "
+                 + ("循环打 BOSS" if action == "boss" else "循环打怪"))
+        return action
 
     def run_loops(self) -> bool:
-        """按 decide_action 的结果跑循环。"""
+        """按疲劳分流跑循环；挂机途中疲劳变了会自动换分支（最多 max_switch 次）。"""
         farm = self._farm()
         loop = self.p.get("loop") or {}
         action = self.decide_action()
+        max_switch = max(0, int(loop.get("max_switch", 3) or 0))
+        switched = 0
+        while True:
+            self._switch_to = None
+            if not self._run_branch(action):
+                return False
+            want = self._switch_to
+            if not want or want == action or switched >= max_switch:
+                return True
+            switched += 1
+            self.log(f"疲劳变化 → 从「{action}」切到「{want}」（第 {switched} 次）")
+            action = want
+
+    def _run_branch(self, action: str) -> bool:
+        farm = self._farm()
+        loop = self.p.get("loop") or {}
         if action == "boss":
             rounds = max(1, int(loop.get("boss_rounds", 1) or 1))
             seconds = float(loop.get("boss_seconds", farm.get("seconds", 30.0)) or 30.0)
@@ -805,7 +832,8 @@ class DungeonRunner:
                                   float(farm.get("travel_wait", 30.0)),
                                   f"BOSS 点({idx}/{rounds})"):
                     return False
-                if not self.combat(seconds, desc=f"打BOSS{idx}/{rounds}"):
+                if not self.combat(seconds, desc=f"打BOSS{idx}/{rounds}",
+                                   action=action):
                     return False
         else:
             rounds = max(1, int(loop.get("trash_rounds", 1) or 1))
@@ -816,7 +844,8 @@ class DungeonRunner:
             for idx in range(1, rounds + 1):
                 if self._stopping():
                     return False
-                if not self.combat(seconds, desc=f"打怪{idx}/{rounds}"):
+                if not self.combat(seconds, desc=f"打怪{idx}/{rounds}",
+                                   action=action):
                     return False
         return True
 
@@ -829,8 +858,20 @@ class DungeonRunner:
         total = float(seconds if seconds is not None else farm.get("seconds", 30.0))
         return self.combat(total, desc="BOSS 点挂机")
 
-    def combat(self, seconds: float, desc: str = "挂机") -> bool:
-        """通用挂机：平A + 技能 + 血量低喝药 + 定时拾取。"""
+    def combat(self, seconds: float, desc: str = "挂机",
+               action: Optional[str] = None) -> bool:
+        """通用挂机：平A + 技能 + 血量低喝药 + 定时拾取。
+
+        action 不为空时，每 loop.fatigue_every 秒查一次疲劳，
+        发现该换分支（打BOSS <-> 打怪）就提前结束本次挂机。
+        """
+        loop = self.p.get("loop") or {}
+        fatigue_every = float(loop.get("fatigue_every", 60.0) or 0.0)
+        fatigue_cfg = self.p.get("fatigue") or {}
+        watch = bool(
+            action and fatigue_every > 0 and fatigue_cfg.get("enabled", True)
+        )
+        next_fatigue = fatigue_every
         farm = self._farm()
         interval = max(0.05, float(farm.get("interval_ms", 250)) / 1000.0)
         pickup_key = str(farm.get("pickup_key") or self._key("pickup", "space"))
@@ -882,6 +923,21 @@ class DungeonRunner:
             if pickup_every > 0 and elapsed >= next_pickup:
                 self.game.tap(pickup_key)
                 next_pickup = elapsed + pickup_every
+
+            if watch and elapsed >= next_fatigue:
+                next_fatigue = elapsed + fatigue_every
+                current, maximum, msg = self.fatigue_check()
+                if current is None:
+                    self.log(f"疲劳读不到（{msg}），继续{desc}")
+                else:
+                    want = self.action_for_fatigue(current)
+                    threshold = abs(int(fatigue_cfg.get("threshold", 800) or 0))
+                    self.log(f"{desc}中查疲劳 {current}/{maximum}（阈值 ±{threshold}）"
+                             + ("" if want == action else
+                                " → 该换分支了：" + ("打BOSS" if want == "boss" else "打怪")))
+                    if want != action:
+                        self._switch_to = want
+                        break
 
             self.game.sleep(interval)
 

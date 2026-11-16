@@ -419,10 +419,58 @@ check("疲劳高 → 不去 BOSS 点", PT_BOSS not in clicks13)
 check("打怪循环跑 2 轮（日志有 打怪2/2）",
       any("打怪2/2" in l for l in logs13), str(logs13[-4:]))
 
+# ---- 11b) 打怪期间定时查疲劳 → 自动换分支 ---------------------------
+p15 = build_profile()
+p15["mount"]["enabled"] = False
+p15["farm"]["farm_pt"] = [0.6, 0.6]
+p15["loop"] = {"boss_seconds": 1.0, "boss_rounds": 1,
+               "trash_seconds": 5.0, "trash_rounds": 1,
+               "fatigue_every": 0.5, "max_switch": 2,
+               "default_action": "farm"}
+game15 = FakeGame()
+logs15 = []
+r15 = df.DungeonRunner(game15, p15, log=logs15.append)
+r15.hp_now = lambda: 5000
+r15.fatigue_check = lambda: (900, 1000, "")
+# 先按默认 farm 打，途中疲劳变成 -900 → 应该切到 boss
+seq = {"n": 0}
+
+
+def fake_check():
+    seq["n"] += 1
+    return (-900, 1000, "") if seq["n"] >= 2 else (0, 1000, "")
+
+
+r15.fatigue_check = fake_check
+# decide_action 第一次用 (0,1000) → 默认 farm；挂机中第二次读到 -900 → 切 boss
+r15.p["loop"]["default_action"] = "farm"
+r15.decide_action = lambda: "farm"
+ok15 = r15.run_loops()
+clicks15 = [a[1] for a in game15.actions if a[0] == "click"]
+check("挂机中查到疲劳变化会换分支",
+      any("该换分支了" in l for l in logs15) or any("切到" in l for l in logs15),
+      str(logs15[-6:]))
+check("切换后真的去了 BOSS 点", PT_BOSS in clicks15, str(clicks15[-6:]))
+
+# 关掉定时查疲劳就不该切
+p16 = dict(p15)
+p16["loop"] = dict(p15["loop"], fatigue_every=0)
+game16 = FakeGame()
+logs16 = []
+r16 = df.DungeonRunner(game16, p16, log=logs16.append)
+r16.hp_now = lambda: 5000
+r16.fatigue_check = lambda: (-900, 1000, "")
+r16.decide_action = lambda: "farm"
+r16.run_loops()
+clicks16 = [a[1] for a in game16.actions if a[0] == "click"]
+check("fatigue_every=0 时不换分支", PT_BOSS not in clicks16, str(clicks16[-6:]))
+
 # ---- 12) 保存要包含所有参数（轮数/循环/骑乘）-------------------------
 p14 = build_profile()
 p14.setdefault("retry", {})["rounds"] = 7
 check("轮数能存进 profile", p14["retry"]["rounds"] == 7)
+check("定时查疲劳参数在默认配置里",
+      "fatigue_every" in df.DEFAULT_PROFILE["loop"])
 check("循环参数在默认配置里",
       all(k in df.DEFAULT_PROFILE["loop"]
           for k in ("boss_seconds", "boss_rounds", "trash_seconds", "trash_rounds")))

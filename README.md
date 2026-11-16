@@ -1,4 +1,4 @@
-# CreatureCurios 后台按键器 v3.9.0
+# CreatureCurios 后台按键器 v3.9.1
 
 Windows 桌面小工具：绑定 `CreatureCurios` 窗口后，在后台循环投递 `A`
 （可选空格拾取），可选技能、喝药、疲劳检测、定时提醒，支持**自动打BOSS**、**后台回放（不抢鼠标键盘）**，
@@ -493,6 +493,7 @@ ACCEL 恢复 accel=(6, 10, 1) speed=13
 | `verify_dungeon_foreground.py` | 前台模式自检（切窗口 + 真实鼠标点击） |
 | `verify_mouse_accel.py` | 鼠标加速自检（回放 1:1，结束恢复） |
 | `verify_dungeon_flow.py` | 副本引擎自检（含骑乘/疲劳分流/方案保存） |
+| `verify_ui_layout.py` | 界面自检（检查网格控件有没有叠在一起） |
 | `%APPDATA%\CreatureCuriosKeyer\startup.log` | 启动自检日志（副本页是否加载成功） |
 | `verify_dungeon_flow.py` | 副本流程状态机自检（假窗口，秒级） |
 | `verify_fatigue_background.py` | 疲劳后台点击自检（不移动鼠标） |
@@ -558,6 +559,16 @@ python -m PyInstaller --noconfirm --clean CreatureCuriosKeyer.spec
 | 中间区间 | 按「默认动作」（默认打 BOSS） |
 
 参数都在界面上：`打BOSS [30] 秒 × [1] 只`、`打怪 [60] 秒 × [1] 轮`。
+
+**挂机途中也会复查疲劳**（默认每 60 秒一次，填 0 关闭）：
+在打怪/打BOSS 的循环里复用同一套`疲劳检测`（点疲劳图标 → OCR 读数值），
+一旦数值越过阈值（比如打怪时掉到 `-800` 以下），会立刻结束当前挂机、
+自动切到另一个分支，最多切 3 次（防止来回跳）。日志会写：
+
+```
+打怪1/1中查疲劳 -820/1000（阈值 ±800） → 该换分支了：打BOSS
+疲劳变化 → 从「farm」切到「boss」（第 1 次）
+```
 
 ### 副本方案（命名保存 / 切换）
 

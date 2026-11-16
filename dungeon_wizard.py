@@ -64,6 +64,7 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     loop["boss_rounds"] = max(1, int(answers.get("boss_rounds") or 1))
     loop["trash_seconds"] = max(5.0, float(answers.get("trash_seconds") or 60.0))
     loop["trash_rounds"] = max(1, int(answers.get("trash_rounds") or 1))
+    loop["fatigue_every"] = max(0.0, float(answers.get("fatigue_every") or 0.0))
 
     farm["farm_pt"] = (
         [round(float(v), 5) for v in answers["farm_pt"]]
@@ -118,6 +119,8 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
         f"({loop['boss_seconds']:.0f}s × {loop['boss_rounds']} 只)；"
         f"> +{fatigue['threshold']} 打怪 "
         f"({loop['trash_seconds']:.0f}s × {loop['trash_rounds']} 轮)"
+        + (f"；打怪时每 {loop['fatigue_every']:.0f}s 复查疲劳，越界自动换分支"
+           if loop.get("fatigue_every") else "")
     )
     plan.append(
         f"② 开地图2 → 点 BOSS 点 → 等 {farm['travel_wait']:.0f}s → 挂机 {farm['seconds']:.0f}s"
@@ -207,6 +210,7 @@ class DungeonWizard(QDialog):
             "boss_rounds": int((self.profile.get("loop") or {}).get("boss_rounds", 1) or 1),
             "trash_seconds": float((self.profile.get("loop") or {}).get("trash_seconds", 60.0)),
             "trash_rounds": int((self.profile.get("loop") or {}).get("trash_rounds", 1) or 1),
+            "fatigue_every": float((self.profile.get("loop") or {}).get("fatigue_every", 60.0)),
             "farm_pt": (self.profile.get("farm") or {}).get("farm_pt"),
             "mount_enabled": bool((self.profile.get("mount") or {}).get("enabled", True)),
             "mount_key": (self.profile.get("mount") or {}).get("key", "s"),
@@ -296,6 +300,7 @@ class DungeonWizard(QDialog):
         self.answers["boss_rounds"] = int(self.spin_boss_rounds.value())
         self.answers["trash_seconds"] = float(self.spin_trash_seconds.value())
         self.answers["trash_rounds"] = int(self.spin_trash_rounds.value())
+        self.answers["fatigue_every"] = float(self.spin_fatigue_every.value())
         self.answers["mount_enabled"] = bool(self.chk_mount.isChecked())
         self.answers["mount_key"] = self.edit_mount_key.text().strip() or "s"
         self.answers["exit_settle"] = float(self.spin_exit_settle.value())
@@ -534,6 +539,12 @@ class DungeonWizard(QDialog):
         self.spin_trash_rounds.setFixedWidth(60)
         g.addWidget(self.spin_trash_rounds, 3, 3)
         g.addWidget(QLabel("轮"), 3, 4)
+
+        g.addWidget(QLabel("打怪时每"), 4, 0)
+        self.spin_fatigue_every = self._dspin(0.0, 600.0,
+                                              self.answers["fatigue_every"])
+        g.addWidget(self.spin_fatigue_every, 4, 1)
+        g.addWidget(_hint("秒查一次疲劳（0=不查），越过阈值会自动换分支"), 4, 2, 1, 3)
         lay.addLayout(g)
 
         row = QHBoxLayout()
