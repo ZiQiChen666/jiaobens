@@ -98,8 +98,10 @@ DEFAULT_PROFILE: dict = {
         "boss_pt": None,           # 地图2 上的 BOSS 点 [nx, ny]
         "travel_wait": 30.0,       # 点完后等自动寻路（有「到达标记」就提前结束）
         "arrived": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},  # 可选：到达标记
-        "boss_present": {"roi": None, "sig": [], "grid": 12, "sim": 0.60,
-                         "search": 1.6, "tol": 30.0},  # BOSS 身形（会走会晃）
+        "boss_present": {"roi": None, "sig": [], "sigs": [], "grid": 12,
+                         "sim": 0.60, "search": 1.6, "tol": 30.0,
+                         "still_seconds": 0.8, "still_timeout": 12.0,
+                         "still_diff": 0.015},  # BOSS 身形（多张样本 + 停下才识别）
         "boss_hp": {"roi": None, "min_ink": 0.02, "miss": 3},               # BOSS 血条
         "finish": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},        # 旧版，已不用
         "boss_retry": 3,           # 没识别到「打怪点BOSS」就重新寻路几次
@@ -613,6 +615,47 @@ class DungeonRunner:
         self._last_frame = frame
         return frame
 
+    def frame_diff(self, a, b) -> float:
+        """两张截图不一样的程度（0=完全一样，1=差很多）。用于判断“人停下来了没”。"""
+        try:
+            w = min(a[0], b[0])
+            h = min(a[1], b[1])
+            pa = frame_array(a)[:h, :w, :3].astype(np.int16)
+            pb = frame_array(b)[:h, :w, :3].astype(np.int16)
+            step_y = max(1, h // 32)
+            step_x = max(1, w // 32)
+            pa = pa[::step_y, ::step_x]
+            pb = pb[::step_y, ::step_x]
+            return float(np.abs(pa - pb).mean() / 255.0)
+        except Exception:
+            return 1.0
+
+    def wait_scene_still(self, seconds: float = 0.8, timeout: float = 12.0,
+                         diff_thresh: float = 0.015) -> bool:
+        """等人停下来：连续 seconds 秒画面几乎不变就算静止。"""
+        poll = max(0.05, float((self.p.get("detect") or {}).get("poll", 0.2)))
+        start = self.game.now()
+        still_since = None
+        prev = self.grab()
+        while not self._stopping() and self.game.now() - start < timeout:
+            self.game.sleep(poll)
+            cur = self.grab()
+            if prev is None or cur is None:
+                prev = cur
+                continue
+            diff = self.frame_diff(prev, cur)
+            prev = cur
+            if diff <= diff_thresh:
+                if still_since is None:
+                    still_since = self.game.now()
+                if self.game.now() - still_since >= seconds:
+                    self.log(f"画面已静止 {seconds:.1f}s（差异 {diff:.3f}）→ 到位")
+                    return True
+            else:
+                still_since = None
+        self.log(f"等了 {timeout:.0f}s 画面还在动（可能在走路/打架）")
+        return False
+
     def _detect_cfg(self, key: str, default: float) -> float:
         return float((self.p.get("detect") or {}).get(key, default))
 
@@ -629,14 +672,19 @@ class DungeonRunner:
         grid = int(spec.get("grid", 12))
         tol = float(spec.get("tol", 18.0))
         cur = signature(patch, grid)
-        best = similarity(sig, cur, tol)
+        templates = [t for t in (spec.get("sigs") or []) if t]
+        if sig:
+            templates.insert(0, sig)
+        if not templates:
+            return -1.0, ink
+        best = max(similarity(t, cur, tol) for t in templates)
         search = float(spec.get("search", 1.0) or 1.0)
         if search > 1.02:
-            # BOSS 会晃/会动：把区域往外扩一点，滑动找最像的位置
             best = max(best, self._search_similarity(spec, frame, search))
         return best, ink
 
     def _search_similarity(self, spec: dict, frame, search: float) -> float:
+        """在放大后的区域里滑动搜索，取所有样本里最像的。"""
         """在大一圈的区域里滑动找最像的位置（BOSS 会走会晃，不能只比原位）。"""
         try:
             rx, ry, rw, rh = (float(v) for v in spec["roi"])
@@ -648,14 +696,19 @@ class DungeonRunner:
             arr = crop_norm(frame, big)
             if arr.size == 0:
                 return 0.0
-            sig = spec.get("sig") or []
+            templates = [t for t in (spec.get("sigs") or []) if t]
+            if spec.get("sig"):
+                templates.insert(0, spec["sig"])
+            if not templates:
+                return 0.0
             grid = int(spec.get("grid", 12))
             tol = float(spec.get("tol", 30.0))
             h, w = arr.shape[:2]
             cell = max(3, min(h, w) // grid)
             span = cell * grid
             if span > h or span > w:
-                return similarity(sig, signature(arr, grid), tol)
+                whole = signature(arr, grid)
+                return max(similarity(t, whole, tol) for t in templates)
             step = max(1, cell // 2)
             best = 0.0
             y = 0
@@ -663,12 +716,19 @@ class DungeonRunner:
                 x = 0
                 while x + span <= w:
                     patch = arr[y:y + span, x:x + span]
-                    best = max(best, similarity(sig, signature(patch, grid), tol))
-                    if best >= 0.99:
-                        return best
+                    win = signature(patch, grid)
+                    for t in templates:
+                        sim = similarity(t, win, tol)
+                        if sim > best:
+                            best = sim
+                            if best >= 0.99:
+                                return best
                     x += step
                 y += step
-            return max(best, similarity(sig, signature(arr, grid), tol))
+            whole = signature(arr, grid)
+            for t in templates:
+                best = max(best, similarity(t, whole, tol))
+            return best
         except Exception:
             return 0.0
 
@@ -1176,14 +1236,20 @@ class DungeonRunner:
             if self._stopping():
                 return False
             self.log(f"前往 BOSS 点（第 {attempt}/{tries} 次）")
-            # 边走边看 BOSS 身形：到了/看见了就立刻开打
+            # 走路时画面一直在动，先不识别；等停下来再看 BOSS
             if not self._goto(farm.get("boss_pt"), travel, "BOSS 点",
-                              watch_spec=spec, watch_desc="BOSS 身形"):
+                              sleep_after=False):
                 return False
-            self.gap("到 BOSS 点后缓冲")
             if not (spec or {}).get("roi"):
+                self.game.sleep(travel)
                 return True
-            if self.wait_until(spec, 3.0, "BOSS 身形"):
+            still_s = float(spec.get("still_seconds", 0.8) or 0.8)
+            still_t = float(spec.get("still_timeout", 12.0) or 12.0)
+            still_d = float(spec.get("still_diff", 0.015) or 0.015)
+            self.log("等角色停下（画面不动了再识别 BOSS）")
+            self.wait_scene_still(still_s, still_t, still_d)
+            self.gap("到 BOSS 点后缓冲")
+            if self.wait_until(spec, 6.0, "BOSS 身形"):
                 return True
             self.log("没识别到「BOSS 身形」→ 回到上一步重新寻路")
         self.log(f"BOSS 点确认失败：{tries} 次都没识别到 BOSS 身形")

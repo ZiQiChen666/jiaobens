@@ -29,7 +29,7 @@ ROI_BOSS_HP = [0.60, 0.06, 0.34, 0.06]   # BOSS 血条：x 120..188, y 7..14
 
 
 def make_frame(enter_dialog=False, exit_dialog=False, progress=None,
-               boss_body=False, boss_hp=False):
+               boss_body=False, boss_hp=False, boss_body_alt=False):
     arr = np.full((H, W, 4), 40, np.uint8)
     arr[..., 3] = 255
     if enter_dialog:
@@ -42,6 +42,9 @@ def make_frame(enter_dialog=False, exit_dialog=False, progress=None,
             arr[61:69, 60:60 + filled] = [70, 230, 120, 255]
     if boss_body:
         arr[36:72, 8:60] = [180, 90, 200, 255]
+    if boss_body_alt:      # 另一个角度/动作的 BOSS（第 2 张样本）
+        arr[36:72, 8:60] = [200, 120, 60, 255]
+        arr[40:50, 20:40] = [120, 200, 90, 255]
     if boss_hp:
         arr[7:14, 120:188] = [230, 60, 60, 255]
     return (W, H, arr.tobytes())
@@ -50,7 +53,7 @@ def make_frame(enter_dialog=False, exit_dialog=False, progress=None,
 class FakeGame:
     def __init__(self, enter_appears=True, fill_time=2.0, fill_max=1.0,
                  body_appears=True, hp_dead_after_a=8,
-                 exit_appears=True):
+                 exit_appears=True, frames_move_first=0):
         self.t = 0.0
         self.actions = []
         self.enter_appears = enter_appears
@@ -64,6 +67,8 @@ class FakeGame:
         self.a_count = 0
         self.pickup_count = 0
         self.confirm_count = 0
+        self.frames_move_first = int(frames_move_first)
+        self.grab_count = 0
 
     def now(self):
         return self.t
@@ -82,6 +87,10 @@ class FakeGame:
         return self.a_count < self.hp_dead_after_a
 
     def grab(self):
+        self.grab_count += 1
+        if self.frames_move_first and self.grab_count <= self.frames_move_first:
+            # 前几帧模拟“人在走”：画面明显不同
+            return make_frame(progress=None, boss_body=(self.grab_count % 2 == 0))
         return make_frame(
             enter_dialog=self.state["enter"],
             exit_dialog=self.state["exit"],
@@ -340,6 +349,42 @@ check("BOSS 身形在路上出现 → 立刻确认",
 check("寻路日志改成“边走边看”",
       any("边走边看" in l for l in logs_boss), str(logs_boss[:3]))
 
+# ---- 7d) 多张样本：任一张像就算命中 --------------------------------
+p_multi = build_profile()
+_spec = p_multi["farm"]["boss_present"]
+_spec["sigs"] = [
+    _spec["sig"],
+    df.signature(df.crop_norm(make_frame(boss_body_alt=True), ROI_BOSS_BODY), 12),
+]
+game_m = FakeGame()
+r_m = df.DungeonRunner(game_m, p_multi, log=lambda _s: None)
+
+
+class _G2:
+    def __init__(self, frame):
+        self.frame = frame
+    def grab(self):
+        return self.frame
+    def now(self):
+        return 0.0
+
+
+ALT_FRAME = make_frame(boss_body=False, boss_body_alt=True)
+_sim, _ink = r_m.anchor_metrics(_spec, ALT_FRAME)
+check("多张样本：第 2 张样本也能命中", _sim >= 0.60, f"相似度 {_sim:.2f}")
+
+# ---- 7e) 走路时不动识别，停下才识别 --------------------------------
+p_still = build_profile()
+p_still["farm"]["boss_present"]["still_seconds"] = 0.4
+p_still["farm"]["boss_present"]["still_timeout"] = 3.0
+game_still = FakeGame(frames_move_first=6)   # 前 6 帧画面在动
+logs_still = []
+r_still = df.DungeonRunner(game_still, p_still, log=logs_still.append)
+game_still.state["body"] = False
+ok_still = r_still.wait_scene_still(0.4, 3.0, 0.015)
+check("画面在动时会一直等", any("画面已静止" in l for l in logs_still)
+      or any("还在动" in l for l in logs_still), str(logs_still[-3:]))
+
 # ---- 8) 配置检查 ----------------------------------------------------
 check("配置里有 BOSS 身形 / BOSS 血条",
       "boss_present" in df.DEFAULT_PROFILE["farm"]
@@ -362,4 +407,4 @@ print()
 if fails:
     print("FAIL:", fails)
     sys.exit(1)
-print("PASS: 副本引擎 v3.13（只跑BOSS流程 + 进度条 + BOSS身形 + 血条判死）全部通过")
+print("PASS: 副本引擎 v3.16（停下识别 + 10张BOSS样本 + 进度条 + 血条判死）全部通过")

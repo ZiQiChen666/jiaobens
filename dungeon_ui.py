@@ -172,8 +172,9 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
     elif where == "farm.boss_present":
         sig = df.signature(df.crop_norm(f, roi_norm), 12)
         profile.setdefault("farm", {})["boss_present"] = {
-            "roi": roi_norm, "grid": 12, "sig": sig,
+            "roi": roi_norm, "grid": 12, "sig": sig, "sigs": [sig],
             "sim": 0.60, "search": 1.6, "tol": 30.0,
+            "still_seconds": 0.8, "still_timeout": 12.0, "still_diff": 0.015,
         }
     elif where == "farm.boss_hp":
         profile.setdefault("farm", {})["boss_hp"] = {
@@ -641,10 +642,17 @@ class DungeonTab(QWidget):
         btn_bossflag.clicked.connect(lambda: self._pick_extra_roi("farm.boss_present"))
         self.lbl_bossflag = QLabel("未设置")
         self.lbl_bossflag.setObjectName("muted")
-        g.addWidget(QLabel("② BOSS 身形（框住 BOSS 本体，相似度高才开打）"),
-                    row0 + 6, 0)
+        g.addWidget(QLabel("② BOSS 身形（先框选，再采 10 张样本）"), row0 + 6, 0)
         g.addWidget(self.lbl_bossflag, row0 + 6, 1)
+        btn_boss_samples = QPushButton("采样本")
+        btn_boss_samples.setFixedWidth(72)
+        btn_boss_samples.setToolTip(
+            "站在 BOSS 面前点这个：自动抓 10 张（每 0.3 秒一张），"
+            "不同角度/动作都能认出来"
+        )
+        btn_boss_samples.clicked.connect(self._capture_boss_samples)
         g.addWidget(btn_bossflag, row0 + 6, 2)
+        g.addWidget(btn_boss_samples, row0 + 6, 3)
 
         btn_bosshp = QPushButton("框选")
         btn_bosshp.setFixedWidth(72)
@@ -1069,7 +1077,10 @@ class DungeonTab(QWidget):
                 (farm.get("boss_hp") or {}, self.lbl_finish),
             ):
                 if (spec or {}).get("roi"):
-                    label.setText("已设置 ✓")
+                    extra = ""
+                    if isinstance(spec, dict) and "sigs" in spec:
+                        extra = f"，样本 {len([t for t in (spec.get('sigs') or []) if t])} 张"
+                    label.setText(f"已设置 ✓{extra}")
                     label.setStyleSheet("color: #15803d; font-weight: 600;")
                 else:
                     label.setText("未设置（可选）")
@@ -1236,6 +1247,61 @@ class DungeonTab(QWidget):
         ):
             self._load_ui()
             self._log("已设置：进本弹窗识别区域")
+
+    def _capture_boss_samples(self) -> None:
+        """站在 BOSS 面前点一下：连拍 10 张当样本（不同角度/动作都能认出来）。"""
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有绑定窗口", "请先绑定游戏窗口。")
+            return
+        spec = (self.profile.get("farm") or {}).get("boss_present") or {}
+        roi = (spec or {}).get("roi")
+        if not roi:
+            QMessageBox.information(
+                self, "先框选",
+                "先用「框选」把 BOSS 本体框一下（框住 BOSS 身上不动的部分），"
+                "然后再点「采样本」。",
+            )
+            return
+        sigs = [t for t in (spec.get("sigs") or []) if t]
+        if spec.get("sig") and spec.get("sig") not in sigs:
+            sigs.insert(0, spec["sig"])
+        added = 0
+        grid = int(spec.get("grid", 12))
+        for i in range(10):
+            frame = app.capture_client_bgra(hwnd)[0]
+            if frame is None:
+                break
+            try:
+                patch = df.crop_norm(frame, roi)
+                sig = df.signature(patch, grid)
+            except Exception:
+                sig = []
+            if not sig:
+                break
+            if all(df.similarity(sig, old, 30.0) < 0.98 for old in sigs):
+                sigs.append(sig)
+                added += 1
+            self._log(f"采样本 {i + 1}/10 …")
+            self._game_sleep(0.3)
+        spec["sigs"] = sigs
+        spec["sig"] = sigs[0] if sigs else []
+        self.profile.setdefault("farm", {})["boss_present"] = spec
+        self._save()
+        self._load_ui()
+        self._log(f"BOSS 样本采集完成：新增 {added} 张，共 {len(sigs)} 张")
+        QMessageBox.information(
+            self, "采样本完成",
+            f"新增 {added} 张，共 {len(sigs)} 张样本。\n"
+            "建议：BOSS 走动/放技能时多点几次「采样本」，样本越多越不容易漏。",
+        )
+
+    @staticmethod
+    def _game_sleep(seconds: float) -> None:
+        import time as _time
+        _t = _time.monotonic() + max(0.0, float(seconds))
+        while _time.monotonic() < _t:
+            _time.sleep(0.02)
 
     def _pick_extra_roi(self, where: str) -> None:
         hwnd = self._hwnd()
