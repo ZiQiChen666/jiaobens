@@ -506,24 +506,16 @@ class DungeonWizard(QDialog):
             "程序会先跑到那里读疲劳值，再决定是打 BOSS 还是打怪；"
             "然后再点 BOSS 所在的位置。"
         ))
-        row_farm = QHBoxLayout()
-        btn_farm = QPushButton("① 截图并点「打怪点」")
-        btn_farm.clicked.connect(self._pick_farm_pt)
-        self.lbl_farm_pt = QLabel(self._pt_text(self.answers.get("farm_pt")))
-        row_farm.addWidget(btn_farm)
-        row_farm.addWidget(self.lbl_farm_pt, 1)
-        lay.addLayout(row_farm)
-
         row_boss = QHBoxLayout()
-        btn = QPushButton("② 截图并点「BOSS 点」")
+        btn = QPushButton("① 截图并点「副本内 BOSS 点」")
         btn.clicked.connect(self._pick_boss)
         self.lbl_boss = QLabel(self._pt_text(self.answers.get("boss_pt")))
         row_boss.addWidget(btn)
         row_boss.addWidget(self.lbl_boss, 1)
         lay.addLayout(row_boss)
         row_flag = QHBoxLayout()
-        btn_bossflag = QPushButton("③ 框住「打怪点BOSS标志」")
-        btn_bossflag.setToolTip("站到 BOSS 面前才有的东西；没识别到会重新寻路")
+        btn_bossflag = QPushButton("② 框住「BOSS 身形」")
+        btn_bossflag.setToolTip("框住 BOSS 本体；相似度高才开始打，不够就重新寻路")
         btn_bossflag.clicked.connect(lambda: self._pick_farm_roi("boss_present"))
         self.lbl_bossflag = QLabel("未设置")
         row_flag.addWidget(btn_bossflag)
@@ -531,9 +523,9 @@ class DungeonWizard(QDialog):
         lay.addLayout(row_flag)
 
         row_finish = QHBoxLayout()
-        btn_finish = QPushButton("④ 框住「打怪完成标志」")
-        btn_finish.setToolTip("BOSS 打完/通关才出现的东西；看到它就停手退出")
-        btn_finish.clicked.connect(lambda: self._pick_farm_roi("finish"))
+        btn_finish = QPushButton("③ 框住「BOSS 血条」")
+        btn_finish.setToolTip("框住 BOSS 头顶血条；血条连续几次不见就判定打完")
+        btn_finish.clicked.connect(lambda: self._pick_farm_roi("boss_hp"))
         self.lbl_finish = QLabel("未设置")
         row_finish.addWidget(btn_finish)
         row_finish.addWidget(self.lbl_finish, 1)
@@ -551,10 +543,10 @@ class DungeonWizard(QDialog):
 
     def _pick_farm_roi(self, which: str) -> None:
         titles = {
-            "boss_present": ("打怪点BOSS标志",
-                             "站到 BOSS 面前才出现的东西（名字/血条/头像）"),
-            "finish": ("打怪完成标志",
-                       "BOSS 打完才出现的东西（结算提示/宝箱/掉落面板）"),
+            "boss_present": ("BOSS 身形",
+                             "框住 BOSS 本体（别框会动的特效）"),
+            "boss_hp": ("BOSS 血条",
+                        "框住 BOSS 头顶那条血条（打怪时看它在不在）"),
         }
         title, info = titles.get(which, ("识别区域", ""))
         if dui.pick_region(self, self.hwnd, self.profile, f"farm.{which}",
@@ -564,18 +556,13 @@ class DungeonWizard(QDialog):
     def _refresh_farm_roi_state(self) -> None:
         farm = self.profile.get("farm") or {}
         for key, label in (("boss_present", self.lbl_bossflag),
-                           ("finish", self.lbl_finish)):
+                           ("boss_hp", self.lbl_finish)):
             if ((farm.get(key) or {}).get("roi")):
                 label.setText("已设置 ✓")
                 label.setStyleSheet("color: #15803d; font-weight: 600;")
             else:
                 label.setText("未设置")
                 label.setStyleSheet("color: #444444;")
-
-    def _pick_farm_pt(self) -> None:
-        self._pick_point("farm_pt", "点打怪点",
-                         "这里显示的是地图2（副本地图）。点一下「打怪点」位置。", True)
-        self.lbl_farm_pt.setText(self._pt_text(self.answers.get("farm_pt")))
 
     def _pick_boss(self) -> None:
         self._pick_point("boss_pt", "点 BOSS 点",
