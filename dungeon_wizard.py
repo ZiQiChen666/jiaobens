@@ -60,6 +60,8 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     farm["potion_every"] = max(1.0, float(answers.get("potion_every") or 6.0))
     farm["pickup_every"] = max(0.0, float(answers.get("pickup_every") or 8.0))
     farm["use_skills"] = bool(answers.get("use_skills", True))
+    farm["pickup_on_a"] = bool(answers.get("pickup_on_a", True))
+    p["action_gap"] = max(0.0, float(answers.get("action_gap") or 0.0))
 
     loop = p.setdefault("loop", {})
     loop["boss_seconds"] = max(5.0, float(answers.get("boss_seconds") or 30.0))
@@ -219,6 +221,8 @@ class DungeonWizard(QDialog):
             "trash_rounds": int((self.profile.get("loop") or {}).get("trash_rounds", 1) or 1),
             "fatigue_every": float((self.profile.get("loop") or {}).get("fatigue_every", 60.0)),
             "farm_pt": (self.profile.get("farm") or {}).get("farm_pt"),
+            "pickup_on_a": bool((self.profile.get("farm") or {}).get("pickup_on_a", True)),
+            "action_gap": float(self.profile.get("action_gap", 1.0)),
             "mount_enabled": bool((self.profile.get("mount") or {}).get("enabled", True)),
             "mount_key": (self.profile.get("mount") or {}).get("key", "s"),
             "mount_text": (self.profile.get("mount") or {}).get("mount_text", "骑乘"),
@@ -310,6 +314,8 @@ class DungeonWizard(QDialog):
         self.answers["trash_seconds"] = float(self.spin_trash_seconds.value())
         self.answers["trash_rounds"] = int(self.spin_trash_rounds.value())
         self.answers["fatigue_every"] = float(self.spin_fatigue_every.value())
+        self.answers["pickup_on_a"] = bool(self.chk_pickup_on_a.isChecked())
+        self.answers["action_gap"] = float(self.spin_action_gap.value())
         self.answers["mount_enabled"] = bool(self.chk_mount.isChecked())
         self.answers["mount_key"] = self.edit_mount_key.text().strip() or "s"
         self.answers["mount_text"] = self.edit_mount_text.text().strip() or "骑乘"
@@ -426,12 +432,12 @@ class DungeonWizard(QDialog):
         lay.addLayout(row2)
 
         row2b = QHBoxLayout()
-        btn_entry = QPushButton("可选：点「副本门口/NPC」的位置")
-        btn_entry.setToolTip("有的游戏走到门口还要点一下传送门/NPC 才弹窗；没有就跳过")
-        btn_entry.clicked.connect(self._pick_entry_pt)
-        self.lbl_entry_pt = QLabel(self._pt_text(self.answers.get("entry_pt")))
-        row2b.addWidget(btn_entry)
-        row2b.addWidget(self.lbl_entry_pt, 1)
+        btn_progress = QPushButton("③ 框住「加载进度条」区域")
+        btn_progress.setToolTip("进本读条那条进度条；程序连拍多帧量填充比例，≥90% 才算加载完")
+        btn_progress.clicked.connect(self._pick_progress)
+        self.lbl_progress = QLabel("未设置")
+        row2b.addWidget(btn_progress)
+        row2b.addWidget(self.lbl_progress, 1)
         lay.addLayout(row2b)
 
         row3 = QHBoxLayout()
@@ -451,6 +457,7 @@ class DungeonWizard(QDialog):
         row3.addStretch(1)
         lay.addLayout(row3)
         self._refresh_dialog_state()
+        self._refresh_progress_state()
         lay.addStretch(1)
         return page
 
@@ -469,11 +476,20 @@ class DungeonWizard(QDialog):
                            "框住弹窗里固定不变的部分（标题/按钮区），别框会闪的动画"):
             self._refresh_dialog_state()
 
-    def _pick_entry_pt(self) -> None:
-        self._pick_point("entry_pt", "点「副本门口/NPC」",
-                         "走到副本门口后还要点一下的那个传送门/NPC 位置（可选）。",
-                         False)
-        self.lbl_entry_pt.setText(self._pt_text(self.answers.get("entry_pt")))
+    def _pick_progress(self) -> None:
+        if dui.pick_region(self, self.hwnd, self.profile, "enter.progress",
+                           "加载进度条区域",
+                           "框住进本时的读条（整条，从起点到终点）"):
+            self._refresh_progress_state()
+
+    def _refresh_progress_state(self) -> None:
+        spec = (self.profile.get("enter") or {}).get("progress") or {}
+        if (spec or {}).get("roi"):
+            self.lbl_progress.setText("已设置 ✓")
+            self.lbl_progress.setStyleSheet("color: #15803d; font-weight: 600;")
+        else:
+            self.lbl_progress.setText("未设置")
+            self.lbl_progress.setStyleSheet("color: #444444;")
 
     def _pick_confirm(self) -> None:
         self._pick_point("confirm_pt", "点「进入游戏」按钮",
@@ -505,14 +521,56 @@ class DungeonWizard(QDialog):
         row_boss.addWidget(btn)
         row_boss.addWidget(self.lbl_boss, 1)
         lay.addLayout(row_boss)
+        row_flag = QHBoxLayout()
+        btn_bossflag = QPushButton("③ 框住「打怪点BOSS标志」")
+        btn_bossflag.setToolTip("站到 BOSS 面前才有的东西；没识别到会重新寻路")
+        btn_bossflag.clicked.connect(lambda: self._pick_farm_roi("boss_present"))
+        self.lbl_bossflag = QLabel("未设置")
+        row_flag.addWidget(btn_bossflag)
+        row_flag.addWidget(self.lbl_bossflag, 1)
+        lay.addLayout(row_flag)
+
+        row_finish = QHBoxLayout()
+        btn_finish = QPushButton("④ 框住「打怪完成标志」")
+        btn_finish.setToolTip("BOSS 打完/通关才出现的东西；看到它就停手退出")
+        btn_finish.clicked.connect(lambda: self._pick_farm_roi("finish"))
+        self.lbl_finish = QLabel("未设置")
+        row_finish.addWidget(btn_finish)
+        row_finish.addWidget(self.lbl_finish, 1)
+        lay.addLayout(row_finish)
+
         row = QHBoxLayout()
         row.addWidget(QLabel("点完后等寻路"))
         self.spin_boss_wait = self._dspin(1.0, 600.0, self.answers["boss_wait"])
         row.addWidget(self.spin_boss_wait)
         row.addWidget(_hint("默认 30 秒"), 1)
         lay.addLayout(row)
+        self._refresh_farm_roi_state()
         lay.addStretch(1)
         return page
+
+    def _pick_farm_roi(self, which: str) -> None:
+        titles = {
+            "boss_present": ("打怪点BOSS标志",
+                             "站到 BOSS 面前才出现的东西（名字/血条/头像）"),
+            "finish": ("打怪完成标志",
+                       "BOSS 打完才出现的东西（结算提示/宝箱/掉落面板）"),
+        }
+        title, info = titles.get(which, ("识别区域", ""))
+        if dui.pick_region(self, self.hwnd, self.profile, f"farm.{which}",
+                           title, info):
+            self._refresh_farm_roi_state()
+
+    def _refresh_farm_roi_state(self) -> None:
+        farm = self.profile.get("farm") or {}
+        for key, label in (("boss_present", self.lbl_bossflag),
+                           ("finish", self.lbl_finish)):
+            if ((farm.get(key) or {}).get("roi")):
+                label.setText("已设置 ✓")
+                label.setStyleSheet("color: #15803d; font-weight: 600;")
+            else:
+                label.setText("未设置")
+                label.setStyleSheet("color: #444444;")
 
     def _pick_farm_pt(self) -> None:
         self._pick_point("farm_pt", "点打怪点",
@@ -566,11 +624,19 @@ class DungeonWizard(QDialog):
         g.addWidget(self.spin_trash_rounds, 3, 3)
         g.addWidget(QLabel("轮"), 3, 4)
 
-        g.addWidget(QLabel("打怪时每"), 4, 0)
+        self.chk_pickup_on_a = QCheckBox("每次平A后都拾取")
+        self.chk_pickup_on_a.setChecked(bool(self.answers["pickup_on_a"]))
+        g.addWidget(self.chk_pickup_on_a, 4, 0, 1, 2)
+        g.addWidget(QLabel("动作缓冲"), 4, 2)
+        self.spin_action_gap = self._dspin(0.0, 10.0, self.answers["action_gap"])
+        g.addWidget(self.spin_action_gap, 4, 3)
+        g.addWidget(_hint("秒（进本后/到点后/拾取后）"), 4, 4, 1, 3)
+
+        g.addWidget(QLabel("打怪时每"), 5, 0)
         self.spin_fatigue_every = self._dspin(0.0, 600.0,
                                               self.answers["fatigue_every"])
-        g.addWidget(self.spin_fatigue_every, 4, 1)
-        g.addWidget(_hint("秒查一次疲劳（0=不查），越过阈值会自动换分支"), 4, 2, 1, 3)
+        g.addWidget(self.spin_fatigue_every, 5, 1)
+        g.addWidget(_hint("秒查一次疲劳（0=不查）"), 5, 2, 1, 3)
         lay.addLayout(g)
 
         row = QHBoxLayout()

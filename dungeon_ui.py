@@ -160,6 +160,10 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
         profile.setdefault("farm", {})["hp_roi"] = roi_norm
     elif where == "fatigue.roi":
         profile.setdefault("fatigue", {})["roi"] = roi_norm
+    elif where == "enter.progress":
+        profile.setdefault("enter", {})["progress"] = {
+            "roi": roi_norm, "min_fill": 0.90, "samples": 3, "interval": 0.25,
+        }
     elif where == "enter.loaded":
         sig = df.signature(df.crop_norm(f, roi_norm), 12)
         profile.setdefault("enter", {})["loaded"] = {
@@ -554,7 +558,6 @@ class DungeonTab(QWidget):
         self.btn_pt = {}
         items = [
             ("dungeon_pt", "① 副本入口（地图1）", "map"),
-            ("entry_pt", "① 副本门口/NPC（可选，走到后点它）", "shot"),
             ("enter_confirm", "① 弹窗「进入游戏」按钮", "shot"),
             ("farm_pt", "② 打怪点（地图2，在这里读疲劳）", "map"),
             ("boss_pt", "② BOSS 点（地图2）", "map"),
@@ -616,10 +619,10 @@ class DungeonTab(QWidget):
 
         btn_loaded = QPushButton("框选")
         btn_loaded.setFixedWidth(72)
-        btn_loaded.clicked.connect(lambda: self._pick_extra_roi("enter.loaded"))
+        btn_loaded.clicked.connect(lambda: self._pick_extra_roi("enter.progress"))
         self.lbl_loaded = QLabel("未设置")
         self.lbl_loaded.setObjectName("muted")
-        g.addWidget(QLabel("① 加载完成标记（可选：进本后一眼能看出已进本的块）"),
+        g.addWidget(QLabel("① 加载进度条区域（框住进本时的读条）"),
                     row0 + 5, 0)
         g.addWidget(self.lbl_loaded, row0 + 5, 1)
         g.addWidget(btn_loaded, row0 + 5, 2)
@@ -634,6 +637,24 @@ class DungeonTab(QWidget):
         g.addWidget(self.lbl_arrived, row0 + 6, 1)
         g.addWidget(btn_arrived, row0 + 6, 2)
 
+        btn_bossflag = QPushButton("框选")
+        btn_bossflag.setFixedWidth(72)
+        btn_bossflag.clicked.connect(lambda: self._pick_extra_roi("farm.boss_present"))
+        self.lbl_bossflag = QLabel("未设置")
+        self.lbl_bossflag.setObjectName("muted")
+        g.addWidget(QLabel("② 打怪点BOSS标志（看到它才开始打）"), row0 + 7, 0)
+        g.addWidget(self.lbl_bossflag, row0 + 7, 1)
+        g.addWidget(btn_bossflag, row0 + 7, 2)
+
+        btn_finish = QPushButton("框选")
+        btn_finish.setFixedWidth(72)
+        btn_finish.clicked.connect(lambda: self._pick_extra_roi("farm.finish"))
+        self.lbl_finish = QLabel("未设置")
+        self.lbl_finish.setObjectName("muted")
+        g.addWidget(QLabel("③ 打怪完成标志（看到它就停手退出）"), row0 + 8, 0)
+        g.addWidget(self.lbl_finish, row0 + 8, 1)
+        g.addWidget(btn_finish, row0 + 8, 2)
+
         row = QHBoxLayout()
         row.addWidget(QLabel("未骑乘文字"))
         self.edit_mount_text = QLineEdit("骑乘")
@@ -646,7 +667,7 @@ class DungeonTab(QWidget):
         self.edit_rest_text.editingFinished.connect(self._save_from_ui)
         row.addWidget(self.edit_rest_text)
         row.addWidget(_hint("读到「未骑乘文字」才点「骑乘」；读到「已骑乘文字」就不点"), 1)
-        g.addLayout(row, row0 + 7, 0, 1, 3)
+        g.addLayout(row, row0 + 9, 0, 1, 3)
         return box
 
     def _build_farm(self) -> QWidget:
@@ -711,6 +732,17 @@ class DungeonTab(QWidget):
         g.addWidget(self.chk_foreground, 5, 0, 1, 8)
 
         row = QHBoxLayout()
+        row_gap = QHBoxLayout()
+        self.chk_pickup_on_a = QCheckBox("每次平A后都拾取")
+        self.chk_pickup_on_a.setChecked(True)
+        self.chk_pickup_on_a.toggled.connect(self._save_from_ui)
+        row_gap.addWidget(self.chk_pickup_on_a)
+        row_gap.addWidget(QLabel("动作之间缓冲"))
+        self.spin_action_gap = self._dspin(0.0, 10.0, 1.0, None, 0, 0)
+        row_gap.addWidget(self.spin_action_gap)
+        row_gap.addWidget(_hint("秒（进本后/到点后/拾取后都会缓冲一下）"), 1)
+        g.addLayout(row_gap, 6, 0, 1, 8)
+
         self.chk_skills = QCheckBox("放技能 1/2")
         self.chk_skills.toggled.connect(self._save_from_ui)
         row.addWidget(self.chk_skills)
@@ -961,6 +993,8 @@ class DungeonTab(QWidget):
             self.spin_trash_seconds.setValue(float(loop.get("trash_seconds", 60.0)))
             self.spin_trash_rounds.setValue(int(loop.get("trash_rounds", 1) or 1))
             self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 60.0)))
+            self.chk_pickup_on_a.setChecked(bool(farm.get("pickup_on_a", True)))
+            self.spin_action_gap.setValue(float(p.get("action_gap", 1.0)))
             self.spin_rounds.setValue(int((p.get("retry") or {}).get("rounds", 0) or 0))
             self.edit_mount_text.setText(str(mount.get("mount_text", "骑乘")))
             self.edit_rest_text.setText(str(mount.get("rest_text", "休息")))
@@ -995,7 +1029,6 @@ class DungeonTab(QWidget):
                 "fatigue_pt": ((p.get("fatigue") or {}).get("pt"), "④ 疲劳图标"),
                 "farm_pt": (farm.get("farm_pt"), "② 打怪点"),
                 "mount_pt": ((p.get("mount") or {}).get("mount_pt"), "⑤ 骑乘按钮"),
-                "entry_pt": (enter.get("entry_pt"), "① 副本门口/NPC"),
             }
             for key, (pt, _name) in states.items():
                 lbl = self.lbl_pt[key]
@@ -1016,8 +1049,10 @@ class DungeonTab(QWidget):
                     label.setText("未设置")
                     label.setStyleSheet("color: #444444;")
             for spec, label in (
-                (enter.get("loaded") or {}, self.lbl_loaded),
+                (enter.get("progress") or {}, self.lbl_loaded),
                 (farm.get("arrived") or {}, self.lbl_arrived),
+                (farm.get("boss_present") or {}, self.lbl_bossflag),
+                (farm.get("finish") or {}, self.lbl_finish),
             ):
                 if (spec or {}).get("roi"):
                     label.setText("已设置 ✓")
@@ -1083,7 +1118,9 @@ class DungeonTab(QWidget):
             "trash_seconds": float(self.spin_trash_seconds.value()),
             "trash_rounds": int(self.spin_trash_rounds.value()),
             "fatigue_every": float(self.spin_fatigue_every.value()),
+            "pickup_on_a": bool(self.chk_pickup_on_a.isChecked()),
         })
+        p["action_gap"] = float(self.spin_action_gap.value())
         p.setdefault("retry", {})["rounds"] = int(self.spin_rounds.value())
         p["input_mode"] = "foreground" if self.chk_foreground.isChecked() else "background"
         p.setdefault("retry", {})["gap"] = float(self.spin_gap.value())
@@ -1129,8 +1166,6 @@ class DungeonTab(QWidget):
             "fatigue_pt": "点一下游戏里那个能弹出疲劳值的图标/按钮位置。",
             "farm_pt": "打开地图2（副本地图），点一下「打怪点」位置（在这里读疲劳）。",
             "mount_pt": "按 S 打开骑乘窗口，点一下里面的「骑乘」按钮。",
-            "entry_pt": ("可选：走到副本门口后，如果还要点一下传送门/NPC 才弹窗，"
-                         "把那个位置点上（不标就直接等弹窗）。"),
         }.get(key, "")
         if kind == "map":
             info += chr(10) + f"（点「重新截图」会先按一次开图键「{map_key}」）"
@@ -1152,8 +1187,6 @@ class DungeonTab(QWidget):
             current = (p.get("farm") or {}).get("farm_pt")
         elif key == "mount_pt":
             current = (p.get("mount") or {}).get("mount_pt")
-        elif key == "entry_pt":
-            current = (p.get("enter") or {}).get("entry_pt")
 
         pt = pick_point(self, hwnd, title, info, open_key, current)
         if not pt:
@@ -1174,8 +1207,6 @@ class DungeonTab(QWidget):
             p.setdefault("farm", {})["farm_pt"] = pt
         elif key == "mount_pt":
             p.setdefault("mount", {})["mount_pt"] = pt
-        elif key == "entry_pt":
-            p.setdefault("enter", {})["entry_pt"] = pt
         self._save()
         self._load_ui()
         self._log(f"已设置：{title} → {pt}")
@@ -1199,10 +1230,16 @@ class DungeonTab(QWidget):
             QMessageBox.warning(self, "没有绑定窗口", "请先绑定游戏窗口。")
             return
         titles = {
-            "enter.loaded": ("副本加载完成标记",
-                             "进本加载完之后才会出现的块（小地图/副本内 UI 都行）"),
+            "enter.progress": ("加载进度条区域",
+                               "进本时那条读条：框住整条进度条（左边起点到右边终点），"
+                               "程序会连拍多帧量填充比例，≥90% 才算加载完"),
             "farm.arrived": ("到达标记",
                              "跑到地图点位后才会出现/变成的块（比如 BOSS 血条、光环）"),
+            "farm.boss_present": ("打怪点BOSS标志",
+                                  "站到 BOSS 面前才有的东西（BOSS 名字/血条/头像）——"
+                                  "没识别到就重新寻路到 BOSS 点"),
+            "farm.finish": ("打怪完成标志",
+                            "BOSS 死掉/通关才出现的东西（结算提示、宝箱、掉落面板）"),
         }
         title, info = titles.get(where, ("识别区域", ""))
         if pick_region(self, hwnd, self.profile, where, title, info):
