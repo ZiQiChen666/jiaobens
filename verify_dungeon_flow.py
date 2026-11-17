@@ -319,6 +319,27 @@ _r.game = _G(make_frame())
 check("BOSS 身形：没 BOSS 不误判",
       not _r.anchor_visible(_body_spec, make_frame()))
 
+# ---- 7c) 边跑边看：弹窗/身形在“路上”出现也要立刻命中 ----------------
+# (a) 弹窗在寻路的第 2 秒就出现 → 不应该等满 travel_wait(10s)
+p_edge = build_profile(enter={"travel_wait": 10.0, "dialog_timeout": 10.0})
+game_edge = FakeGame(fill_time=1.0)
+logs_edge = []
+r_edge = df.DungeonRunner(game_edge, p_edge, log=logs_edge.append)
+ok_edge = r_edge.enter_dungeon()
+check("弹窗在路上出现 → 立刻进本（不等满寻路 10s）",
+      ok_edge is True and game_edge.t < 12.0, f"t={game_edge.t:.1f}")
+
+# (b) BOSS 身形在路上出现 → 立刻开打（不等满 travel_wait 10s）
+p_boss = build_profile(farm={"travel_wait": 10.0})
+game_boss = FakeGame()
+logs_boss = []
+r_boss = df.DungeonRunner(game_boss, p_boss, log=logs_boss.append)
+ok_boss = r_boss.goto_boss_point()
+check("BOSS 身形在路上出现 → 立刻确认",
+      ok_boss is True and game_boss.t < 5.0, f"t={game_boss.t:.1f}")
+check("寻路日志改成“边走边看”",
+      any("边走边看" in l for l in logs_boss), str(logs_boss[:3]))
+
 # ---- 8) 配置检查 ----------------------------------------------------
 check("配置里有 BOSS 身形 / BOSS 血条",
       "boss_present" in df.DEFAULT_PROFILE["farm"]

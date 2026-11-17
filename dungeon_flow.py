@@ -916,24 +916,37 @@ class DungeonRunner:
         return False
 
     def _goto(self, point, wait: float, desc: str,
-              arrived_spec: Optional[dict] = None) -> bool:
-        """点地图点位 → 等自动寻路。有「到达标记」就一到就走，不等满。"""
+              arrived_spec: Optional[dict] = None,
+              watch_spec: Optional[dict] = None,
+              watch_desc: Optional[str] = None,
+              sleep_after: bool = True) -> bool:
+        """点地图点位 → 边走边看（可传要盯的锚点）→ 最多等 wait 秒。
+
+        watch_spec：路上要盯的东西（比如 BOSS 身形 / 进入弹窗），
+                   一出现就立刻返回 True，不用等走完。
+        sleep_after：没盯到东西时，要不要把剩余时间等完（进本那边不等）。
+        """
         if not point:
             self.log(f"「{desc}」没有标定，跳过")
             return False
         self.ensure_mount()
         self.log(f"点「{desc}」({float(point[0]):.3f}, {float(point[1]):.3f})"
-                 f" → 等自动寻路（最多 {wait:.0f}s）")
+                 f" → 边走边看（最多 {wait:.0f}s）")
         self.open_map()
         if not self.game.click_norm(point):
             self.log(f"点击「{desc}」失败")
             return False
-        if (arrived_spec or {}).get("roi"):
-            if self.wait_until(arrived_spec, wait, f"{desc}到达标记"):
+
+        watch = watch_spec if (watch_spec or {}).get("roi") else arrived_spec
+        name = watch_desc or (f"{desc}到达标记" if watch is arrived_spec else f"{desc}目标")
+        start = self.game.now()
+        if (watch or {}).get("roi"):
+            if self.wait_until(watch, wait, name):
                 return True
-            self.log(f"没识别到「{desc}」到达标记，按时间继续")
-        else:
-            self.game.sleep(wait)
+        if sleep_after:
+            left = wait - (self.game.now() - start)
+            if left > 0:
+                self.game.sleep(left)
         return True
 
     def _arrived_spec(self) -> dict:
@@ -1025,6 +1038,7 @@ class DungeonRunner:
         confirm_pt = enter.get("confirm_pt")
         travel = float(enter.get("travel_wait", 40.0))
         timeout = float(enter.get("dialog_timeout", 24.0))
+        watch = min(travel, timeout) if timeout > 0 else travel
         load_wait = float(enter.get("load_wait", 15.0))
         blind_after = float(enter.get("blind_confirm_after", 3.0))
         attempts = max(1, int(enter.get("retry", 3) or 1))
@@ -1042,9 +1056,11 @@ class DungeonRunner:
             if self._stopping():
                 return False
             self.log(f"—— 进本第 {attempt}/{attempts} 次：点副本入口 ——")
-            if not self._goto(enter.get("dungeon_pt"), travel, "副本入口"):
+            # 点完就开始盯弹窗：寻路过程中就识别，弹窗一出现马上点
+            if not self._goto(enter.get("dungeon_pt"), watch, "副本入口",
+                              watch_spec=spec, watch_desc="进入弹窗",
+                              sleep_after=False):
                 return False
-
             blind_done = False
             start = self.game.now()
             while not self._stopping() and self.game.now() - start < timeout:
@@ -1160,12 +1176,14 @@ class DungeonRunner:
             if self._stopping():
                 return False
             self.log(f"前往 BOSS 点（第 {attempt}/{tries} 次）")
-            if not self._goto(farm.get("boss_pt"), travel, "BOSS 点"):
+            # 边走边看 BOSS 身形：到了/看见了就立刻开打
+            if not self._goto(farm.get("boss_pt"), travel, "BOSS 点",
+                              watch_spec=spec, watch_desc="BOSS 身形"):
                 return False
             self.gap("到 BOSS 点后缓冲")
             if not (spec or {}).get("roi"):
                 return True
-            if self.wait_until(spec, 8.0, "BOSS 身形"):
+            if self.wait_until(spec, 3.0, "BOSS 身形"):
                 return True
             self.log("没识别到「BOSS 身形」→ 回到上一步重新寻路")
         self.log(f"BOSS 点确认失败：{tries} 次都没识别到 BOSS 身形")
