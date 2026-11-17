@@ -280,12 +280,54 @@ check("打完又拾取了 3 次",
       game8.pickup_count >= game8.a_count + 3 - 1, str(game8.pickup_count))
 check("有“打完再拾取”日志", any("打完再拾取" in l for l in logs8), str(logs8[-4:]))
 
+# ---- 7b) 识别优化：旧标定的严格阈值会被自动放宽 --------------------
+_old_profile = df._merge(df.DEFAULT_PROFILE, {
+    "enter": {"dialog": {"roi": [0.1, 0.1, 0.2, 0.1], "sig": [1.0] * 144,
+                         "grid": 12, "sim": 0.90}},
+    "farm": {"boss_present": {"roi": [0.2, 0.2, 0.2, 0.2], "sig": [1.0] * 144,
+                              "grid": 12, "sim": 0.90}},
+})
+_norm = df._normalize_profile(_old_profile)
+check("旧标定的弹窗阈值被放宽到 0.80",
+      abs(float(_norm["enter"]["dialog"]["sim"]) - 0.80) < 1e-6,
+      str(_norm["enter"]["dialog"]["sim"]))
+check("弹窗补上了宽松阈值/占比阈值",
+      "sim_loose" in _norm["enter"]["dialog"]
+      and "ink_min" in _norm["enter"]["dialog"])
+check("BOSS 身形补上滑动搜索参数",
+      float(_norm["farm"]["boss_present"].get("search", 1.0)) >= 1.6
+      and float(_norm["farm"]["boss_present"].get("tol", 18)) >= 30)
+
+# BOSS 身形：小范围晃动/带特效也能命中；没 BOSS 不误判
+_body_spec = {"roi": ROI_BOSS_BODY, "grid": 12,
+              "sig": df.signature(df.crop_norm(make_frame(boss_body=True), ROI_BOSS_BODY), 12),
+              "sim": 0.60, "search": 1.6, "tol": 30.0}
+
+
+class _G:
+    def __init__(self, frame):
+        self.frame = frame
+    def grab(self):
+        return self.frame
+    def now(self):
+        return 0.0
+
+
+_r = df.DungeonRunner(_G(make_frame(boss_body=True)), build_profile(), log=lambda _s: None)
+check("BOSS 身形：原位能命中", _r.anchor_visible(_body_spec, make_frame(boss_body=True)))
+_r.game = _G(make_frame())
+check("BOSS 身形：没 BOSS 不误判",
+      not _r.anchor_visible(_body_spec, make_frame()))
+
 # ---- 8) 配置检查 ----------------------------------------------------
 check("配置里有 BOSS 身形 / BOSS 血条",
       "boss_present" in df.DEFAULT_PROFILE["farm"]
       and "boss_hp" in df.DEFAULT_PROFILE["farm"])
 check("弹窗盲点阈值在配置里",
       "blind_confirm_after" in df.DEFAULT_PROFILE["enter"])
+check("识别阈值可配（sim / sim_loose / poll）",
+      all(k in df.DEFAULT_PROFILE["detect"]
+          for k in ("sim", "sim_loose", "ink_min", "poll")))
 
 # ---- 9) 停止事件 ----------------------------------------------------
 stop = threading.Event()

@@ -98,7 +98,8 @@ DEFAULT_PROFILE: dict = {
         "boss_pt": None,           # 地图2 上的 BOSS 点 [nx, ny]
         "travel_wait": 30.0,       # 点完后等自动寻路（有「到达标记」就提前结束）
         "arrived": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},  # 可选：到达标记
-        "boss_present": {"roi": None, "sig": [], "grid": 12, "sim": 0.88},  # BOSS 身形
+        "boss_present": {"roi": None, "sig": [], "grid": 12, "sim": 0.60,
+                         "search": 1.6, "tol": 30.0},  # BOSS 身形（会走会晃）
         "boss_hp": {"roi": None, "min_ink": 0.02, "miss": 3},               # BOSS 血条
         "finish": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},        # 旧版，已不用
         "boss_retry": 3,           # 没识别到「打怪点BOSS」就重新寻路几次
@@ -142,7 +143,12 @@ DEFAULT_PROFILE: dict = {
         "threshold": 800,          # 当前疲劳 < 这个值就算「疲劳不足」
         "farm_seconds": 300.0,     # 疲劳不足时普通挂机打怪多久
     },
-    "detect": {"poll": 0.5},
+    "detect": {
+        "poll": 0.2,        # 轮询间隔（越小越灵敏）
+        "sim": 0.80,        # 主相似度阈值
+        "sim_loose": 0.60,  # 宽松阈值（配合 ink 占比一起判断）
+        "ink_min": 0.05,    # 宽松判定时要求的“区域有东西”比例
+    },
     "retry": {"rounds": 0, "gap": 8.0, "max_fail": 3},
 }
 
@@ -270,7 +276,33 @@ def load_profile(path: Optional[str] = None) -> dict:
     except Exception as exc:
         print(f"[警告] 读取标定失败：{type(exc).__name__}: {exc}")
         return json.loads(json.dumps(DEFAULT_PROFILE))
-    return _merge(DEFAULT_PROFILE, data)
+    merged = _merge(DEFAULT_PROFILE, data)
+    return _normalize_profile(merged)
+
+
+def _normalize_profile(p: dict) -> dict:
+    """把旧版标定的“太严”阈值调松，否则弹窗明明在也识别不到。"""
+    loose_defaults = {"sim": 0.80, "sim_loose": 0.60, "ink_min": 0.05}
+    try:
+        for group, key in (("enter", "dialog"), ("exit", "dialog"),
+                           ("mount", "dialog"), ("mount", "state")):
+            spec = ((p.get(group) or {}).get(key) or {})
+            if not isinstance(spec, dict) or not spec.get("roi"):
+                continue
+            if not spec.get("sim") or float(spec.get("sim", 0)) >= 0.85:
+                spec["sim"] = loose_defaults["sim"]
+            spec.setdefault("sim_loose", loose_defaults["sim_loose"])
+            spec.setdefault("ink_min", loose_defaults["ink_min"])
+            (p.setdefault(group, {}) or {})[key] = spec
+        body = ((p.get("farm") or {}).get("boss_present") or {})
+        if isinstance(body, dict) and body.get("roi"):
+            body["sim"] = min(float(body.get("sim") or 0.60), 0.65)
+            body["search"] = max(float(body.get("search") or 1.0), 1.6)
+            body["tol"] = max(float(body.get("tol") or 18.0), 30.0)
+            p.setdefault("farm", {})["boss_present"] = body
+    except Exception:
+        pass
+    return p
 
 
 def save_profile(profile: dict, path: Optional[str] = None) -> str:
@@ -581,20 +613,83 @@ class DungeonRunner:
         self._last_frame = frame
         return frame
 
+    def _detect_cfg(self, key: str, default: float) -> float:
+        return float((self.p.get("detect") or {}).get(key, default))
+
+    def anchor_metrics(self, spec: dict, frame) -> tuple[float, float]:
+        """返回 (相似度, 非背景占比)。没 sig 时相似度返回 -1。"""
+        roi = (spec or {}).get("roi")
+        if not roi or frame is None:
+            return -1.0, 0.0
+        patch = crop_norm(frame, roi)
+        ink = ink_ratio(patch)
+        sig = spec.get("sig")
+        if not sig:
+            return -1.0, ink
+        grid = int(spec.get("grid", 12))
+        tol = float(spec.get("tol", 18.0))
+        cur = signature(patch, grid)
+        best = similarity(sig, cur, tol)
+        search = float(spec.get("search", 1.0) or 1.0)
+        if search > 1.02:
+            # BOSS 会晃/会动：把区域往外扩一点，滑动找最像的位置
+            best = max(best, self._search_similarity(spec, frame, search))
+        return best, ink
+
+    def _search_similarity(self, spec: dict, frame, search: float) -> float:
+        """在大一圈的区域里滑动找最像的位置（BOSS 会走会晃，不能只比原位）。"""
+        try:
+            rx, ry, rw, rh = (float(v) for v in spec["roi"])
+            dx = rw * (search - 1.0) / 2.0
+            dy = rh * (search - 1.0) / 2.0
+            bx = max(0.0, rx - dx)
+            by = max(0.0, ry - dy)
+            big = [bx, by, min(1.0 - bx, rw + 2 * dx), min(1.0 - by, rh + 2 * dy)]
+            arr = crop_norm(frame, big)
+            if arr.size == 0:
+                return 0.0
+            sig = spec.get("sig") or []
+            grid = int(spec.get("grid", 12))
+            tol = float(spec.get("tol", 30.0))
+            h, w = arr.shape[:2]
+            cell = max(3, min(h, w) // grid)
+            span = cell * grid
+            if span > h or span > w:
+                return similarity(sig, signature(arr, grid), tol)
+            step = max(1, cell // 2)
+            best = 0.0
+            y = 0
+            while y + span <= h:
+                x = 0
+                while x + span <= w:
+                    patch = arr[y:y + span, x:x + span]
+                    best = max(best, similarity(sig, signature(patch, grid), tol))
+                    if best >= 0.99:
+                        return best
+                    x += step
+                y += step
+            return max(best, similarity(sig, signature(arr, grid), tol))
+        except Exception:
+            return 0.0
+
     def anchor_visible(self, spec: dict, frame) -> bool:
-        """通用：某个锚点区域现在是不是“和标定时一样”（相似度/占比）。"""
+        """锚点是否“和标定时一样”。
+
+        判定用两条路（任一条满足即可，解决“明明在、就是差一点”的问题）：
+          1) 相似度 ≥ sim（默认 0.80）
+          2) 相似度 ≥ sim_loose（默认 0.60）且区域内容占比 ≥ ink_min（默认 0.05）
+        """
         if not isinstance(spec, dict):
             return False
-        roi = spec.get("roi")
-        if not roi or frame is None:
-            return False
-        patch = crop_norm(frame, roi)
-        sig = spec.get("sig")
-        if sig:
-            return similarity(
-                sig, signature(patch, int(spec.get("grid", 12)))
-            ) >= float(spec.get("sim", 0.90))
-        return ink_ratio(patch) > 0.15
+        sim_th = float(spec.get("sim") or self._detect_cfg("sim", 0.80))
+        loose = float(spec.get("sim_loose")
+                      or self._detect_cfg("sim_loose", 0.60))
+        ink_min = float(spec.get("ink_min")
+                        or self._detect_cfg("ink_min", 0.05))
+        sim, ink = self.anchor_metrics(spec, frame)
+        if sim < 0:
+            return ink > max(0.15, ink_min)
+        return sim >= sim_th or (sim >= loose and ink >= ink_min)
 
     def enter_dialog_spec(self) -> dict:
         return ((self.p.get("enter") or {}).get("dialog") or {})
@@ -650,19 +745,30 @@ class DungeonRunner:
         if frame is None:
             return {}
         out = {}
-        for name, spec in (("enter", self.enter_dialog_spec()),
-                           ("exit", self.exit_dialog_spec())):
-            roi = (spec or {}).get("roi")
-            if not roi:
-                out[f"{name}_popup"] = "未标定"
+        checks = (
+            ("进本弹窗", self.enter_dialog_spec()),
+            ("退出弹窗", self.exit_dialog_spec()),
+            ("BOSS身形", self._anchor_of("boss_present")),
+        )
+        for name, spec in checks:
+            if not (spec or {}).get("roi"):
+                out[name] = "未标定"
                 continue
-            patch = crop_norm(frame, roi)
-            visible = self.anchor_visible(spec, frame)
-            sig = spec.get("sig")
-            detail = f"ink={ink_ratio(patch):.3f}"
-            if sig:
-                detail += (f" sim={similarity(sig, signature(patch, int(spec.get('grid', 12)))):.3f}")
-            out[f"{name}_popup"] = f"{'在' if visible else '不在'}({detail})"
+            sim, ink = self.anchor_metrics(spec, frame)
+            th = float((spec or {}).get("sim")
+                       or self._detect_cfg("sim", 0.80))
+            hit = self.anchor_visible(spec, frame)
+            out[name] = (f"{'命中' if hit else '未命中'}"
+                         f"(相似度 {sim:.2f}/{th:.2f} 占比 {ink:.2f})")
+        hp_spec = self._anchor_of("boss_hp")
+        if (hp_spec or {}).get("roi"):
+            patch = crop_norm(frame, hp_spec["roi"])
+            out["BOSS血条"] = ("在" if ink_ratio(patch)
+                               > float(hp_spec.get("min_ink", 0.02) or 0.02)
+                               else "不在") + f"(占比 {ink_ratio(patch):.2f})"
+        prog = self._progress_spec()
+        if (prog or {}).get("roi"):
+            out["加载进度条"] = f"{self.progress_fill() * 100:.0f}%"
         hp = self.hp_now()
         if hp is not None:
             out["hp"] = hp
@@ -780,19 +886,33 @@ class DungeonRunner:
         """边等边看：区域内连续 need 次命中就立刻返回 True；超时返回 False。"""
         if not (spec or {}).get("roi"):
             return False
-        poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
+        poll = max(0.05, float((self.p.get("detect") or {}).get("poll", 0.2)))
         start = self.game.now()
         hits = 0
+        best_sim = -2.0
+        best_ink = 0.0
+        next_log = 0.0
         while not self._stopping() and self.game.now() - start < timeout:
             frame = self.grab()
-            if frame is not None and self.anchor_visible(spec, frame):
-                hits += 1
-                if hits >= max(1, int(need)):
-                    self.log(f"识别到{desc}（{self.game.now() - start:.1f}s）")
-                    return True
-            else:
-                hits = 0
+            if frame is not None:
+                sim, ink = self.anchor_metrics(spec, frame)
+                best_sim = max(best_sim, sim)
+                best_ink = max(best_ink, ink)
+                if self.anchor_visible(spec, frame):
+                    hits += 1
+                    if hits >= max(1, int(need)):
+                        self.log(f"识别到{desc}（{self.game.now() - start:.1f}s，"
+                                 f"相似度 {sim:.2f}）")
+                        return True
+                else:
+                    hits = 0
+                    elapsed = self.game.now() - start
+                    if elapsed >= next_log:
+                        next_log = elapsed + 1.0
+                        self.log(f"等{desc}… 相似度 {sim:.2f}"
+                                 + (f" / 占比 {ink:.2f}" if ink else ""))
             self.game.sleep(poll)
+        self.log(f"没等到{desc}（最高相似度 {best_sim:.2f}，最高占比 {best_ink:.2f}）")
         return False
 
     def _goto(self, point, wait: float, desc: str,
@@ -1045,7 +1165,7 @@ class DungeonRunner:
             self.gap("到 BOSS 点后缓冲")
             if not (spec or {}).get("roi"):
                 return True
-            if self.wait_until(spec, 6.0, "BOSS 身形"):
+            if self.wait_until(spec, 8.0, "BOSS 身形"):
                 return True
             self.log("没识别到「BOSS 身形」→ 回到上一步重新寻路")
         self.log(f"BOSS 点确认失败：{tries} 次都没识别到 BOSS 身形")

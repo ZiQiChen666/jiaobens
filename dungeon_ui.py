@@ -169,6 +169,12 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
         profile.setdefault("enter", {})["loaded"] = {
             "roi": roi_norm, "grid": 12, "sig": sig, "sim": 0.90,
         }
+    elif where == "farm.boss_present":
+        sig = df.signature(df.crop_norm(f, roi_norm), 12)
+        profile.setdefault("farm", {})["boss_present"] = {
+            "roi": roi_norm, "grid": 12, "sig": sig,
+            "sim": 0.60, "search": 1.6, "tol": 30.0,
+        }
     elif where == "farm.boss_hp":
         profile.setdefault("farm", {})["boss_hp"] = {
             "roi": roi_norm, "min_ink": 0.02, "miss": 3,
@@ -726,6 +732,19 @@ class DungeonTab(QWidget):
         g.addWidget(self.chk_foreground, 5, 0, 1, 8)
 
         row = QHBoxLayout()
+        row_sim = QHBoxLayout()
+        row_sim.addWidget(QLabel("识别相似度"))
+        self.spin_sim = self._dspin(0.30, 0.99, 0.80, None, 0, 0)
+        self.spin_sim.setSingleStep(0.05)
+        row_sim.addWidget(self.spin_sim)
+        row_sim.addWidget(QLabel("宽松阈值"))
+        self.spin_sim_loose = self._dspin(0.20, 0.95, 0.60, None, 0, 0)
+        self.spin_sim_loose.setSingleStep(0.05)
+        row_sim.addWidget(self.spin_sim_loose)
+        row_sim.addWidget(_hint(
+            "弹窗/BOSS 身形老是识别不到就把这两个调小（0.70 / 0.50）"), 1)
+        g.addLayout(row_sim, 5, 0, 1, 8)
+
         row_gap = QHBoxLayout()
         self.chk_pickup_on_a = QCheckBox("每次平A后都拾取")
         self.chk_pickup_on_a.setChecked(True)
@@ -987,6 +1006,9 @@ class DungeonTab(QWidget):
             self.spin_trash_seconds.setValue(float(loop.get("trash_seconds", 60.0)))
             self.spin_trash_rounds.setValue(int(loop.get("trash_rounds", 1) or 1))
             self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 60.0)))
+            detect = p.get("detect") or {}
+            self.spin_sim.setValue(float(detect.get("sim", 0.80)))
+            self.spin_sim_loose.setValue(float(detect.get("sim_loose", 0.60)))
             self.chk_pickup_on_a.setChecked(bool(farm.get("pickup_on_a", True)))
             self.spin_action_gap.setValue(float(p.get("action_gap", 1.0)))
             self.spin_rounds.setValue(int((p.get("retry") or {}).get("rounds", 0) or 0))
@@ -1113,6 +1135,10 @@ class DungeonTab(QWidget):
             "pickup_on_a": bool(self.chk_pickup_on_a.isChecked()),
         })
         p["action_gap"] = float(self.spin_action_gap.value())
+        p.setdefault("detect", {}).update({
+            "sim": float(self.spin_sim.value()),
+            "sim_loose": float(self.spin_sim_loose.value()),
+        })
         p.setdefault("retry", {})["rounds"] = int(self.spin_rounds.value())
         p["input_mode"] = "foreground" if self.chk_foreground.isChecked() else "background"
         p.setdefault("retry", {})["gap"] = float(self.spin_gap.value())

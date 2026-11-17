@@ -551,6 +551,10 @@ class DungeonWizard(QDialog):
         title, info = titles.get(which, ("识别区域", ""))
         if dui.pick_region(self, self.hwnd, self.profile, f"farm.{which}",
                            title, info):
+            if which == "boss_present":
+                spec = (self.profile.get("farm") or {}).get("boss_present") or {}
+                spec.update({"sim": 0.60, "search": 1.6, "tol": 30.0})
+                self.profile.setdefault("farm", {})["boss_present"] = spec
             self._refresh_farm_roi_state()
 
     def _refresh_farm_roi_state(self) -> None:
