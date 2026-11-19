@@ -64,10 +64,9 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     p["action_gap"] = max(0.0, float(answers.get("action_gap") or 0.0))
 
     loop = p.setdefault("loop", {})
-    loop["boss_seconds"] = max(5.0, float(answers.get("boss_seconds") or 30.0))
-    loop["boss_rounds"] = max(1, int(answers.get("boss_rounds") or 1))
-    loop["trash_seconds"] = max(5.0, float(answers.get("trash_seconds") or 60.0))
-    loop["trash_rounds"] = max(1, int(answers.get("trash_rounds") or 1))
+    loop["boss_seconds"] = max(
+        5.0, min(1000.0, float(answers.get("seconds") or 120.0))
+    )
     loop["fatigue_every"] = max(0.0, float(answers.get("fatigue_every") or 0.0))
 
     farm["farm_pt"] = (
@@ -95,7 +94,6 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     fatigue = p.setdefault("fatigue", {})
     fatigue["enabled"] = bool(answers.get("fatigue_enabled", True))
     fatigue["threshold"] = max(0, int(answers.get("fatigue_threshold") or 0))
-    fatigue["farm_seconds"] = max(0.0, float(answers.get("fatigue_farm_seconds") or 0.0))
     if answers.get("fatigue_pt"):
         fatigue["pt"] = [round(float(v), 5) for v in answers["fatigue_pt"]]
 
@@ -123,15 +121,13 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
             "没骑就点「骑乘」→ 关弹窗"
         )
     plan.append(
-        f"打怪点按疲劳分流：< -{fatigue['threshold']} 打BOSS "
-        f"({loop['boss_seconds']:.0f}s × {loop['boss_rounds']} 只)；"
-        f"> +{fatigue['threshold']} 打怪 "
-        f"({loop['trash_seconds']:.0f}s × {loop['trash_rounds']} 轮)"
-        + (f"；打怪时每 {loop['fatigue_every']:.0f}s 复查疲劳，越界自动换分支"
-           if loop.get("fatigue_every") else "")
+        f"打怪点按疲劳分流：打小怪时疲劳 < -{fatigue['threshold']} 就去打BOSS；"
+        f"打BOSS时疲劳 > +{fatigue['threshold']} 就回打怪点打小怪；"
+        f"不设挂机时长，每 {loop['fatigue_every']:.0f}s 查一次疲劳"
     )
     plan.append(
-        f"② 开地图2 → 点 BOSS 点 → 等 {farm['travel_wait']:.0f}s → 挂机 {farm['seconds']:.0f}s"
+        f"② 开地图2 → 点 BOSS 点 → 等 {farm['travel_wait']:.0f}s → "
+        f"打BOSS（上限 {loop['boss_seconds']:.0f}s，血条消失就结束）"
         f"（喝药 {farm['potion_every']:.0f}s"
         + (f"，血量 < {hp} 才喝" if hp and farm.get("hp_roi") else "")
         + f"；每 {farm['pickup_every']:.0f}s 拾取一次）"
@@ -141,11 +137,6 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
         f"{float((p.get('exit') or {}).get('dialog_timeout', 10.0)):.0f}s)"
         " → 点「确认」"
         + f" → 等加载 {exit_cfg['settle']:.0f}s"
-        + (
-            f" → 检测疲劳（阈值 {fatigue['threshold']}），不足就先普通打怪 "
-            f"{fatigue['farm_seconds']:.0f}s"
-            if fatigue.get("enabled") else ""
-        )
         + f" → 等 {p['retry']['gap']:.0f}s 下一轮"
     )
     missing = []
@@ -206,19 +197,15 @@ class DungeonWizard(QDialog):
             "load_wait": float(enter.get("load_wait", 10.0)),
             "boss_pt": farm.get("boss_pt"),
             "boss_wait": float(farm.get("travel_wait", 30.0)),
-            "seconds": float(farm.get("seconds", 30.0)),
+            "seconds": float((self.profile.get("loop") or {}).get(
+                "boss_seconds", farm.get("seconds", 120.0)) or 120.0),
             "hp_threshold": int(farm.get("hp_threshold", 0) or 0),
             "potion_every": float(farm.get("potion_every", 6.0)),
             "pickup_every": float(farm.get("pickup_every", 8.0)),
             "use_skills": bool(farm.get("use_skills", True)),
             "fatigue_enabled": bool(fatigue.get("enabled", True)),
             "fatigue_threshold": int(fatigue.get("threshold", 800) or 0),
-            "fatigue_farm_seconds": float(fatigue.get("farm_seconds", 300.0)),
             "fatigue_pt": fatigue.get("pt"),
-            "boss_seconds": float((self.profile.get("loop") or {}).get("boss_seconds", 30.0)),
-            "boss_rounds": int((self.profile.get("loop") or {}).get("boss_rounds", 1) or 1),
-            "trash_seconds": float((self.profile.get("loop") or {}).get("trash_seconds", 60.0)),
-            "trash_rounds": int((self.profile.get("loop") or {}).get("trash_rounds", 1) or 1),
             "fatigue_every": float((self.profile.get("loop") or {}).get("fatigue_every", 60.0)),
             "farm_pt": (self.profile.get("farm") or {}).get("farm_pt"),
             "pickup_on_a": bool((self.profile.get("farm") or {}).get("pickup_on_a", True)),
@@ -308,11 +295,7 @@ class DungeonWizard(QDialog):
         self.answers["hp_threshold"] = int(self.spin_hp.value())
         self.answers["fatigue_enabled"] = bool(self.chk_fatigue.isChecked())
         self.answers["fatigue_threshold"] = int(self.spin_fatigue.value())
-        self.answers["fatigue_farm_seconds"] = float(self.spin_fatigue_farm.value())
-        self.answers["boss_seconds"] = float(self.spin_boss_seconds.value())
-        self.answers["boss_rounds"] = int(self.spin_boss_rounds.value())
-        self.answers["trash_seconds"] = float(self.spin_trash_seconds.value())
-        self.answers["trash_rounds"] = int(self.spin_trash_rounds.value())
+        self.answers["boss_seconds"] = float(self.spin_seconds.value())
         self.answers["fatigue_every"] = float(self.spin_fatigue_every.value())
         self.answers["pickup_on_a"] = bool(self.chk_pickup_on_a.isChecked())
         self.answers["action_gap"] = float(self.spin_action_gap.value())
@@ -576,12 +559,12 @@ class DungeonWizard(QDialog):
     def _page_farm(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.addWidget(_title("第 4 步：BOSS 点挂机（打多久 / 喝药 / 拾取）"))
+        lay.addWidget(_title("第 4 步：BOSS 战（打多久 / 喝药 / 拾取）"))
         g = QGridLayout()
-        g.addWidget(QLabel("挂机时长"), 0, 0)
-        self.spin_seconds = self._dspin(5.0, 3600.0, self.answers["seconds"])
+        g.addWidget(QLabel("打BOSS上限"), 0, 0)
+        self.spin_seconds = self._dspin(5.0, 1000.0, self.answers["seconds"])
         g.addWidget(self.spin_seconds, 0, 1)
-        g.addWidget(_hint("默认 30 秒；多开时每个窗口可以不一样"), 0, 2, 1, 2)
+        g.addWidget(_hint("血条消失就提前结束；最大 1000 秒"), 0, 2, 1, 2)
         g.addWidget(QLabel("喝药间隔"), 0, 4)
         self.spin_potion = self._dspin(1.0, 60.0, self.answers["potion_every"])
         g.addWidget(self.spin_potion, 0, 5)
@@ -593,41 +576,19 @@ class DungeonWizard(QDialog):
         self.chk_skills.setChecked(bool(self.answers["use_skills"]))
         g.addWidget(self.chk_skills, 1, 4, 1, 2)
 
-        g.addWidget(QLabel("打BOSS"), 2, 0)
-        self.spin_boss_seconds = self._dspin(5.0, 600.0, self.answers["boss_seconds"])
-        g.addWidget(self.spin_boss_seconds, 2, 1)
-        g.addWidget(QLabel("秒 ×"), 2, 2)
-        self.spin_boss_rounds = QSpinBox()
-        self.spin_boss_rounds.setRange(1, 99)
-        self.spin_boss_rounds.setValue(int(self.answers["boss_rounds"]))
-        self.spin_boss_rounds.setFixedWidth(60)
-        g.addWidget(self.spin_boss_rounds, 2, 3)
-        g.addWidget(QLabel("只"), 2, 4)
-
-        g.addWidget(QLabel("打怪"), 3, 0)
-        self.spin_trash_seconds = self._dspin(5.0, 1800.0, self.answers["trash_seconds"])
-        g.addWidget(self.spin_trash_seconds, 3, 1)
-        g.addWidget(QLabel("秒 ×"), 3, 2)
-        self.spin_trash_rounds = QSpinBox()
-        self.spin_trash_rounds.setRange(1, 99)
-        self.spin_trash_rounds.setValue(int(self.answers["trash_rounds"]))
-        self.spin_trash_rounds.setFixedWidth(60)
-        g.addWidget(self.spin_trash_rounds, 3, 3)
-        g.addWidget(QLabel("轮"), 3, 4)
-
         self.chk_pickup_on_a = QCheckBox("每次平A后都拾取")
         self.chk_pickup_on_a.setChecked(bool(self.answers["pickup_on_a"]))
-        g.addWidget(self.chk_pickup_on_a, 4, 0, 1, 2)
-        g.addWidget(QLabel("动作缓冲"), 4, 2)
+        g.addWidget(self.chk_pickup_on_a, 2, 0, 1, 2)
+        g.addWidget(QLabel("动作缓冲"), 2, 2)
         self.spin_action_gap = self._dspin(0.0, 10.0, self.answers["action_gap"])
-        g.addWidget(self.spin_action_gap, 4, 3)
-        g.addWidget(_hint("秒（进本后/到点后/拾取后）"), 4, 4, 1, 3)
+        g.addWidget(self.spin_action_gap, 2, 3)
+        g.addWidget(_hint("秒（进本后/到点后/拾取后）"), 2, 4, 1, 3)
 
-        g.addWidget(QLabel("打怪时每"), 5, 0)
-        self.spin_fatigue_every = self._dspin(0.0, 600.0,
+        g.addWidget(QLabel("每"), 3, 0)
+        self.spin_fatigue_every = self._dspin(10.0, 600.0,
                                               self.answers["fatigue_every"])
-        g.addWidget(self.spin_fatigue_every, 5, 1)
-        g.addWidget(_hint("秒查一次疲劳（0=不查）"), 5, 2, 1, 3)
+        g.addWidget(self.spin_fatigue_every, 3, 1)
+        g.addWidget(_hint("秒查一次疲劳（默认 60 秒；不设挂机时长）"), 3, 2, 1, 3)
         lay.addLayout(g)
 
         row = QHBoxLayout()
@@ -676,12 +637,7 @@ class DungeonWizard(QDialog):
         self.spin_fatigue.setValue(int(self.answers["fatigue_threshold"]))
         self.spin_fatigue.setFixedWidth(110)
         g.addWidget(self.spin_fatigue, 0, 1)
-        g.addWidget(_hint("低于这个值就算「疲劳不足」"), 0, 2, 1, 2)
-        g.addWidget(QLabel("不足时先普通打怪"), 1, 0)
-        self.spin_fatigue_farm = self._dspin(0.0, 7200.0,
-                                             self.answers["fatigue_farm_seconds"])
-        g.addWidget(self.spin_fatigue_farm, 1, 1)
-        g.addWidget(_hint("打这么久再继续下一轮副本"), 1, 2, 1, 2)
+        g.addWidget(_hint("打小怪时 < -阈值 就去打BOSS；打BOSS时 > +阈值 就回打怪点"), 0, 2, 1, 3)
         lay.addLayout(g)
 
         row = QHBoxLayout()

@@ -27,7 +27,7 @@ try:
 except ImportError:  # pragma: no cover
     win32gui = None  # type: ignore
 
-from PySide6.QtCore import QMetaObject, QPoint, Qt, QThread, Signal
+from PySide6.QtCore import QMetaObject, QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -389,6 +389,8 @@ class DungeonTab(QWidget):
         self.host = host
         self.profile = df.load_profile()
         self.threads: dict[int, DungeonThread] = {}
+        self._nav_recorder = None
+        self._nav_pending = False
         self._loading = True
         self.setStyleSheet(LIGHT_QSS)
 
@@ -409,6 +411,7 @@ class DungeonTab(QWidget):
         root.addWidget(self._build_banner())
         root.addWidget(self._build_points())
         root.addWidget(self._build_farm())
+        root.addWidget(self._build_nav_macro())
         root.addWidget(self._build_exit())
         root.addWidget(self._build_multi())
         root.addWidget(self._build_run())
@@ -728,7 +731,6 @@ class DungeonTab(QWidget):
         self.spin_retry.valueChanged.connect(self._save_from_ui)
         g.addWidget(self.spin_retry, 5, 1)
 
-        pair(5, 2, "打怪时每", "spin_fatigue_every", 0.0, 600.0, 20.0)
 
         g.addWidget(QLabel("轮数(0=无限)"), 6, 0)
         self.spin_rounds = QSpinBox()
@@ -877,30 +879,212 @@ class DungeonTab(QWidget):
             grid.addWidget(spin, row, col)
         return spin
 
-    def _build_exit(self) -> QWidget:
-        box = QGroupBox("④ 退出副本后：检测疲劳，不足就先普通挂机打怪")
+    def _build_nav_macro(self) -> QWidget:
+        box = QGroupBox("引路宏（鼠标宏：地图点识别不准时，用录制的点击/按键引路）")
         g = QGridLayout(box)
-        self.chk_fatigue = QCheckBox("每轮退出副本后检测一次疲劳值")
+        self.chk_nav_macro = QCheckBox(
+            "用引路宏导航（替代「地图1 副本入口 + 地图2 BOSS 点」这两步）"
+        )
+        self.chk_nav_macro.setToolTip(
+            "录制一段从打怪点 → 开图 → 点副本入口 → 进入游戏 → 跑到 BOSS 的操作；\n"
+            "运行到 BOSS 流程时直接回放这段鼠标宏，不再依赖地图点位。\n"
+            "录的是左键点击和按键（鼠标移动/拖拽不录）。"
+        )
+        self.chk_nav_macro.toggled.connect(self._save_from_ui)
+        g.addWidget(self.chk_nav_macro, 0, 0, 1, 4)
+
+        self.chk_nav_fallback = QCheckBox("宏跑完没到 BOSS 时，回退到地图点位")
+        self.chk_nav_fallback.setChecked(False)
+        self.chk_nav_fallback.toggled.connect(self._save_from_ui)
+        g.addWidget(self.chk_nav_fallback, 0, 4, 1, 2)
+
+        row = QHBoxLayout()
+        self.btn_nav_record = QPushButton("录制引路宏（3 秒后开始）")
+        self.btn_nav_record.clicked.connect(self._record_nav_macro)
+        self.btn_nav_stop = QPushButton("停止并保存")
+        self.btn_nav_stop.setEnabled(False)
+        self.btn_nav_stop.clicked.connect(self._stop_nav_record)
+        self.btn_nav_clear = QPushButton("清空")
+        self.btn_nav_clear.clicked.connect(self._clear_nav_macro)
+        self.btn_test_a = QPushButton("测试后台平A")
+        self.btn_test_a.setToolTip("给当前绑定窗口发一次后台 A，验证游戏认不认 PostMessage")
+        self.btn_test_a.clicked.connect(self._test_background_a)
+        self.lbl_nav_macro = QLabel("未录制")
+        self.lbl_nav_macro.setObjectName("muted")
+        row.addWidget(self.btn_nav_record)
+        row.addWidget(self.btn_nav_stop)
+        row.addWidget(self.btn_nav_clear)
+        row.addWidget(self.btn_test_a)
+        row.addWidget(self.lbl_nav_macro, 1)
+        g.addLayout(row, 1, 0, 1, 6)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("回放速度"))
+        self.spin_nav_speed = QDoubleSpinBox()
+        self.spin_nav_speed.setRange(0.25, 3.0)
+        self.spin_nav_speed.setSingleStep(0.25)
+        self.spin_nav_speed.setValue(1.0)
+        self.spin_nav_speed.setFixedWidth(90)
+        self.spin_nav_speed.valueChanged.connect(self._save_from_ui)
+        row2.addWidget(self.spin_nav_speed)
+        row2.addWidget(_hint(
+            "先在打怪点站好 → 点「录制引路宏」→ 3 秒内切到游戏，正常开图/进本/跑到 BOSS "
+            "→ 切回本程序点「停止并保存」。只录左键点击和按键。"
+        ), 1)
+        g.addLayout(row2, 2, 0, 1, 6)
+        return box
+
+    def _test_background_a(self) -> None:
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有绑定窗口", "请先绑定游戏窗口。")
+            return
+        self._save_from_ui()
+        try:
+            game = df.WinGame(int(hwnd), self.profile, log=self._log)
+            target = game.message_target()
+            ok = game.tap("a")
+        except Exception as exc:
+            self._log(f"测试后台平A失败：{exc}")
+            return
+        self._log(
+            f"测试后台平A → {'已发送' if ok else '发送失败'}"
+            f"（目标窗口 0x{int(hwnd):X}，焦点子窗口 0x{int(target):X}）"
+        )
+        if not ok:
+            self._log("如果游戏没反应：用管理员运行；窗口别最小化；"
+                      "或者勾「允许抢占鼠标键盘」让点击走真实鼠标")
+
+    def _record_nav_macro(self) -> None:
+        if self._nav_recorder is not None or self._nav_pending:
+            self._log("引路宏已经在录制/等待开始")
+            return
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有绑定窗口", "请先绑定游戏窗口，再录引路宏。")
+            return
+        self._save_from_ui()
+        self._nav_pending = True
+        self.btn_nav_record.setEnabled(False)
+        self.btn_nav_stop.setEnabled(True)
+        self.lbl_nav_macro.setText("3 秒后开始录制…请切到游戏")
+        self._log("引路宏：3 秒后开始录制，切到游戏正常操作；完成后切回来点「停止并保存」")
+        QTimer.singleShot(3000, self._start_nav_record)
+
+    def _start_nav_record(self) -> None:
+        if not self._nav_pending:
+            return
+        self._nav_pending = False
+        hwnd = self._hwnd()
+        if not hwnd:
+            self._reset_nav_record_buttons()
+            return
+        try:
+            recorder = app.MacroRecorder(int(hwnd))
+            recorder.start()
+        except Exception as exc:
+            self._log(f"引路宏录制启动失败：{exc}")
+            self._reset_nav_record_buttons()
+            return
+        self._nav_recorder = recorder
+        self.lbl_nav_macro.setText("录制中…操作完切回来点「停止并保存」")
+        self._log("引路宏：开始录制（只录游戏窗口内的左键点击和按键）")
+
+    def _reset_nav_record_buttons(self) -> None:
+        self.btn_nav_record.setEnabled(True)
+        self.btn_nav_stop.setEnabled(False)
+
+    def _stop_nav_record(self) -> None:
+        if self._nav_pending and self._nav_recorder is None:
+            self._nav_pending = False
+            self._reset_nav_record_buttons()
+            self._update_nav_macro_label()
+            self._log("引路宏：已取消")
+            return
+        recorder = self._nav_recorder
+        if recorder is None:
+            self._reset_nav_record_buttons()
+            return
+        self._nav_recorder = None
+        try:
+            events = recorder.stop()
+            meta = recorder.meta()
+        except Exception as exc:
+            self._log(f"引路宏停止失败：{exc}")
+            self._reset_nav_record_buttons()
+            return
+        kept = []
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            typ = str(ev.get("type", ""))
+            if typ == "down" and str(ev.get("button", "left")) == "left":
+                nx, ny = ev.get("nx"), ev.get("ny")
+                if nx is None or ny is None:
+                    continue
+                kept.append({
+                    "type": "down", "t": float(ev.get("t", 0.0)),
+                    "nx": float(nx), "ny": float(ny),
+                })
+            elif typ == "key_down":
+                name = str(ev.get("name", "")).strip()
+                low = name.lower()
+                # F1~F12 是热键，不写进引路宏，避免回放时触发别的功能
+                if low.startswith("f") and low[1:].isdigit():
+                    continue
+                if name:
+                    kept.append({
+                        "type": "key_down", "t": float(ev.get("t", 0.0)),
+                        "name": name,
+                    })
+        nav = self.profile.setdefault("nav_macro", {})
+        nav["events"] = kept
+        nav["meta"] = meta if isinstance(meta, dict) else {}
+        self._save()
+        self._reset_nav_record_buttons()
+        self._update_nav_macro_label()
+        if kept:
+            self._log(f"引路宏：已保存 {len(kept)} 个动作")
+        else:
+            self._log("引路宏：没录到点击/按键（要游戏在前台、鼠标在游戏窗口内）")
+
+    def _clear_nav_macro(self) -> None:
+        nav = self.profile.setdefault("nav_macro", {})
+        nav["events"] = []
+        nav["meta"] = {}
+        self._save()
+        self._update_nav_macro_label()
+        self._log("引路宏：已清空")
+
+    def _update_nav_macro_label(self) -> None:
+        nav = self.profile.get("nav_macro") or {}
+        events = nav.get("events") or []
+        if not events:
+            self.lbl_nav_macro.setText("未录制")
+            return
+        clicks = sum(1 for e in events if e.get("type") == "down")
+        keys = sum(1 for e in events if e.get("type") == "key_down")
+        self.lbl_nav_macro.setText(f"已录制：{clicks} 次点击 / {keys} 个按键")
+
+    def _build_exit(self) -> QWidget:
+        box = QGroupBox("④ 疲劳联动：按上下阈值自动切换打怪 / 打BOSS")
+        g = QGridLayout(box)
+        self.chk_fatigue = QCheckBox("启用疲劳检测（每 1 分钟查一次，按上下阈值切换）")
         self.chk_fatigue.setChecked(True)
         self.chk_fatigue.toggled.connect(self._save_from_ui)
-        g.addWidget(self.chk_fatigue, 0, 0, 1, 2)
+        g.addWidget(self.chk_fatigue, 0, 0, 1, 3)
 
-        g.addWidget(QLabel("疲劳阈值"), 0, 2)
+        g.addWidget(QLabel("疲劳阈值 ±"), 0, 3)
         self.spin_fatigue = QSpinBox()
         self.spin_fatigue.setRange(0, 999999)
         self.spin_fatigue.setValue(600)
         self.spin_fatigue.setFixedWidth(100)
+        self.spin_fatigue.setToolTip(
+            "打小怪时：疲劳 < -阈值 → 去打BOSS；"
+            "打BOSS时：疲劳 > +阈值 → 回打怪点打小怪。"
+        )
         self.spin_fatigue.valueChanged.connect(self._save_from_ui)
-        g.addWidget(self.spin_fatigue, 0, 3)
-
-        g.addWidget(QLabel("低于阈值先普通打怪"), 0, 4)
-        self.spin_fatigue_farm = QDoubleSpinBox()
-        self.spin_fatigue_farm.setRange(0.0, 7200.0)
-        self.spin_fatigue_farm.setSuffix(" 秒")
-        self.spin_fatigue_farm.setValue(300.0)
-        self.spin_fatigue_farm.setFixedWidth(110)
-        self.spin_fatigue_farm.valueChanged.connect(self._save_from_ui)
-        g.addWidget(self.spin_fatigue_farm, 0, 5)
+        g.addWidget(self.spin_fatigue, 0, 4)
 
         self.btn_fatigue_roi = QPushButton("框疲劳提示区域（可选）")
         self.btn_fatigue_roi.clicked.connect(self._pick_fatigue_roi)
@@ -908,8 +1092,8 @@ class DungeonTab(QWidget):
         self.lbl_fatigue_roi = QLabel("未设置（会沿用主界面「疲劳检测」框过的区域）")
         g.addWidget(self.lbl_fatigue_roi, 1, 1, 1, 6)
         g.addWidget(_hint(
-            "流程：退出副本 → 点一下上面④设置的「疲劳图标」→ 读取弹出的疲劳值 → "
-            "低于阈值就先普通挂机打怪一段时间，再继续下一轮副本。"
+            "不需要设挂机时长：每 60 秒查一次疲劳。"
+            "打小怪时疲劳 < -阈值 就去打BOSS；打BOSS时疲劳 > +阈值 就回打怪点。"
         ), 2, 0, 1, 8)
         return box
 
@@ -917,7 +1101,7 @@ class DungeonTab(QWidget):
     # 多开
     # ------------------------------------------------------------------
     def _build_multi(self) -> QWidget:
-        box = QGroupBox("多开（每个窗口可设不同挂机时长）")
+        box = QGroupBox("多开（每行一个窗口；F8 全部开始 / F9 全部停止）")
         g = QGridLayout(box)
         self.multi_combos: list[QComboBox] = []
         self.multi_seconds: list[QDoubleSpinBox] = []   # 已废弃：挂机不再设时长
@@ -1115,7 +1299,6 @@ class DungeonTab(QWidget):
             self.spin_trash_seconds.setValue(
                 float(loop.get("fatigue_every", 60.0))
             )
-            self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 60.0)))
             self.chk_link.setChecked(bool(loop.get("link_fatigue", True)))
             detect = p.get("detect") or {}
             self.spin_sim.setValue(float(detect.get("sim", 0.80)))
@@ -1136,6 +1319,14 @@ class DungeonTab(QWidget):
                     label.setText("未设置")
                     label.setStyleSheet("color: #444444;")
             self.chk_allow_grab.setChecked(bool(p.get("allow_grab", False)))
+            nav = p.get("nav_macro") or {}
+            self.chk_nav_macro.setChecked(bool(nav.get("enabled", False)))
+            self.chk_nav_fallback.setChecked(bool(nav.get("fallback", False)))
+            try:
+                self.spin_nav_speed.setValue(float(nav.get("speed", 1.0) or 1.0))
+            except (TypeError, ValueError):
+                self.spin_nav_speed.setValue(1.0)
+            self._update_nav_macro_label()
             _mode = str(p.get("input_mode", "hybrid"))
             _idx = self.combo_input_mode.findData(_mode)
             self.combo_input_mode.setCurrentIndex(_idx if _idx >= 0 else 0)
@@ -1153,7 +1344,6 @@ class DungeonTab(QWidget):
             fatigue = p.get("fatigue") or {}
             self.chk_fatigue.setChecked(bool(fatigue.get("enabled", True)))
             self.spin_fatigue.setValue(int(fatigue.get("threshold", 800) or 0))
-            self.spin_fatigue_farm.setValue(float(fatigue.get("farm_seconds", 300.0)))
 
             states = {
                 "dungeon_pt": (enter.get("dungeon_pt"), "① 副本入口"),
@@ -1252,7 +1442,6 @@ class DungeonTab(QWidget):
         p.setdefault("fatigue", {}).update({
             "enabled": bool(self.chk_fatigue.isChecked()),
             "threshold": int(self.spin_fatigue.value()),
-            "farm_seconds": float(self.spin_fatigue_farm.value()),
         })
         p.setdefault("mount", {}).update({
             "enabled": bool(self.chk_mount.isChecked()),
@@ -1262,12 +1451,8 @@ class DungeonTab(QWidget):
         })
         p.setdefault("loop", {}).update({
             "boss_seconds": float(self.spin_seconds.value()),
-            "boss_rounds": 1,
-            "trash_seconds": float(self.spin_trash_seconds.value()),
-            "trash_rounds": 1,
             "fatigue_every": float(self.spin_trash_seconds.value()),
             "link_fatigue": bool(self.chk_link.isChecked()),
-            "farm_seconds": 0.0,
             "pickup_on_a": bool(self.chk_pickup_on_a.isChecked()),
         })
         p["action_gap"] = float(self.spin_action_gap.value())
@@ -1278,6 +1463,10 @@ class DungeonTab(QWidget):
         p.setdefault("retry", {})["rounds"] = int(self.spin_rounds.value())
         p["allow_grab"] = bool(self.chk_allow_grab.isChecked())
         p["input_mode"] = self.combo_input_mode.currentData() or "hybrid"
+        nav = p.setdefault("nav_macro", {})
+        nav["enabled"] = bool(self.chk_nav_macro.isChecked())
+        nav["fallback"] = bool(self.chk_nav_fallback.isChecked())
+        nav["speed"] = float(self.spin_nav_speed.value())
         p.setdefault("retry", {})["gap"] = float(self.spin_gap.value())
         self._save()
 
@@ -1570,6 +1759,9 @@ class DungeonTab(QWidget):
         return missing
 
     def _start_single(self, dry: bool) -> None:
+        if self._nav_recorder is not None or self._nav_pending:
+            self._log("正在录引路宏，先点「停止并保存」再开始运行")
+            return
         thread = self.threads.get(0)
         if thread is not None:
             if thread.isRunning():
@@ -1611,9 +1803,13 @@ class DungeonTab(QWidget):
         self._log(f"① 按「{self.edit_map_key.text().strip() or 'm'}」开地图1 → 点副本入口 "
                   f"→ 等 {self.spin_entry_wait.value():.0f}s → 等进本弹窗"
                   f"（识别到才点「进入游戏」）→ 等加载 {self.spin_load_wait.value():.0f}s")
+        nav = self.profile.get("nav_macro") or {}
+        if nav.get("enabled") and nav.get("events"):
+            self._log("引路宏：已启用（进本/跑向 BOSS 用录制的鼠标宏，不点地图点位）")
         self._log(
             f"② 疲劳 < -阈值 → 打BOSS（上限 {self.spin_seconds.value():.0f}s，血条没了就结束）；"
-            f"疲劳 > +阈值 → 回打怪点挂机；每 {self.spin_trash_seconds.value():.0f}s 查一次疲劳"
+            f"疲劳 > +阈值 → 回打怪点挂机；不设挂机时长，"
+            f"每 {self.spin_trash_seconds.value():.0f}s 查一次疲劳"
         )
         self._log(f"③ 点「退出副本」→ 识别退出确认弹窗 → 点「确认」→ 等 {self.spin_exit_settle.value():.0f}s")
         self._launch(0, hwnd, rounds if not dry else 1, dry=dry)
@@ -1638,6 +1834,9 @@ class DungeonTab(QWidget):
         thread.start()
 
     def _toggle_slot(self, slot: int) -> None:
+        if self._nav_recorder is not None or self._nav_pending:
+            self._log("正在录引路宏，先点「停止并保存」再开始运行")
+            return
         thread = self.threads.get(slot)
         if thread is not None:
             if thread.isRunning():
@@ -1709,14 +1908,43 @@ class DungeonTab(QWidget):
             self._log(f"全局热键已注册：{' / '.join(ok)}（F8 开始，F9 停止）")
 
     def _on_hotkey_start(self) -> None:
+        if self._nav_recorder is not None or self._nav_pending:
+            self._log("[F8] 正在录引路宏，先停止录制")
+            return
         if self.threads:
             self._log("[F8] 已经在运行了")
             return
-        self._log("[F8] 开始运行")
-        self._start_single(dry=False)
+        missing = self._missing_items()
+        if missing:
+            self._log("[F8] 还没标定完：" + "、".join(missing))
+            QMessageBox.warning(
+                self, "还没标定完",
+                "下面这些还没设置，按 F8 也跑不了：\n\n"
+                + "\n".join("· " + m for m in missing),
+            )
+            return
+        self._save_from_ui()
+        self._log("[F8] 开始运行：先启动多开里已选窗口，没选则启动单窗口")
+        started = 0
+        used: set[int] = set()
+        for i in range(4):
+            hwnd = self.multi_combos[i].currentData()
+            if not hwnd:
+                continue
+            hwnd = int(hwnd)
+            if hwnd in used:
+                continue
+            used.add(hwnd)
+            self._toggle_slot(i)
+            started += 1
+        if not started:
+            self._start_single(dry=False)
 
     def _on_hotkey_stop(self) -> None:
         self._log("[F9] 停止")
+        if self._nav_recorder is not None or self._nav_pending:
+            self._stop_nav_record()
+            return
         self._stop_all()
         self._stop_single()
 

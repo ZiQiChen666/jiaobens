@@ -20,7 +20,7 @@
     python dungeon_flow.py --list
     python dungeon_flow.py --calibrate --window CreatureCurios
     python dungeon_flow.py --run --window CreatureCurios --rounds 3
-    python dungeon_flow.py --run --window CreatureCurios --farm-seconds 90
+    python dungeon_flow.py --run --window CreatureCurios --boss-seconds 90
     python dungeon_flow.py --probe --window CreatureCurios --seconds 5
 """
 
@@ -30,8 +30,10 @@ import argparse
 import copy
 import datetime
 import json
+import math
 import os
 import sys
+import threading
 import time
 from typing import Callable, Optional
 
@@ -57,6 +59,10 @@ ACTIVE_NAME_FILE = "dungeon_active.txt"
 # 配置
 # ---------------------------------------------------------------------------
 
+# 多开时所有窗口共用：谁要切前台/借光标，都必须先拿到这把锁。
+# 这样 A 窗口在点地图时，B 窗口不会同时把光标/前台抢走。
+_INPUT_LOCK = threading.RLock()
+
 DEFAULT_PROFILE: dict = {
     "name": "默认副本",
     "window_title": "CreatureCurios",
@@ -68,6 +74,13 @@ DEFAULT_PROFILE: dict = {
     "input_mode": "hybrid",   # hybrid=只在点击时借鼠标（键盘走后台）；foreground=全程占用；background=纯后台
     "prime_activate": True,   # 后台模式下补发 WM_ACTIVATE/焦点消息
     "action_gap": 1.0,        # 动作之间的缓冲（秒）
+    "nav_macro": {
+        "enabled": False,     # 用录制的鼠标宏引路（地图点识别不准时用）
+        "events": [],         # 录制下来的点击/按键（归一化客户区坐标）
+        "meta": {},           # 录制时的客户区尺寸（换分辨率也能回放）
+        "speed": 1.0,         # 回放速度 0.25~3.0
+        "fallback": False,    # 宏跑完没到 BOSS 时，是否回退到地图点位
+    },
     "enter": {
         "dungeon_pt": None,        # 地图1 上的副本入口 [nx, ny]
         "travel_wait": 40.0,       # 走路/寻路到副本口要多久
@@ -80,6 +93,7 @@ DEFAULT_PROFILE: dict = {
         "blind_confirm_after": 3.0,  # 这么久还没识别到弹窗 → 先盲点一次确认
         "load_wait": 10.0,         # 点完确认后的加载时间
         "retry": 3,                # 没识别到弹窗 → 重新开图重点，最多几次
+        "map_radius": 0.02,        # 重试时在副本入口周围绕圈微调（归一化半径）
     },
     "mount": {
         "enabled": True,           # 每次寻路前按一下 S，检查宠物是否骑乘
@@ -106,8 +120,9 @@ DEFAULT_PROFILE: dict = {
         "boss_hp": {"roi": None, "min_fill": 0.15, "miss": 3},              # BOSS 血条（亮像素占比）
         "finish": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},        # 旧版，已不用
         "boss_retry": 3,           # 没识别到「打怪点BOSS」就重新寻路几次
+        "map_radius": 0.02,        # 重试时在 BOSS 点周围绕圈微调（归一化半径）
         "pickup_on_a": True,       # 每次平A后都按一次拾取
-        "seconds": 30.0,           # 挂机多久（多开时每个窗口可不同）
+        "seconds": 30.0,           # 兼容旧标定；实际 BOSS 战上限用 loop.boss_seconds
         "interval_ms": 250,
         "use_skills": True,
         "skill1": "1", "skill1_every": 12.0,
@@ -121,14 +136,10 @@ DEFAULT_PROFILE: dict = {
     },
     "loop": {
         "link_fatigue": True,      # 打怪点挂机 ↔ 打BOSS 联动（按疲劳上下限切换）
-        "farm_seconds": 0.0,       # 0 = 一直挂到疲劳够为止（不建议设时长了）
-        "fatigue_every": 60.0,     # 挂机时每隔多少秒查一次疲劳（多开每个窗口独立查）
+        "fatigue_every": 60.0,     # 打怪/挂机时每隔多少秒查一次疲劳（多开每个窗口独立查）
         "max_switch": 3,           # 疲劳变化导致换分支，最多切几次（防来回跳）
-        "trash_seconds": 60.0,     # 打怪循环：打多久
-        "trash_rounds": 1,         # 打怪循环：打几轮
-        "boss_seconds": 30.0,      # BOSS 循环：每只打多久
-        "boss_rounds": 1,          # BOSS 循环：打几只
-        "default_action": "boss",  # 疲劳在中间区间时做哪个：boss / farm
+        "boss_seconds": 120.0,     # BOSS 战上限（血条一直不消失时兜底；最大 1000s）
+        "default_action": "farm",  # 疲劳在中间区间时做哪个：boss / farm
     },
     "warehouse": {
         "enabled": True,
@@ -151,11 +162,10 @@ DEFAULT_PROFILE: dict = {
         "settle": 10.0,            # 退出副本的加载时间
     },
     "fatigue": {
-        "enabled": True,           # 每轮退出副本后检测一次疲劳
+        "enabled": True,           # 是否按疲劳自动切换分支
         "pt": None,                # 疲劳图标点位 [nx, ny]（点一下弹提示）
         "roi": None,               # 疲劳提示文字区域；空则用主界面已框的
-        "threshold": 600,          # 疲劳下限/上限：< -阈值 去打BOSS，> +阈值 回打怪点
-        "farm_seconds": 300.0,     # 疲劳不足时普通挂机打怪多久
+        "threshold": 600,          # 疲劳上下限：< -阈值 去打BOSS，> +阈值 回打怪点
     },
     "detect": {
         "poll": 0.2,        # 轮询间隔（越小越灵敏）
@@ -327,10 +337,20 @@ def save_profile(profile: dict, path: Optional[str] = None) -> str:
     return path
 
 
-def copy_profile_for_slot(profile: dict, farm_seconds: float) -> dict:
-    """多开：每个窗口复制一份，只改挂机时长。"""
+def copy_profile_for_slot(profile: dict, boss_seconds: Optional[float] = None) -> dict:
+    """多开：每个窗口复制一份（不再按窗口设挂机时长）。
+
+    保留 boss_seconds 参数只是为了兼容旧调用：它现在表示 BOSS 战上限，
+    不再是「挂机多久」。
+    """
     p = json.loads(json.dumps(profile))
-    p.setdefault("farm", {})["seconds"] = float(farm_seconds)
+    if boss_seconds is not None:
+        try:
+            p.setdefault("loop", {})["boss_seconds"] = max(
+                5.0, min(1000.0, float(boss_seconds))
+            )
+        except (TypeError, ValueError):
+            pass
     return p
 
 
@@ -416,6 +436,8 @@ class WinGame:
         self.prefix = prefix
         self.stop_event = stop_event
         self.last_error = ""
+        self._focus_saved = 0
+        self._logged_target = False
 
     # -- 基础 --
     def now(self) -> float:
@@ -547,23 +569,25 @@ class WinGame:
     def hybrid_mode(self) -> bool:
         return self.input_mode() == "hybrid"
 
-    def release_focus(self) -> None:
-        """把前台还给用户原来的窗口（混合模式下在纯键盘阶段调用）。"""
+    def release_focus(self, quiet: bool = False) -> None:
+        """把前台还给抢占之前那个窗口（混合模式点完立刻调用）。"""
         if not self.hybrid_mode():
             return
-        saved = getattr(self, "_focus_saved", 0)
-        self._focus_saved = 0
-        if not saved:
-            return
-        try:
-            if saved == self.hwnd or not win32gui.IsWindow(saved):
+        with _INPUT_LOCK:
+            saved = getattr(self, "_focus_saved", 0)
+            self._focus_saved = 0
+            if not saved:
                 return
-            if int(win32gui.GetForegroundWindow() or 0) != self.hwnd:
-                return
-            app._force_foreground_window(saved)
-            self.log("已把前台还给用户窗口（键盘继续后台发送）")
-        except Exception:
-            pass
+            try:
+                if saved == self.hwnd or not win32gui.IsWindow(saved):
+                    return
+                if int(win32gui.GetForegroundWindow() or 0) != self.hwnd:
+                    return
+                app._force_foreground_window(saved)
+                if not quiet:
+                    self.log("已把前台/光标还给原来的窗口（键盘继续后台发送）")
+            except Exception:
+                pass
 
     def activate(self) -> bool:
         """把游戏窗口切到前台（只有允许抢占时才真的切）。"""
@@ -571,24 +595,25 @@ class WinGame:
             return True
         if not self.allow_grab():
             return True   # 纯后台模式：不切前台，只发消息
-        try:
-            if int(win32gui.GetForegroundWindow() or 0) == self.hwnd:
-                return True
-        except Exception:
-            pass
-        try:
-            if win32gui.IsIconic(self.hwnd):
-                win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
-                self.sleep(0.25)
-        except Exception:
-            pass
-        ok = bool(app._force_foreground_window(self.hwnd))
-        if not ok:
-            self.sleep(0.2)
+        with _INPUT_LOCK:
+            try:
+                if int(win32gui.GetForegroundWindow() or 0) == self.hwnd:
+                    return True
+            except Exception:
+                pass
+            try:
+                if win32gui.IsIconic(self.hwnd):
+                    win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+                    self.sleep(0.25)
+            except Exception:
+                pass
             ok = bool(app._force_foreground_window(self.hwnd))
-        if not ok:
-            self.log("警告：没能把游戏切到前台，本次不点击（避免点到别的窗口）")
-        return ok
+            if not ok:
+                self.sleep(0.2)
+                ok = bool(app._force_foreground_window(self.hwnd))
+            if not ok:
+                self.log("警告：没能把游戏切到前台，本次不点击（避免点到别的窗口）")
+            return ok
 
     def _client_to_screen(self, client_x: int, client_y: int):
         try:
@@ -623,48 +648,59 @@ class WinGame:
             self.log(f"[DRY] click ({x},{y})")
             return True
         if self.foreground_mode() and self.allow_grab():
-            hybrid = self.hybrid_mode()
-            saved_cursor = None
-            if hybrid:
-                # 记住用户光标/前台，点完立刻还回去
-                try:
-                    saved_cursor = win32api.GetCursorPos()
-                except Exception:
-                    saved_cursor = None
-                try:
-                    fg = int(win32gui.GetForegroundWindow() or 0)
-                    if fg and fg != self.hwnd:
-                        self._focus_saved = fg
-                except Exception:
-                    pass
-            if not self.activate():
-                self.last_error = "游戏窗口不在前台，已跳过这次点击"
-                return False
-            sx, sy = self._client_to_screen(x, y)
-            try:
-                win32api.SetCursorPos((sx, sy))
-                self.sleep(0.05)
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                self.sleep(0.04)
-                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-                self.sleep(0.08)
-                return True
-            except Exception as exc:
-                self.last_error = f"真实鼠标点击失败：{exc}"
-                self.log(self.last_error)
-                return False
-            finally:
-                if hybrid and saved_cursor is not None:
-                    try:
-                        win32api.SetCursorPos(saved_cursor)
-                    except Exception:
-                        pass
+            return self._grab_click(x, y)
         if self.profile.get("prime_activate", True):
             app.prime_background_input(self.hwnd, activate=True)
         ok = app.post_click_client(self.hwnd, x, y)
         if not ok:
             self.last_error = "后台点击发送失败"
         return ok
+
+    def _grab_click(self, x: int, y: int) -> bool:
+        """真实鼠标点击：整段拿全局输入锁，点完光标/前台都还原。
+
+        多开时 4 个窗口共用 _INPUT_LOCK，所以不会出现 A 窗口把光标移到
+        地图上、B 窗口又把光标还原到半路的情况。
+        """
+        hybrid = self.hybrid_mode()
+        with _INPUT_LOCK:
+            saved_cursor = None
+            if hybrid:
+                try:
+                    saved_cursor = win32api.GetCursorPos()
+                except Exception:
+                    saved_cursor = None
+            try:
+                fg = int(win32gui.GetForegroundWindow() or 0)
+            except Exception:
+                fg = 0
+            self._focus_saved = fg if fg and fg != self.hwnd else 0
+            try:
+                if not self.activate():
+                    self.last_error = "游戏窗口不在前台，已跳过这次点击"
+                    return False
+                sx, sy = self._client_to_screen(x, y)
+                try:
+                    win32api.SetCursorPos((sx, sy))
+                    self.sleep(0.05)
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                    self.sleep(0.04)
+                    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                    self.sleep(0.08)
+                    return True
+                except Exception as exc:
+                    self.last_error = f"真实鼠标点击失败：{exc}"
+                    self.log(self.last_error)
+                    return False
+            finally:
+                if hybrid and saved_cursor is not None:
+                    try:
+                        win32api.SetCursorPos(saved_cursor)
+                    except Exception:
+                        pass
+                # 用户要求：抢完鼠标键盘要回到原来的界面。
+                if hybrid:
+                    self.release_focus(quiet=True)
 
     def tap(self, name: str, hold: float = 0.05) -> bool:
         """后台投递按键（前台模式下也用投递，避免输入法把按键吃掉）。"""
@@ -1106,6 +1142,29 @@ class DungeonRunner:
         self.log(f"没等到{desc}（最高相似度 {best_sim:.2f}，最高占比 {best_ink:.2f}）")
         return False
 
+    def _offset_point(self, point, index: int, radius: float = 0.02):
+        """V3.2 的做法：地图点第一次没点中时，在它周围绕圈微调。
+
+        index=0 返回原点；1..8 是半径 radius 的 8 个方向；
+        9..16 再转 22.5° 再来一圈（和旧版 5% 半径绕圈一致）。
+        坐标是窗口客户区归一化坐标。
+        """
+        if not point:
+            return point
+        try:
+            bx, by = float(point[0]), float(point[1])
+            r = max(0.002, float(radius or 0.0))
+            if index <= 0:
+                return (bx, by)
+            k = (index - 1) % 8
+            loop = (index - 1) // 8
+            angle = 2.0 * math.pi * k / 8.0 + loop * math.pi / 8.0
+            nx = max(0.0, min(1.0, bx + r * math.cos(angle)))
+            ny = max(0.0, min(1.0, by + r * math.sin(angle)))
+            return (nx, ny)
+        except (TypeError, ValueError):
+            return point
+
     def _goto(self, point, wait: float, desc: str,
               arrived_spec: Optional[dict] = None,
               watch_spec: Optional[dict] = None,
@@ -1127,6 +1186,7 @@ class DungeonRunner:
         if not self.game.click_norm(point):
             self.log(f"点击「{desc}」失败")
             return False
+        self.release_focus()
 
         watch = watch_spec if (watch_spec or {}).get("roi") else arrived_spec
         name = watch_desc or (f"{desc}到达标记" if watch is arrived_spec else f"{desc}目标")
@@ -1145,6 +1205,69 @@ class DungeonRunner:
 
     def _loaded_spec(self) -> dict:
         return ((self.p.get("enter") or {}).get("loaded") or {})
+
+    # ---- 引路宏（鼠标宏）：播放录制的点击/按键 ----
+    def nav_macro(self) -> dict:
+        return self.p.get("nav_macro") or {}
+
+    def nav_macro_enabled(self) -> bool:
+        cfg = self.nav_macro()
+        return bool(cfg.get("enabled")) and bool(cfg.get("events"))
+
+    def play_nav_macro(self) -> bool:
+        """回放录制的鼠标宏（点击 + 按键），用归一化客户区坐标。
+
+        点击走 WinGame.click_norm：允许抢占时是真实鼠标（点完还原光标/前台），
+        不允许抢占时是后台 PostMessage。多开时整段拿 _INPUT_LOCK，
+        不会和别的窗口抢鼠标。
+        """
+        cfg = self.nav_macro()
+        events = [e for e in (cfg.get("events") or []) if isinstance(e, dict)]
+        if not events:
+            self.log("引路宏是空的")
+            return False
+        try:
+            speed = max(0.25, min(3.0, float(cfg.get("speed", 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            speed = 1.0
+        clicks = sum(1 for e in events if e.get("type") == "down"
+                     and str(e.get("button", "left")) == "left")
+        keys = sum(1 for e in events if e.get("type") == "key_down")
+        self.log(f"—— 引路宏：{len(events)} 个事件（{clicks} 次点击 / {keys} 个按键，"
+                 f"速度 {speed * 100:.0f}%）——")
+        start = self.game.now()
+        last_t = 0.0
+        try:
+            base_t = min(float(e.get("t", 0.0)) for e in events)
+        except (TypeError, ValueError):
+            base_t = 0.0
+        for ev in events:
+            if self._stopping():
+                return False
+            try:
+                target_t = max(0.0, (float(ev.get("t", 0.0)) - base_t) / speed)
+            except (TypeError, ValueError):
+                target_t = last_t
+            wait = target_t - (self.game.now() - start)
+            if wait > 0:
+                self.game.sleep(wait)
+            last_t = max(last_t, target_t)
+            typ = str(ev.get("type", ""))
+            if typ == "down" and str(ev.get("button", "left")) == "left":
+                nx, ny = ev.get("nx"), ev.get("ny")
+                if nx is None or ny is None:
+                    continue
+                if not self.game.click_norm((float(nx), float(ny))):
+                    self.log("引路宏点击失败，停止回放")
+                    return False
+            elif typ == "key_down":
+                name = str(ev.get("name", "")).strip()
+                if name:
+                    self.game.tap(name)
+        self.gap("引路宏结束缓冲")
+        self.release_focus()
+        self.log("引路宏回放完成")
+        return True
 
     def _progress_spec(self) -> dict:
         return ((self.p.get("enter") or {}).get("progress") or {})
@@ -1255,9 +1378,15 @@ class DungeonRunner:
         for attempt in range(1, attempts + 1):
             if self._stopping():
                 return False
-            self.log(f"—— 进本第 {attempt}/{attempts} 次：点副本入口 ——")
+            radius = float(enter.get("map_radius", 0.02) or 0.02)
+            pt = self._offset_point(enter.get("dungeon_pt"), attempt - 1, radius)
+            if attempt > 1:
+                self.log(f"—— 进本第 {attempt}/{attempts} 次：地图点微调 "
+                         f"({pt[0]:.3f}, {pt[1]:.3f}) ——")
+            else:
+                self.log(f"—— 进本第 {attempt}/{attempts} 次：点副本入口 ——")
             # 点完就开始盯弹窗：寻路过程中就识别，弹窗一出现马上点
-            if not self._goto(enter.get("dungeon_pt"), watch, "副本入口",
+            if not self._goto(pt, watch, "副本入口",
                               watch_spec=spec, watch_desc="进入弹窗",
                               sleep_after=False):
                 return False
@@ -1270,12 +1399,14 @@ class DungeonRunner:
                     if frame is not None and self.anchor_visible(spec, frame):
                         self.log(f"识别到进入弹窗（{self.game.now() - start:.1f}s）→ 点「进入游戏」")
                         self.game.click_norm(confirm_pt)
+                        self.release_focus()
                         break
                 # 识别不到就早点盲点一次（不傻等 24s）
                 if (not blind_done
                         and self.game.now() - start >= blind_after):
                     self.log(f"{blind_after:.0f}s 没识别到弹窗 → 先盲点一次「进入游戏」")
                     self.game.click_norm(confirm_pt)
+                    self.release_focus()
                     blind_done = True
                 elif blind_done:
                     # 盲点后只要看到进度条出现，就说明弹窗点对了、确实进本了
@@ -1425,10 +1556,13 @@ class DungeonRunner:
         for attempt in range(1, tries + 1):
             if self._stopping():
                 return False
-            self.log(f"前往 BOSS 点（第 {attempt}/{tries} 次）")
+            radius = float(farm.get("map_radius", 0.02) or 0.02)
+            pt = self._offset_point(farm.get("boss_pt"), attempt - 1, radius)
+            self.log(f"前往 BOSS 点（第 {attempt}/{tries} 次"
+                     + (f"，地图点微调 {pt[0]:.3f},{pt[1]:.3f}" if attempt > 1 else "")
+                     + "）")
             # 走路时画面一直在动，先不识别；等停下来再看 BOSS
-            if not self._goto(farm.get("boss_pt"), travel, "BOSS 点",
-                              sleep_after=False):
+            if not self._goto(pt, travel, "BOSS 点", sleep_after=False):
                 return False
             if not (spec or {}).get("roi"):
                 self.game.sleep(travel)
@@ -1450,7 +1584,8 @@ class DungeonRunner:
         """③ 挂机打怪：每次平A都拾取；BOSS 血条消失（连续 N 次看不到）= 打完。"""
         farm = self._farm()
         loop = self.p.get("loop") or {}
-        seconds = float(loop.get("boss_seconds", farm.get("seconds", 60.0)) or 60.0)
+        seconds = min(1000.0,
+                      float(loop.get("boss_seconds", 120.0) or 120.0))
         interval = max(0.05, float(farm.get("interval_ms", 250)) / 1000.0)
         pickup_key = str(farm.get("pickup_key") or self._key("pickup", "space"))
         pickup_on_a = bool(farm.get("pickup_on_a", True))
@@ -1538,46 +1673,46 @@ class DungeonRunner:
     def farm_round(self) -> bool:
         """挂机：在「打怪点」一直打，每 fatigue_every 秒查一次疲劳。
 
-        · 疲劳 < -阈值 → 结束挂机（下一轮自动去打 BOSS）
-        · 其它情况继续打（不设总时长；farm_seconds>0 时才按它兜底）
+        · 不设挂机总时长；疲劳 < -阈值 才结束挂机（下一轮自动去打 BOSS）
+        · 疲劳在中间区间就一直打；> +阈值 也继续打（本来就在打小怪）
         """
         farm = self._farm()
         loop = self.p.get("loop") or {}
         every = max(10.0, float(loop.get("fatigue_every", 60.0) or 60.0))
-        cap = float(loop.get("farm_seconds", 0.0) or 0.0)
         if not farm.get("farm_pt"):
             self.log("没标「打怪点」，没法挂机（请到「副本流程」页标一下）")
             return False
-        self.log(f"—— 打怪点挂机（每 {every:.0f}s 查一次疲劳；疲劳 <-阈值 去打BOSS）——")
+        self.log(f"—— 打怪点挂机（不设时长；每 {every:.0f}s 查一次疲劳，"
+                 f"疲劳 <-阈值 去打BOSS）——")
         if not self._goto(farm.get("farm_pt"),
                           float(farm.get("travel_wait", 30.0)), "打怪点"):
             return False
         self.gap("到打怪点后缓冲")
-        total = 0.0
+        self.release_focus()
         while not self._stopping():
             self.combat(every, desc="打怪点挂机", action="farm")
-            total += every
             if self._stopping():
                 return True
-            mode = self.resolve_mode()
-            if mode == "boss":
-                self.log("疲劳够了 → 结束挂机，准备去打 BOSS")
-                return True
-            if cap > 0 and total >= cap:
-                self.log(f"本次挂机到 {cap:.0f}s 上限（配置里的兜底）")
+            if self._switch_to == "boss":
+                self._switch_to = None
+                self._mode = "boss"
+                self.log("疲劳 < -阈值 → 切到打BOSS（结束挂机）")
                 return True
         return True
 
     # -- 兼容旧接口：固定时长打 BOSS 点 --
     def farm_at_boss(self, seconds: Optional[float] = None) -> bool:
         farm = self._farm()
+        loop = self.p.get("loop") or {}
         if not self._goto(farm.get("boss_pt"),
                           float(farm.get("travel_wait", 30.0)), "BOSS 点"):
             return False
         self.gap("到 BOSS 点后缓冲")
-        return self.combat(seconds if seconds is not None
-                           else float(farm.get("seconds", 30.0)),
-                           desc="BOSS 点挂机")
+        return self.combat(
+            min(1000.0, seconds if seconds is not None
+                else float(loop.get("boss_seconds", 120.0) or 120.0)),
+            desc="BOSS 点挂机",
+        )
 
     def combat(self, seconds: float, desc: str = "挂机",
                action: Optional[str] = None) -> bool:
@@ -1586,6 +1721,7 @@ class DungeonRunner:
         action 不为空时，每 loop.fatigue_every 秒查一次疲劳，
         发现该换分支（打BOSS <-> 打怪）就提前结束本次挂机。
         """
+        self._switch_to = None
         loop = self.p.get("loop") or {}
         fatigue_every = float(loop.get("fatigue_every", 60.0) or 0.0)
         fatigue_cfg = self.p.get("fatigue") or {}
@@ -1614,11 +1750,31 @@ class DungeonRunner:
         hp_low = False
 
         pickup_on_a = bool(farm.get("pickup_on_a", True))
+        bg_warned = False
         while not self._stopping():
             elapsed = self.game.now() - start
+            # 先查疲劳：farm_round 里 seconds 可能正好等于 fatigue_every，
+            # 如果先判断「到点结束」就永远查不到疲劳，会死在挂机循环里。
+            if watch and elapsed >= next_fatigue:
+                next_fatigue = elapsed + fatigue_every
+                current, maximum, msg = self.fatigue_check()
+                if current is None:
+                    self.log(f"疲劳读不到（{msg}），继续{desc}")
+                else:
+                    want = self.action_for_fatigue(current)
+                    threshold = abs(int(fatigue_cfg.get("threshold", 800) or 0))
+                    self.log(f"{desc}中查疲劳 {current}/{maximum}（阈值 ±{threshold}）"
+                             + ("" if want == action else
+                                " → 该换分支了：" + ("打BOSS" if want == "boss" else "打怪")))
+                    if want != action:
+                        self._switch_to = want
+                        break
             if elapsed >= seconds:
                 break
-            self.game.tap("a")
+            if not self.game.tap("a") and not bg_warned:
+                bg_warned = True
+                self.log("后台平A发送失败：点「测试后台平A」看目标窗口；"
+                         "游戏要用管理员运行，窗口别最小化")
             if pickup_on_a:
                 self.game.tap(pickup_key)
             if use_skills:
@@ -1648,21 +1804,6 @@ class DungeonRunner:
             if pickup_every > 0 and elapsed >= next_pickup:
                 self.game.tap(pickup_key)
                 next_pickup = elapsed + pickup_every
-
-            if watch and elapsed >= next_fatigue:
-                next_fatigue = elapsed + fatigue_every
-                current, maximum, msg = self.fatigue_check()
-                if current is None:
-                    self.log(f"疲劳读不到（{msg}），继续{desc}")
-                else:
-                    want = self.action_for_fatigue(current)
-                    threshold = abs(int(fatigue_cfg.get("threshold", 800) or 0))
-                    self.log(f"{desc}中查疲劳 {current}/{maximum}（阈值 ±{threshold}）"
-                             + ("" if want == action else
-                                " → 该换分支了：" + ("打BOSS" if want == "boss" else "打怪")))
-                    if want != action:
-                        self._switch_to = want
-                        break
 
             self.game.sleep(interval)
 
@@ -1705,22 +1846,18 @@ class DungeonRunner:
             return None, None, f"疲劳识别异常：{type(exc).__name__}: {exc}"
 
     def after_exit_fatigue(self) -> None:
-        """退出副本后检测一次疲劳；低于阈值就先普通挂机打怪一会儿。"""
+        """退出副本后读一次疲劳，只更新下一次该走哪个分支，不再定时挂机。"""
         cfg = self.p.get("fatigue") or {}
         if not cfg.get("enabled", True):
             return
         current, maximum, msg = self.fatigue_check()
         if current is None:
-            self.log(f"疲劳检测失败（{msg}），跳过普通打怪")
+            self.log(f"疲劳检测失败（{msg}），按当前分支继续")
             return
-        threshold = int(cfg.get("threshold", 800) or 0)
-        self.log(f"当前疲劳 {current}/{maximum}（阈值 {threshold}）")
-        if current < threshold:
-            seconds = float(cfg.get("farm_seconds", 300.0) or 0.0)
-            if seconds > 0:
-                self.combat(seconds, desc=f"疲劳不足，普通挂机打怪 {seconds:.0f}s")
-        else:
-            self.log("疲劳充足，继续下一轮副本")
+        threshold = abs(int(cfg.get("threshold", 600) or 0))
+        self._mode = self.action_for_fatigue(current)
+        self.log(f"当前疲劳 {current}/{maximum}（±{threshold}）→ "
+                 f"下一轮走 {'打BOSS' if self._mode == 'boss' else '打怪点挂机'}")
 
     # -- ③ 退出副本 --
     def loot_before_exit(self) -> None:
@@ -1766,6 +1903,7 @@ class DungeonRunner:
             self.log(f"按 ESC 回主界面（{i + 1}/{esc_times}）")
             self.game.tap("esc")
             self.game.sleep(gap)
+        self.release_focus()
         return True
 
     def exit_dungeon(self) -> bool:
@@ -1798,12 +1936,14 @@ class DungeonRunner:
                 # 没框退出确认弹窗区域：直接盲点确认（兼容老标定）
                 self.log("没标定「退出确认弹窗区域」→ 直接点「确认」（盲点）")
                 self.game.click_norm(confirm_pt)
+                self.release_focus()
                 self.game.sleep(confirm_wait)
                 self.game.sleep(settle)
                 return True
             if self.wait_anchor(spec, timeout, poll, "退出确认弹窗"):
                 self.log("点「确认」→ 等退出加载")
                 self.game.click_norm(confirm_pt)
+                self.release_focus()
                 self.game.sleep(confirm_wait)
                 self.game.sleep(settle)
                 return True
@@ -1815,8 +1955,14 @@ class DungeonRunner:
     def run_round(self, seconds: Optional[float] = None) -> bool:
         """一轮：按疲劳决定【打怪点挂机】还是【打BOSS副本】。"""
         self.log("=== 开始一轮 ===")
-        if getattr(self.game, "foreground_mode", None) and self.game.foreground_mode():
-            self.log("切到游戏窗口（前台模式：会用真实鼠标键盘）")
+        # 只有「前台模式 + 允许抢占」才需要一开始就切前台；
+        # 混合模式只在真正点击时借一下鼠标，点完马上还回去。
+        try:
+            mode_name = self.game.input_mode()
+        except Exception:
+            mode_name = "hybrid"
+        if mode_name == "foreground" and getattr(self.game, "allow_grab", lambda: False)():
+            self.log("前台模式：整个流程占用鼠标键盘")
             try:
                 self.game.activate()
             except Exception:
@@ -1835,11 +1981,46 @@ class DungeonRunner:
         return self.boss_round(seconds)
 
     def boss_round(self, seconds: Optional[float] = None) -> bool:
-        """一次 BOSS 副本：进本 → BOSS 点 → 打怪 → 拾取 → 退出。"""
-        if not self.enter_dungeon():
-            return self._failed("进副本失败")
-        if not self.run_loops():
-            return self._failed("BOSS 点打怪失败")
+        """一次 BOSS 副本：进本 → BOSS 点 → 打怪 → 拾取 → 退出。
+
+        勾了「引路宏」时，进本 + 跑到 BOSS 这段改播放录制的鼠标宏，
+        不再依赖地图点位；宏跑完若没看到 BOSS 身形，可选择回退到地图点位。
+        """
+        if self.nav_macro_enabled():
+            self.log("用引路宏导航（鼠标宏）：进本/跑向 BOSS 不再点地图")
+            if not self.play_nav_macro():
+                return self._failed("引路宏回放失败")
+            spec = self._anchor_of("boss_present")
+            if (spec or {}).get("roi"):
+                still_s = float(spec.get("still_seconds", 0.8) or 0.8)
+                still_t = float(spec.get("still_timeout", 12.0) or 12.0)
+                still_d = float(spec.get("still_diff", 0.015) or 0.015)
+                self.release_focus()
+                self.log("引路宏跑完，等角色停下再识别 BOSS")
+                self.wait_scene_still(still_s, still_t, still_d)
+                self.gap("到 BOSS 点后缓冲")
+                if self.wait_until(spec, 6.0, "BOSS 身形"):
+                    if not self.fight_until_finish():
+                        return self._failed("BOSS 点打怪失败")
+                elif self.nav_macro().get("fallback", False):
+                    self.log("引路宏没识别到 BOSS 身形 → 回退到地图点位")
+                    if not self.enter_dungeon():
+                        return self._failed("进副本失败")
+                    if not self.run_loops():
+                        return self._failed("BOSS 点打怪失败")
+                else:
+                    return self._failed(
+                        "引路宏没到 BOSS（可勾「宏失败回退地图点位」）"
+                    )
+            else:
+                self.log("没框 BOSS 身形 → 引路宏跑完直接开打")
+                if not self.fight_until_finish():
+                    return self._failed("BOSS 点打怪失败")
+        else:
+            if not self.enter_dungeon():
+                return self._failed("进副本失败")
+            if not self.run_loops():
+                return self._failed("BOSS 点打怪失败")
         self.loot_before_exit()
         if not self.exit_dungeon():
             return self._failed("退出副本失败")
@@ -1986,8 +2167,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--seconds", type=float, default=0.0,
                         help="--probe 时打印多少秒")
     parser.add_argument("--rounds", type=int, default=None, help="跑几轮")
-    parser.add_argument("--farm-seconds", type=float, default=None,
-                        help="覆盖挂机时长（秒）")
+    parser.add_argument("--farm-seconds", "--boss-seconds", dest="boss_seconds",
+                        type=float, default=None,
+                        help="覆盖 BOSS 战上限（秒，最大 1000；不是挂机时长）")
     parser.add_argument("--dry", action="store_true", help="模拟跑：不发真实按键")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -2027,7 +2209,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         game = WinGame(hwnd, profile, dry=args.dry, snapshot_dir=snapshot_dir())
         runner = DungeonRunner(game, profile, verbose=args.verbose)
         try:
-            runner.run(args.rounds, args.farm_seconds)
+            runner.run(args.rounds, args.boss_seconds)
         except KeyboardInterrupt:
             print("\n已中断")
             return 130

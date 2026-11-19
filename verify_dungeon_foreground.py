@@ -67,7 +67,8 @@ def check(name, cond, extra=""):
 saved_cursor = win32api.GetCursorPos()
 saved_fg = win32gui.GetForegroundWindow()
 
-profile = df._merge(df.DEFAULT_PROFILE, {"input_mode": "foreground"})
+profile = df._merge(df.DEFAULT_PROFILE,
+                    {"input_mode": "foreground", "allow_grab": True})
 game = df.WinGame(hwnd, profile, log=print)
 
 # 1) 切前台

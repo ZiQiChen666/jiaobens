@@ -38,13 +38,9 @@ answers = {
     "use_skills": True,
     "fatigue_enabled": True,
     "fatigue_threshold": 600,
-    "fatigue_farm_seconds": 240.0,
     "fatigue_pt": [0.10, 0.90],
     "farm_pt": [0.60, 0.60],
-    "boss_seconds": 30.0,
-    "boss_rounds": 2,
-    "trash_seconds": 45.0,
-    "trash_rounds": 3,
+    "fatigue_every": 60.0,
     "mount_enabled": True,
     "mount_key": "s",
     "mount_pt": [0.50, 0.20],
@@ -60,16 +56,15 @@ check("等弹窗超时", profile["enter"]["dialog_timeout"] == 25.0)
 check("没弹窗重试次数", profile["enter"]["retry"] == 4)
 check("进本加载 10s", profile["enter"]["load_wait"] == 10.0)
 check("跑向 BOSS 30s", profile["farm"]["travel_wait"] == 30.0)
-check("BOSS 挂机时长", profile["farm"]["seconds"] == 45.0)
+check("BOSS 战上限", profile["loop"]["boss_seconds"] == 45.0)
 check("喝药间隔 6s", profile["farm"]["potion_every"] == 6.0)
 check("拾取间隔", profile["farm"]["pickup_every"] == 9.0)
 check("退出后加载 10s", profile["exit"]["settle"] == 10.0)
 check("退出两个点", profile["exit"]["exit_pt"] == [0.94, 0.05]
       and profile["exit"]["confirm_pt"] == [0.55, 0.68])
-check("疲劳：开启 + 阈值 + 普通打怪时长 + 图标点",
+check("疲劳：开启 + 阈值 + 图标点",
       profile["fatigue"]["enabled"] is True
       and profile["fatigue"]["threshold"] == 600
-      and profile["fatigue"]["farm_seconds"] == 240.0
       and profile["fatigue"]["pt"] == [0.1, 0.9])
 check("每轮间隔", profile["retry"]["gap"] == 12.0)
 check("步骤表 3 步 + 疲劳说明", len(plan) >= 3
@@ -90,8 +85,11 @@ check("全部跳过也不崩，并列出缺失", any(l.startswith("还差") for 
 
 a = df.copy_profile_for_slot(profile, 60)
 b = df.copy_profile_for_slot(profile, 300)
-check("多开挂机秒数独立", a["farm"]["seconds"] == 60.0
-      and b["farm"]["seconds"] == 300.0 and profile["farm"]["seconds"] == 45.0)
+check("多开不再设挂机时长（只改 BOSS 上限）",
+      a["loop"]["boss_seconds"] == 60.0
+      and b["loop"]["boss_seconds"] == 300.0
+      and profile["loop"]["boss_seconds"] == 45.0
+      and "farm_seconds" not in a["loop"])
 
 # ---- 界面走一遍 -------------------------------------------------------
 _real_save = df.save_profile
@@ -129,13 +127,9 @@ try:
     wiz.spin_hp.setValue(1600)
     wiz.chk_fatigue.setChecked(True)
     wiz.spin_fatigue.setValue(800)
-    wiz.spin_fatigue_farm.setValue(300.0)
+    wiz.spin_fatigue_every.setValue(60.0)
     wiz.spin_exit_settle.setValue(10.0)
     wiz.spin_gap.setValue(8.0)
-    wiz.spin_boss_seconds.setValue(30.0)
-    wiz.spin_boss_rounds.setValue(2)
-    wiz.spin_trash_seconds.setValue(45.0)
-    wiz.spin_trash_rounds.setValue(3)
     wiz.chk_mount.setChecked(True)
     wiz.edit_mount_key.setText("s")
 
@@ -153,14 +147,14 @@ try:
     check("保存等弹窗 24s", saved["enter"]["dialog_timeout"] == 24.0)
     check("保存进本加载 10s", saved["enter"]["load_wait"] == 10.0)
     check("保存跑向 BOSS 30s", saved["farm"]["travel_wait"] == 30.0)
-    check("保存挂机 30s", saved["farm"]["seconds"] == 30.0)
+    check("保存 BOSS 上限 30s", saved["loop"]["boss_seconds"] == 30.0)
     check("保存退出后加载 10s", saved["exit"]["settle"] == 10.0)
     check("保存疲劳设置", saved["fatigue"]["enabled"] is True
           and saved["fatigue"]["threshold"] == 800
           and saved["fatigue"]["pt"] == [0.1, 0.9])
     check("保存了打怪点", saved["farm"]["farm_pt"] == [0.6, 0.6])
-    check("保存了循环参数",
-          saved["loop"]["boss_rounds"] == 2 and saved["loop"]["trash_rounds"] == 3)
+    check("保存了疲劳检查间隔",
+          saved["loop"]["fatigue_every"] == 60.0)
     check("保存了骑乘设置",
           saved["mount"]["enabled"] is True and saved["mount"]["key"] == "s")
     check("保存两个退出点", saved["exit"]["exit_pt"] == [0.94, 0.05]

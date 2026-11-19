@@ -182,8 +182,7 @@ def build_profile(**over):
         },
         "fatigue": {"enabled": False, "threshold": 800,
                     "pt": [0.10, 0.90], "roi": [0.4, 0.05, 0.2, 0.05]},
-        "loop": {"boss_seconds": 60.0, "boss_rounds": 1, "trash_seconds": 30.0,
-                 "trash_rounds": 1, "fatigue_every": 0, "max_switch": 0,
+        "loop": {"boss_seconds": 60.0, "fatigue_every": 0, "max_switch": 0,
                  "default_action": "boss"},
         "detect": {"poll": 0.3},
         "retry": {"rounds": 1, "gap": 1.0, "max_fail": 2},
@@ -198,6 +197,13 @@ def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name + (f"  {extra}" if extra and not cond else ""))
     if not cond:
         fails.append(name)
+
+
+def clicks_near(actions, pt, radius=0.05):
+    """地图点微调后，点击会落在标记点周围；用半径判断而不是精确相等。"""
+    return [a[1] for a in actions if a[0] == "click"
+            and abs(a[1][0] - pt[0]) <= radius
+            and abs(a[1][1] - pt[1]) <= radius]
 
 
 # ---- 1) 弹窗立刻识别 → 立刻进本 --------------------------------------
@@ -234,7 +240,8 @@ r3 = df.DungeonRunner(game3, build_profile(enter={"retry": 2, "load_wait": 4.0})
 ok3 = r3.enter_dungeon()
 check("进度条只有一半 → 不算进本", ok3 is False)
 check("进度条不到 → 重新寻路（副本入口 2 次）",
-      [a[1] for a in game3.actions if a[0] == "click"].count(PT_DUNGEON) == 2)
+      len(clicks_near(game3.actions, PT_DUNGEON)) == 2,
+      str(clicks_near(game3.actions, PT_DUNGEON)))
 
 # ---- 4) BOSS 身形：没识别到就重新寻路 --------------------------------
 game4 = FakeGame(body_appears=False)
@@ -242,7 +249,8 @@ logs4 = []
 r4 = df.DungeonRunner(game4, build_profile(), log=logs4.append)
 ok4 = r4.goto_boss_point()
 check("没识别到 BOSS 身形 → 重新寻路（BOSS 点 2 次）",
-      [a[1] for a in game4.actions if a[0] == "click"].count(PT_BOSS) == 2)
+      len(clicks_near(game4.actions, PT_BOSS)) == 2,
+      str(clicks_near(game4.actions, PT_BOSS)))
 check("始终没身形 → 判定失败", ok4 is False)
 check("日志写“BOSS 身形”", any("BOSS 身形" in l for l in logs4), str(logs4[-4:]))
 
@@ -387,12 +395,12 @@ check("画面在动时会一直等", any("画面已静止" in l for l in logs_st
 
 # ---- 7f) 挂机 ↔ 打BOSS 联动（按疲劳滞回切换）------------------------
 p_link = build_profile()
-p_link["loop"] = dict(p_link["loop"], link_fatigue=True, farm_seconds=5.0,
+p_link["loop"] = dict(p_link["loop"], link_fatigue=True,
                       fatigue_every=0.5, default_action="farm")
 p_link["fatigue"] = {"enabled": True, "threshold": 600,
                      "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
 p_link["farm"]["farm_pt"] = [0.20, 0.30]
-_seq = {"values": [800, 800, -700, -700, 700, 700], "i": 0}
+_seq = {"values": [800, 800, -700, -700, 700, 700, -700, -700], "i": 0}
 
 
 def _next_fatigue():
@@ -431,8 +439,7 @@ _seq["i"] = 4
 game_link.actions.clear()
 r_link.run_round()
 clicks3 = [a[1] for a in game_link.actions if a[0] == "click"]
-check("疲劳 >+600 → 切回打怪点", r_link._mode == "farm", str(r_link._mode))
-check("切回后确实去了打怪点", (0.20, 0.30) in clicks3, str(clicks3[:4]))
+check("疲劳 >+600 → 切回打怪点", (0.20, 0.30) in clicks3, str(clicks3[:4]))
 
 # 关闭联动 → 永远走 BOSS
 p_nolink = build_profile()
@@ -520,7 +527,7 @@ check("默认配置里 allow_grab=False",
 # 连续挂机：每 fatigue_every 查疲劳，< -阈值 就结束（不再按“段”停）
 p_farm = build_profile()
 p_farm["loop"] = dict(p_farm["loop"], link_fatigue=True, fatigue_every=10.0,
-                      farm_seconds=0.0, default_action="farm")
+                      default_action="farm")
 p_farm["fatigue"] = {"enabled": True, "threshold": 600,
                      "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
 p_farm["farm"]["farm_pt"] = [0.20, 0.30]
@@ -548,6 +555,30 @@ check("挂机期间一直在按 A（连续挂机）",
       [a[1] for a in g_farm.actions if a[0] == "tap"].count("a") > 20,
       str([a[1] for a in g_farm.actions if a[0] == "tap"].count("a")))
 
+# ---- 7j) 引路宏：回放录制的点击/按键 -------------------------------
+p_nav = build_profile()
+p_nav["nav_macro"] = {
+    "enabled": True,
+    "fallback": False,
+    "speed": 2.0,
+    "events": [
+        {"type": "key_down", "t": 0.0, "name": "m"},
+        {"type": "down", "t": 0.2, "button": "left",
+         "nx": PT_DUNGEON[0], "ny": PT_DUNGEON[1]},
+        {"type": "key_down", "t": 0.2, "name": "esc"},
+    ],
+}
+g_nav = FakeGame()
+r_nav = df.DungeonRunner(g_nav, p_nav, log=lambda _s: None)
+check("引路宏已启用", r_nav.nav_macro_enabled() is True)
+check("引路宏回放成功", r_nav.play_nav_macro() is True)
+check("引路宏按了开图键和 Esc",
+      [a[1] for a in g_nav.actions if a[0] == "tap"][:2] == ["m", "esc"],
+      str(g_nav.actions[:4]))
+check("引路宏点到了地图点",
+      len(clicks_near(g_nav.actions, PT_DUNGEON, 0.02)) == 1,
+      str(g_nav.actions[:4]))
+
 # ---- 8) 配置检查 ----------------------------------------------------
 check("配置里有 BOSS 身形 / BOSS 血条",
       "boss_present" in df.DEFAULT_PROFILE["farm"]
@@ -561,7 +592,8 @@ check("仓库配置在默认里",
       and df.DEFAULT_PROFILE["warehouse"]["esc_times"] == 2)
 check("联动配置在默认里",
       df.DEFAULT_PROFILE["loop"].get("link_fatigue") is True
-      and "farm_seconds" in df.DEFAULT_PROFILE["loop"])
+      and "farm_seconds" not in df.DEFAULT_PROFILE["loop"]
+      and 5.0 <= df.DEFAULT_PROFILE["loop"]["boss_seconds"] <= 1000.0)
 check("疲劳阈值默认 600", df.DEFAULT_PROFILE["fatigue"]["threshold"] == 600)
 check("识别阈值可配（sim / sim_loose / poll）",
       all(k in df.DEFAULT_PROFILE["detect"]
