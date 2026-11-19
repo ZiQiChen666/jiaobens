@@ -565,19 +565,9 @@ check("血条基准能读到（活着时亮度高）", base is not None and base
       f"base={base}")
 g_hp.a_count = 999
 check("血条基准对比：血条没了 → 判死",
-      r_hp.boss_hp_visible(base) is False,
+      r_hp.boss_hp_visible() is False,
       f"ratio={getattr(r_hp, '_last_hp_ratio', None)} "
       f"need={getattr(r_hp, '_last_hp_need', None)}")
-
-p_body = build_profile()
-p_body["farm"]["boss_hp"] = {"roi": None, "min_fill": 0.15, "miss": 2}
-p_body["farm"]["death_by_body"] = True
-g_body = FakeGame()
-r_body = df.DungeonRunner(g_body, p_body, log=lambda _s: None)
-r_body.boss_present = lambda: False
-ok_body = r_body.fight_until_finish()
-check("血条不框时：BOSS 身形连续不见 → 判死",
-      ok_body is True and g_body.t < 10.0, f"t={g_body.t:.1f}")
 
 # ---- 7j) 引路宏：回放录制的点击/按键 -------------------------------
 p_nav = build_profile()

@@ -148,10 +148,6 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
         missing.append("进本弹窗识别区域（没有它就只能盲点确认）")
     if not farm.get("boss_pt"):
         missing.append("地图2 的 BOSS 点")
-    if not (farm.get("boss_present") or {}).get("roi") and not (
-        farm.get("boss_hp") or {}
-    ).get("roi"):
-        missing.append("BOSS 身形 / BOSS 血条（至少框一个，否则识别不了死亡）")
     if not exit_cfg.get("exit_pt"):
         missing.append("「退出副本」按钮")
     if fatigue.get("enabled") and not (fatigue.get("pt") or fatigue.get("roi")):

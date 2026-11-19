@@ -117,12 +117,10 @@ DEFAULT_PROFILE: dict = {
                          "sim": 0.60, "search": 1.6, "tol": 30.0,
                          "still_seconds": 0.8, "still_timeout": 12.0,
                          "still_diff": 0.015},  # BOSS 身形（多张样本 + 停下才识别）
-        "boss_hp": {"roi": None, "min_fill": 0.15, "miss": 3,
-                    "drop_ratio": 0.55},  # BOSS 血条（亮度占比；比基准掉到 55% 以下算消失）
+        "boss_hp": {"roi": None, "min_fill": 0.15, "miss": 3},  # BOSS 血条（v3.24 tag：亮度占比）
         "finish": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},        # 旧版，已不用
         "boss_retry": 3,           # 没识别到「打怪点BOSS」就重新寻路几次
         "map_radius": 0.02,        # 重试时在 BOSS 点周围绕圈微调（归一化半径）
-        "death_by_body": False,    # 血条没消失时，BOSS 身形连续 miss 次不见也算死
         "pickup_on_a": True,       # 每次平A后都按一次拾取
         "seconds": 30.0,           # 兼容旧标定；实际 BOSS 战上限用 loop.boss_seconds
         "interval_ms": 250,
@@ -1529,27 +1527,20 @@ class DungeonRunner:
         except Exception:
             return None
 
-    def boss_hp_visible(self, baseline: Optional[float] = None) -> bool:
-        """BOSS 血条还在不在（在=没死）。
+    def boss_hp_visible(self) -> bool:
+        """BOSS 血条还在不在（在=没死）。—— 和 v3.24.0 tag 完全一致。
 
-        baseline 是开打时血条区域的亮度占比。此时用「相对基准下降到 drop_ratio」
-        判死，比固定 0.15 更抗背景亮度/血条粗细变化；没有 baseline 时退回 min_fill。
+        用「亮像素占比」判断：血条是亮的，空的血条槽/背景是暗的。
         """
         spec = self._anchor_of("boss_hp")
-        if not (spec or {}).get("roi"):
-            return True  # 没框血条 → 用时间上限/身形判死
+        roi = (spec or {}).get("roi")
+        if not roi:
+            return True  # 没框血条 → 用时间上限
         ratio = self.boss_hp_ratio()
         if ratio is None:
             return True
-        try:
-            drop = max(0.10, min(0.95, float(spec.get("drop_ratio", 0.55) or 0.55)))
-        except (TypeError, ValueError):
-            drop = 0.55
-        if baseline is not None and baseline > 0:
-            need = max(0.01, float(baseline) * drop)
-        else:
-            need = max(0.01, float(spec.get("min_fill",
-                                             spec.get("min_ink", 0.15)) or 0.15))
+        need = float(spec.get("min_fill",
+                              spec.get("min_ink", 0.15)) or 0.15)
         self._last_hp_ratio = ratio
         self._last_hp_need = need
         return ratio >= need
@@ -1619,43 +1610,18 @@ class DungeonRunner:
         hp_every = float(farm.get("hp_check_every", 2.0) or 2.0)
         use_skills = bool(farm.get("use_skills", True))
         hp_spec = self._anchor_of("boss_hp")
-        body_spec = self._anchor_of("boss_present")
-        has_hp = bool((hp_spec or {}).get("roi"))
-        has_body = bool((body_spec or {}).get("roi"))
-        use_body = bool(farm.get("death_by_body", False))
-        if not has_hp and has_body:
-            use_body = True
-            self.log("没框 BOSS 血条 → 用「BOSS 身形消失」判死")
-        if not has_hp and not has_body:
-            self.log("没框血条也没框身形 → 只能按「打BOSS上限」停，识别不了死亡")
         need_miss = max(1, int((hp_spec or {}).get("miss", 3) or 3))
         poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
         loop_fat = float(loop.get("fatigue_every", 60.0) or 0.0)
         watch_fatigue = bool((self.p.get("fatigue") or {}).get("enabled", True)) and loop_fat > 0
-        hp_baseline = self.boss_hp_ratio() if has_hp else None
-        if has_hp:
-            if hp_baseline is None:
-                self.log("BOSS 血条基准读取失败：这次按固定阈值判死")
-            elif hp_baseline < 0.01:
-                self.log("BOSS 血条基准亮度接近 0（可能没框准）→ 按固定阈值判死")
-            else:
-                drop = float((hp_spec or {}).get("drop_ratio", 0.55) or 0.55)
-                self.log(f"BOSS 血条基准亮度 {hp_baseline * 100:.0f}%"
-                         f"（降到 {hp_baseline * drop * 100:.0f}% 以下算消失）")
 
         self.release_focus()
-        if has_hp:
-            how = "血条消失" + ("/BOSS 身形消失" if use_body and has_body else "")
-        elif has_body and use_body:
-            how = "BOSS 身形消失"
-        else:
-            how = "按时间停"
-        self.log(f"开始打怪（上限 {seconds:.0f}s；{how}就算打完）")
+        self.log(f"开始打怪（上限 {seconds:.0f}s；"
+                 + ("BOSS 血条消失就算打完）" if (hp_spec or {}).get("roi")
+                    else "没框血条，按时间停）"))
         start = self.game.now()
         next_s1 = next_s2 = next_potion = next_pickup = next_hp = 0.0
         next_fatigue = next_pickup = next_check = 0.0
-        next_body_check = 0.0
-        next_hp_log = 0.0
         next_pickup = pickup_every
         hp_low = False
         misses = 0
@@ -1692,38 +1658,21 @@ class DungeonRunner:
                 self.game.tap(pickup_key)
                 next_pickup = elapsed + pickup_every
 
-            if (has_hp or (use_body and has_body)) and elapsed >= next_check:
-                next_check = elapsed + (poll if has_hp else 1.0)
-                visible = self.boss_hp_visible(hp_baseline) if has_hp else True
-                ratio = getattr(self, "_last_hp_ratio", None)
-                need = getattr(self, "_last_hp_need", None)
-                body_gone = False
-                if use_body and has_body and elapsed >= next_body_check:
-                    next_body_check = elapsed + 1.0
-                    # 血条还在时，再用身形确认一次（血条已经没了就不重复截图）
-                    if not has_hp or visible:
-                        body_gone = not self.boss_present()
-                if visible and not body_gone:
+            if (hp_spec or {}).get("roi") and elapsed >= next_check:
+                next_check = elapsed + poll
+                if self.boss_hp_visible():
                     misses = 0
                 else:
                     misses += 1
-                    why = []
-                    if not visible and ratio is not None and need is not None:
-                        why.append(f"血条亮度 {ratio * 100:.0f}% < {need * 100:.0f}%")
-                    elif not visible:
-                        why.append("血条不见了")
-                    if body_gone:
-                        why.append("BOSS 身形不见")
-                    self.log(f"BOSS 可能死了（{misses}/{need_miss}）："
-                             + "；".join(why))
+                    ratio = getattr(self, "_last_hp_ratio", None)
+                    need = getattr(self, "_last_hp_need", None)
+                    extra = ""
+                    if ratio is not None and need is not None:
+                        extra = f"（亮度 {ratio * 100:.0f}% < {need * 100:.0f}%）"
+                    self.log(f"BOSS 血条不见了（{misses}/{need_miss}）{extra}")
                     if misses >= need_miss:
-                        self.log(f"连续 {misses} 次不见 → 判定打完")
+                        self.log(f"BOSS 血条连续 {misses} 次不见 → 判定打完")
                         break
-                if has_hp and elapsed >= next_hp_log:
-                    next_hp_log = elapsed + 5.0
-                    self.log(f"血条亮度 {ratio * 100:.0f}%"
-                             f"（判死 {need * 100:.0f}%）"
-                             + ("；身形在" if not body_gone else "；身形不见"))
 
             if watch_fatigue and elapsed >= next_fatigue:
                 next_fatigue = elapsed + loop_fat
