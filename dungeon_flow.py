@@ -1901,6 +1901,14 @@ class DungeonRunner:
 
 
 def list_windows(keyword: str = "") -> list[tuple[int, str]]:
+    """列出候选游戏窗口。
+
+    会排除：本程序自己的窗口（标题含“后台按键器”、或属于本进程）、
+    没有标题的窗口、不可见窗口。
+    """
+    import os as _os
+
+    my_pid = _os.getpid()
     found: list[tuple[int, str]] = []
 
     def cb(hwnd, _param):
@@ -1909,6 +1917,15 @@ def list_windows(keyword: str = "") -> list[tuple[int, str]]:
         title = win32gui.GetWindowText(hwnd)
         if not title:
             return True
+        if "后台按键器" in title:
+            return True
+        try:
+            pid = wt.DWORD()
+            _USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if int(pid.value) == my_pid:
+                return True
+        except Exception:
+            pass
         if keyword and keyword.lower() not in title.lower():
             return True
         found.append((int(hwnd), title))

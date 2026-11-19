@@ -1306,25 +1306,37 @@ class DungeonTab(QWidget):
         self._save()
 
     def _refresh_windows(self) -> None:
+        """刷新窗口列表，并把窗口按顺序自动排到 4 行里（不重复）。"""
         wins = df.list_windows("CreatureCurios")
+        # 稳定排序：先按标题，再按句柄
+        wins = sorted(wins, key=lambda item: (item[1], item[0]))
+        # 当前绑定的窗口排第一，其余按顺序
+        bound = self._hwnd()
+        if bound:
+            wins.sort(key=lambda item: 0 if item[0] == bound else 1)
+
+        # 每行都已经塞进同样的候选列表
         for combo in self.multi_combos:
-            current = combo.currentData()
             combo.blockSignals(True)
             combo.clear()
             for hwnd, title in wins:
-                combo.addItem(f"{title[:36]} [0x{hwnd:X}]", hwnd)
-            if current:
-                index = combo.findData(current)
-                if index >= 0:
-                    combo.setCurrentIndex(index)
+                combo.addItem(f"{title[:34]} [0x{hwnd:X}]", hwnd)
             combo.blockSignals(False)
-        bound = self._hwnd()
-        if bound:
-            for combo in self.multi_combos:
-                index = combo.findData(bound)
-                if index >= 0:
-                    combo.setCurrentIndex(index)
-                    break
+
+        # 自动排队：第 1 行放第 1 个窗口，第 2 行放第 2 个……互不重复
+        for i, combo in enumerate(self.multi_combos):
+            if i in self.threads:
+                continue                      # 这行正在跑，别动它
+            combo.blockSignals(True)
+            if i < len(wins):
+                idx = combo.findData(wins[i][0])
+                combo.setCurrentIndex(idx if idx >= 0 else -1)
+            else:
+                combo.setCurrentIndex(-1)
+            combo.blockSignals(False)
+
+        self._log(f"窗口列表已刷新：找到 {len(wins)} 个窗口，已按顺序排到 "
+                  f"{min(len(wins), len(self.multi_combos))} 行")
         for i in range(len(self.multi_combos)):
             self._refresh_slot_name(i)
 
