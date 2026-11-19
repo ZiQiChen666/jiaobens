@@ -1,4 +1,4 @@
-# CreatureCurios 后台按键器 v3.19.0
+# CreatureCurios 后台按键器 v3.20.0
 
 Windows 桌面小工具：绑定 `CreatureCurios` 窗口后，在后台循环投递 `A`
 （可选空格拾取），可选技能、喝药、疲劳检测、定时提醒，支持**自动打BOSS**、**后台回放（不抢鼠标键盘）**，

@@ -35,7 +35,7 @@ def cells(layout: QGridLayout):
             name = str(name)[:22]
         else:
             sub = item.layout()
-            name = f"<layout {type(sub).__name__}>"
+            name = f"<{type(sub).__name__}#{i}>"
         for r in range(row, row + max(1, rspan)):
             for c in range(col, col + max(1, cspan)):
                 out.append(((r, c), name))
@@ -93,10 +93,52 @@ import creature_curios_keyer as app  # noqa: E402
 import dungeon_flow as df  # noqa: E402
 
 w = app.MainWindow()
+w.resize(1600, 1200)
+w.show()
 tab = getattr(w, "dungeon_tab", None)
 check("副本页存在", tab is not None)
 if tab is not None:
+    w.tabs.setCurrentWidget(tab)
+    for _ in range(8):
+        qa.processEvents()
     scan(tab, "副本流程页")
+
+
+def check_group_overlaps(widget, path: str):
+    """把每个 QGroupBox 里直接子控件两两比几何，找“真叠在一起”。"""
+    from PySide6.QtWidgets import QGroupBox
+
+    for gb in widget.findChildren(QGroupBox):
+        lay = gb.layout()
+        if lay is not None:
+            lay.activate()
+        gb.adjustSize()
+        if lay is not None:
+            lay.activate()
+        qa.processEvents()
+        rects = []
+        for ch in gb.findChildren(QWidget):
+            if ch.parent() is not gb or not ch.isVisible():
+                continue
+            geo = ch.geometry()
+            if geo.width() <= 1 or geo.height() <= 1:
+                continue
+            label = ch.text() if hasattr(ch, "text") else ""
+            rects.append((type(ch).__name__, str(label)[:12], geo))
+        bad = 0
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                inter = rects[i][2].intersected(rects[j][2])
+                if inter.width() > 4 and inter.height() > 4:
+                    bad += 1
+                    if bad <= 3:
+                        print(f"    叠在一起：{rects[i][:2]} × {rects[j][:2]} {inter}")
+        check(f"{path}/{gb.title()[:12]} 控件无重叠（{len(rects)} 个）", bad == 0,
+              f"{bad} 处重叠")
+
+
+if tab is not None:
+    check_group_overlaps(tab, "副本流程页")
 
 # 向导每页也扫一遍
 from dungeon_wizard import DungeonWizard  # noqa: E402
