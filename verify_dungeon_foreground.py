@@ -143,8 +143,65 @@ try:
         win32gui.SetForegroundWindow(saved_fg)
 except Exception:
     pass
-win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+# （窗口在文件末尾统一关闭）
 time.sleep(0.2)
+
+# ---- 5) 混合模式：借鼠标点击，点完立刻还原光标 -------------------
+hybrid_profile = df._merge(df.DEFAULT_PROFILE, {"input_mode": "hybrid"})
+hgame = df.WinGame(hwnd, hybrid_profile, log=print)
+
+calls = []
+_real_set = win32api.SetCursorPos
+_real_evt = win32api.mouse_event
+
+
+def spy_set(pos, *a, **k):
+    calls.append(("SetCursorPos", tuple(pos)))
+    return _real_set(pos, *a, **k)
+
+
+def spy_evt(*a, **k):
+    calls.append(("mouse_event", int(a[0])))
+    return _real_evt(*a, **k)
+
+
+hgame.activate = lambda: True          # 这一步只测“借/还鼠标”，不测切前台
+win32api.SetCursorPos = spy_set
+win32api.mouse_event = spy_evt
+saved = win32api.GetCursorPos()
+try:
+    ok_h = hgame.click_norm((0.5, 0.5))
+finally:
+    win32api.SetCursorPos = _real_set
+    win32api.mouse_event = _real_evt
+
+moves = [c for c in calls if c[0] == "SetCursorPos"]
+downs = [c for c in calls if c[0] == "mouse_event"]
+check("混合模式点击返回成功", ok_h, f"last_error={hgame.last_error}")
+check("混合模式：先移到目标点", bool(moves))
+check("混合模式：最后把光标还原到原位置",
+      bool(moves) and moves[-1][1] == tuple(saved),
+      f"最后一次 {moves[-1][1] if moves else None} vs 原 {tuple(saved)}")
+check("混合模式：真的按下/松开了一次",
+      sum(1 for c in downs if c[1] == win32con.MOUSEEVENTF_LEFTDOWN) == 1
+      and sum(1 for c in downs if c[1] == win32con.MOUSEEVENTF_LEFTUP) == 1,
+      str([c[1] for c in downs]))
+
+calls.clear()
+win32api.SetCursorPos = spy_set
+win32api.mouse_event = spy_evt
+try:
+    hgame.tap("m")
+finally:
+    win32api.SetCursorPos = _real_set
+    win32api.mouse_event = _real_evt
+check("混合模式：按键不碰鼠标", not calls, str(calls[:3]))
+
+# 收尾：关掉测试窗口
+try:
+    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+except Exception:
+    pass
 
 print()
 if fails:

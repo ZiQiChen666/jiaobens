@@ -64,7 +64,7 @@ DEFAULT_PROFILE: dict = {
         "open_map": "m",     # 开地图键（地图1/地图2 都用它）
         "pickup": "space",   # 拾取键
     },
-    "input_mode": "foreground",  # foreground=切到游戏窗口用真实鼠标键盘（宏）；background=后台消息
+    "input_mode": "hybrid",   # hybrid=只在点击时借鼠标（键盘走后台）；foreground=全程占用；background=纯后台
     "prime_activate": True,   # 后台模式下补发 WM_ACTIVATE/焦点消息
     "action_gap": 1.0,        # 动作之间的缓冲（秒）
     "enter": {
@@ -467,8 +467,34 @@ class WinGame:
             pass
 
     # -- 前台模式 --
+    def input_mode(self) -> str:
+        mode = str(self.profile.get("input_mode", "hybrid") or "hybrid").lower()
+        return mode if mode in ("hybrid", "foreground", "background") else "hybrid"
+
     def foreground_mode(self) -> bool:
-        return str(self.profile.get("input_mode", "foreground")) != "background"
+        """真正需要切前台/动鼠标的两种情况（hybrid 只在点击时借）。"""
+        return self.input_mode() in ("foreground", "hybrid")
+
+    def hybrid_mode(self) -> bool:
+        return self.input_mode() == "hybrid"
+
+    def release_focus(self) -> None:
+        """把前台还给用户原来的窗口（混合模式下在纯键盘阶段调用）。"""
+        if not self.hybrid_mode():
+            return
+        saved = getattr(self, "_focus_saved", 0)
+        self._focus_saved = 0
+        if not saved:
+            return
+        try:
+            if saved == self.hwnd or not win32gui.IsWindow(saved):
+                return
+            if int(win32gui.GetForegroundWindow() or 0) != self.hwnd:
+                return
+            app._force_foreground_window(saved)
+            self.log("已把前台还给用户窗口（键盘继续后台发送）")
+        except Exception:
+            pass
 
     def activate(self) -> bool:
         """把游戏窗口切到前台（前台模式必须）。"""
@@ -526,7 +552,20 @@ class WinGame:
             self.log(f"[DRY] click ({x},{y})")
             return True
         if self.foreground_mode():
-            # 真实鼠标（宏方式）：切到游戏 → 移动光标 → 左键按下/松开
+            hybrid = self.hybrid_mode()
+            saved_cursor = None
+            if hybrid:
+                # 记住用户光标/前台，点完立刻还回去
+                try:
+                    saved_cursor = win32api.GetCursorPos()
+                except Exception:
+                    saved_cursor = None
+                try:
+                    fg = int(win32gui.GetForegroundWindow() or 0)
+                    if fg and fg != self.hwnd:
+                        self._focus_saved = fg
+                except Exception:
+                    pass
             if not self.activate():
                 self.last_error = "游戏窗口不在前台，已跳过这次点击"
                 return False
@@ -543,6 +582,12 @@ class WinGame:
                 self.last_error = f"真实鼠标点击失败：{exc}"
                 self.log(self.last_error)
                 return False
+            finally:
+                if hybrid and saved_cursor is not None:
+                    try:
+                        win32api.SetCursorPos(saved_cursor)
+                    except Exception:
+                        pass
         if self.profile.get("prime_activate", True):
             app.prime_background_input(self.hwnd, activate=True)
         ok = app.post_click_client(self.hwnd, x, y)
@@ -1031,6 +1076,15 @@ class DungeonRunner:
         return ((self.p.get("enter") or {}).get("progress") or {})
 
     # ---- 动作缓冲 ----
+    def release_focus(self) -> None:
+        """把前台还给用户（混合模式下纯键盘阶段用）。"""
+        fn = getattr(self.game, "release_focus", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
     def gap(self, name: str = "动作缓冲") -> None:
         seconds = float(self.p.get("action_gap", 1.0) or 0.0)
         if seconds > 0:
@@ -1164,10 +1218,12 @@ class DungeonRunner:
             self.gap("点进入后缓冲")
             if self.wait_progress(load_wait):
                 self.gap("进本完成后缓冲")
+                self.release_focus()
                 return True
             loaded = self._loaded_spec()
             if (loaded or {}).get("roi") and self.wait_until(loaded, 3.0, "副本内特征"):
                 self.gap("进本完成后缓冲")
+                self.release_focus()
                 return True
             self.log("没看到加载进度条 → 认为没进副本，重新寻路")
         self.log(f"进本失败：{attempts} 次都没能进副本")
@@ -1306,6 +1362,7 @@ class DungeonRunner:
             still_s = float(spec.get("still_seconds", 0.8) or 0.8)
             still_t = float(spec.get("still_timeout", 12.0) or 12.0)
             still_d = float(spec.get("still_diff", 0.015) or 0.015)
+            self.release_focus()
             self.log("等角色停下（画面不动了再识别 BOSS）")
             self.wait_scene_still(still_s, still_t, still_d)
             self.gap("到 BOSS 点后缓冲")
@@ -1335,6 +1392,7 @@ class DungeonRunner:
         loop_fat = float(loop.get("fatigue_every", 60.0) or 0.0)
         watch_fatigue = bool((self.p.get("fatigue") or {}).get("enabled", True)) and loop_fat > 0
 
+        self.release_focus()
         self.log(f"开始打怪（上限 {seconds:.0f}s；"
                  + ("BOSS 血条消失就算打完）" if (hp_spec or {}).get("roi")
                     else "没框血条，按时间停）"))
@@ -1454,6 +1512,7 @@ class DungeonRunner:
         hp_every = float(farm.get("hp_check_every", 2.0) or 2.0)
         use_skills = bool(farm.get("use_skills", True))
 
+        self.release_focus()
         self.log(f"{desc}：{seconds:.0f}s（喝药 {potion_every:.0f}s / "
                  f"拾取 {pickup_every:.0f}s）")
         start = self.game.now()
@@ -1694,6 +1753,7 @@ class DungeonRunner:
         if not self.exit_dungeon():
             return self._failed("退出副本失败")
         self.gap("退出后缓冲")
+        self.release_focus()
         wh = self.p.get("warehouse") or {}
         if wh.get("enabled", True) and str(wh.get("after", "exit")) == "exit":
             if not self.deposit_to_warehouse():

@@ -732,15 +732,23 @@ class DungeonTab(QWidget):
         self.lbl_hp = QLabel("未设置（不框就按固定间隔喝药）")
         g.addWidget(self.lbl_hp, 2, 7)
 
-        self.chk_foreground = QCheckBox("前台模式：先切到游戏窗口，用真实鼠标键盘（宏方式）")
-        self.chk_foreground.setChecked(True)
-        self.chk_foreground.setToolTip(
-            "勾选：点「开始运行」会把游戏切到前台，并用真实鼠标点击、真实按键（和鼠标宏一样）。"
-            "运行期间会占用你的鼠标键盘，别同时用电脑。\n"
-            "不勾：只用 PostMessage 后台消息（不抢鼠标），但有些游戏不认，会出现“开了地图就不动”。"
+        row_mode = QHBoxLayout()
+        row_mode.addWidget(QLabel("输入模式"))
+        self.combo_input_mode = QComboBox()
+        self.combo_input_mode.addItem("混合（推荐）：点击时才借鼠标，键盘后台发送", "hybrid")
+        self.combo_input_mode.addItem("前台：整个流程占用鼠标键盘", "foreground")
+        self.combo_input_mode.addItem("纯后台：只发消息（部分游戏不认）", "background")
+        self.combo_input_mode.setMinimumWidth(320)
+        self.combo_input_mode.setToolTip(
+            "混合模式：需要点击（地图点/弹窗/仓库）时临时把鼠标借过来点一下，"
+            "点完立刻把光标还给用户；按键全部走后台 PostMessage。"
+            "前台模式=整个流程占用；纯后台=点地图可能无效。"
         )
-        self.chk_foreground.toggled.connect(self._save_from_ui)
-        g.addWidget(self.chk_foreground, 5, 0, 1, 8)
+        self.combo_input_mode.currentIndexChanged.connect(self._save_from_ui)
+        row_mode.addWidget(self.combo_input_mode)
+        row_mode.addWidget(_hint(
+            "混合模式下等待/打怪时你可以正常用电脑，只有点的那一下会借走光标"), 1)
+        g.addLayout(row_mode, 5, 0, 1, 8)
 
         row = QHBoxLayout()
         row_sim = QHBoxLayout()
@@ -1071,9 +1079,9 @@ class DungeonTab(QWidget):
                 else:
                     label.setText("未设置")
                     label.setStyleSheet("color: #444444;")
-            self.chk_foreground.setChecked(
-                str(p.get("input_mode", "foreground")) != "background"
-            )
+            _mode = str(p.get("input_mode", "hybrid"))
+            _idx = self.combo_input_mode.findData(_mode)
+            self.combo_input_mode.setCurrentIndex(_idx if _idx >= 0 else 0)
             self.edit_map_key.setText(str(keys.get("open_map", "m")))
             self.edit_pickup_key.setText(str(keys.get("pickup", "space")))
             self.edit_potion_key.setText(
@@ -1211,7 +1219,7 @@ class DungeonTab(QWidget):
             "sim_loose": float(self.spin_sim_loose.value()),
         })
         p.setdefault("retry", {})["rounds"] = int(self.spin_rounds.value())
-        p["input_mode"] = "foreground" if self.chk_foreground.isChecked() else "background"
+        p["input_mode"] = self.combo_input_mode.currentData() or "hybrid"
         p.setdefault("retry", {})["gap"] = float(self.spin_gap.value())
         self._save()
 
@@ -1517,13 +1525,15 @@ class DungeonTab(QWidget):
         self.btn_dry.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.lbl_state.setText("运行中…（试跑，不按键）" if dry else "运行中…")
+        _mode_text = {
+            "hybrid": "混合模式：点击时借鼠标，键盘后台",
+            "foreground": "前台模式：全程占用鼠标键盘",
+            "background": "纯后台：只发消息",
+        }.get(self.combo_input_mode.currentData() or "hybrid", "")
         self._log(f"=== 副本方案「{self.combo_dungeon.currentData() or '未命名'}」"
-                  "要执行的流程（"
-                  + ("前台模式：真实鼠标键盘" if self.chk_foreground.isChecked()
-                     else "后台模式：PostMessage")
-                  + "）===")
-        if self.chk_foreground.isChecked():
-            self._log("开始运行会先把游戏窗口切到前台，然后用真实鼠标点击地图点 → 运行期间别动鼠标")
+                  f"要执行的流程（{_mode_text}）===")
+        if (self.combo_input_mode.currentData() or "hybrid") == "hybrid":
+            self._log("混合模式：需要点击时才切前台+借鼠标，点完立刻还给你；按键后台发送")
         self._log(f"① 按「{self.edit_map_key.text().strip() or 'm'}」开地图1 → 点副本入口 "
                   f"→ 等 {self.spin_entry_wait.value():.0f}s → 等进本弹窗"
                   f"（识别到才点「进入游戏」）→ 等加载 {self.spin_load_wait.value():.0f}s")
