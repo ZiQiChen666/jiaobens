@@ -147,7 +147,8 @@ except Exception:
 time.sleep(0.2)
 
 # ---- 5) 混合模式：借鼠标点击，点完立刻还原光标 -------------------
-hybrid_profile = df._merge(df.DEFAULT_PROFILE, {"input_mode": "hybrid"})
+hybrid_profile = df._merge(df.DEFAULT_PROFILE,
+                           {"input_mode": "hybrid", "allow_grab": True})
 hgame = df.WinGame(hwnd, hybrid_profile, log=print)
 
 calls = []
@@ -202,6 +203,27 @@ try:
     win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
 except Exception:
     pass
+
+# ---- 6) 不允许抢占：完全不碰鼠标/前台 ------------------------------
+bg_profile = df._merge(df.DEFAULT_PROFILE,
+                       {"input_mode": "hybrid", "allow_grab": False})
+bgame = df.WinGame(hwnd, bg_profile, log=print)
+called = []
+_real_set2 = win32api.SetCursorPos
+_real_evt2 = win32api.mouse_event
+_real_fg2 = win32gui.SetForegroundWindow
+win32api.SetCursorPos = lambda *a, **k: called.append("SetCursorPos") or _real_set2(*a, **k)
+win32api.mouse_event = lambda *a, **k: called.append("mouse_event") or _real_evt2(*a, **k)
+win32gui.SetForegroundWindow = lambda *a, **k: called.append("SetForegroundWindow") or _real_fg2(*a, **k)
+try:
+    ok_b = bgame.click_norm((0.5, 0.5))
+    bgame.tap("a")
+finally:
+    win32api.SetCursorPos = _real_set2
+    win32api.mouse_event = _real_evt2
+    win32gui.SetForegroundWindow = _real_fg2
+check("不允许抢占：点击仍然成功（走后台消息）", ok_b)
+check("不允许抢占：完全不碰鼠标/前台", not called, str(called))
 
 print()
 if fails:

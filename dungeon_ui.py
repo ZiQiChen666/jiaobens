@@ -26,7 +26,7 @@ try:
 except ImportError:  # pragma: no cover
     win32gui = None  # type: ignore
 
-from PySide6.QtCore import QPoint, Qt, QThread, Signal
+from PySide6.QtCore import QMetaObject, QPoint, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -380,6 +380,9 @@ class DungeonThread(QThread):
 
 
 class DungeonTab(QWidget):
+    hotkey_start = Signal()
+    hotkey_stop = Signal()
+
     def __init__(self, host, parent=None):
         super().__init__(parent)
         self.host = host
@@ -412,6 +415,7 @@ class DungeonTab(QWidget):
 
         self._loading = False
         self._refresh_all()
+        self._install_hotkeys()
 
     # ------------------------------------------------------------------
     def _build_header(self) -> QWidget:
@@ -711,7 +715,7 @@ class DungeonTab(QWidget):
         pair(3, 0, "喝药间隔", "spin_potion", 1.0, 60.0, 6.0)
         pair(3, 2, "拾取间隔", "spin_pickup", 0.0, 120.0, 8.0)
         pair(4, 0, "打怪上限", "spin_seconds", 5.0, 3600.0, 60.0)
-        pair(4, 2, "打怪点挂机", "spin_trash_seconds", 5.0, 1800.0, 60.0)
+        pair(4, 2, "挂机查疲劳", "spin_trash_seconds", 10.0, 600.0, 60.0)
 
         g.addWidget(QLabel("没弹窗重试"), 5, 0)
         self.spin_retry = QSpinBox()
@@ -795,6 +799,17 @@ class DungeonTab(QWidget):
         row_wh.addStretch(1)
         g.addLayout(row_wh, 11, 0, 1, 4)
 
+        self.chk_allow_grab = QCheckBox(
+            "允许抢占鼠标键盘（我在电脑前时勾选；不勾=纯后台，绝不动光标/不切前台）"
+        )
+        self.chk_allow_grab.setChecked(False)
+        self.chk_allow_grab.setToolTip(
+            "不勾：只用 PostMessage 发消息，鼠标/前台完全不动（人不在时用这个）。\n"
+            "勾选：需要点击时才借鼠标/切前台，点完立刻还原（人在电脑前时用）。"
+        )
+        self.chk_allow_grab.toggled.connect(self._save_from_ui)
+        g.addWidget(self.chk_allow_grab, 12, 0, 1, 4)
+
         row_mode = QHBoxLayout()
         row_mode.addWidget(QLabel("输入模式"))
         self.combo_input_mode = QComboBox()
@@ -809,7 +824,7 @@ class DungeonTab(QWidget):
         self.combo_input_mode.currentIndexChanged.connect(self._save_from_ui)
         row_mode.addWidget(self.combo_input_mode)
         row_mode.addStretch(1)
-        g.addLayout(row_mode, 12, 0, 1, 4)
+        g.addLayout(row_mode, 13, 0, 1, 4)
 
         row_sim = QHBoxLayout()
         row_sim.addWidget(QLabel("识别相似度"))
@@ -821,7 +836,7 @@ class DungeonTab(QWidget):
         self.spin_sim_loose.setSingleStep(0.05)
         row_sim.addWidget(self.spin_sim_loose)
         row_sim.addStretch(1)
-        g.addLayout(row_sim, 13, 0, 1, 4)
+        g.addLayout(row_sim, 14, 0, 1, 4)
 
         row_gap = QHBoxLayout()
         self.chk_pickup_on_a = QCheckBox("每次平A后都拾取")
@@ -841,7 +856,7 @@ class DungeonTab(QWidget):
         self.chk_mount.toggled.connect(self._save_from_ui)
         row_gap.addWidget(self.chk_mount)
         row_gap.addStretch(1)
-        g.addLayout(row_gap, 14, 0, 1, 4)
+        g.addLayout(row_gap, 15, 0, 1, 4)
 
         row_keys = QHBoxLayout()
         row_keys.addWidget(QLabel("开图键"))
@@ -863,7 +878,7 @@ class DungeonTab(QWidget):
         self.chk_skills.toggled.connect(self._save_from_ui)
         row_keys.addWidget(self.chk_skills)
         row_keys.addStretch(1)
-        g.addLayout(row_keys, 15, 0, 1, 4)
+        g.addLayout(row_keys, 16, 0, 1, 4)
 
         return box
 
@@ -1053,9 +1068,11 @@ class DungeonTab(QWidget):
             self.edit_mount_key.setText(str(mount.get("key", "s")))
             self.spin_boss_seconds.setValue(float(loop.get("boss_seconds", 30.0)))
             self.spin_boss_rounds.setValue(int(loop.get("boss_rounds", 1) or 1))
-            self.spin_trash_seconds.setValue(float(loop.get("trash_seconds", 60.0)))
+            self.spin_trash_seconds.setValue(
+                float(loop.get("fatigue_every", 60.0))
+            )
             self.spin_trash_rounds.setValue(int(loop.get("trash_rounds", 1) or 1))
-            self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 20.0)))
+            self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 60.0)))
             self.chk_link.setChecked(bool(loop.get("link_fatigue", True)))
             detect = p.get("detect") or {}
             self.spin_sim.setValue(float(detect.get("sim", 0.80)))
@@ -1075,6 +1092,7 @@ class DungeonTab(QWidget):
                 else:
                     label.setText("未设置")
                     label.setStyleSheet("color: #444444;")
+            self.chk_allow_grab.setChecked(bool(p.get("allow_grab", False)))
             _mode = str(p.get("input_mode", "hybrid"))
             _idx = self.combo_input_mode.findData(_mode)
             self.combo_input_mode.setCurrentIndex(_idx if _idx >= 0 else 0)
@@ -1204,9 +1222,9 @@ class DungeonTab(QWidget):
             "boss_rounds": int(self.spin_boss_rounds.value()),
             "trash_seconds": float(self.spin_trash_seconds.value()),
             "trash_rounds": int(self.spin_trash_rounds.value()),
-            "fatigue_every": float(self.spin_fatigue_every.value()),
+            "fatigue_every": float(self.spin_trash_seconds.value()),
             "link_fatigue": bool(self.chk_link.isChecked()),
-            "farm_seconds": float(self.spin_trash_seconds.value()),
+            "farm_seconds": 0.0,
             "pickup_on_a": bool(self.chk_pickup_on_a.isChecked()),
         })
         p["action_gap"] = float(self.spin_action_gap.value())
@@ -1215,6 +1233,7 @@ class DungeonTab(QWidget):
             "sim_loose": float(self.spin_sim_loose.value()),
         })
         p.setdefault("retry", {})["rounds"] = int(self.spin_rounds.value())
+        p["allow_grab"] = bool(self.chk_allow_grab.isChecked())
         p["input_mode"] = self.combo_input_mode.currentData() or "hybrid"
         p.setdefault("retry", {})["gap"] = float(self.spin_gap.value())
         self._save()
@@ -1528,8 +1547,10 @@ class DungeonTab(QWidget):
         }.get(self.combo_input_mode.currentData() or "hybrid", "")
         self._log(f"=== 副本方案「{self.combo_dungeon.currentData() or '未命名'}」"
                   f"要执行的流程（{_mode_text}）===")
-        if (self.combo_input_mode.currentData() or "hybrid") == "hybrid":
-            self._log("混合模式：需要点击时才切前台+借鼠标，点完立刻还给你；按键后台发送")
+        if not self.chk_allow_grab.isChecked():
+            self._log("未允许抢占：纯后台（不切前台、不动光标），鼠标键盘完全归你")
+        elif (self.combo_input_mode.currentData() or "hybrid") == "hybrid":
+            self._log("已允许抢占：需要点击时才切前台+借鼠标，点完立刻还原")
         self._log(f"① 按「{self.edit_map_key.text().strip() or 'm'}」开地图1 → 点副本入口 "
                   f"→ 等 {self.spin_entry_wait.value():.0f}s → 等进本弹窗"
                   f"（识别到才点「进入游戏」）→ 等加载 {self.spin_load_wait.value():.0f}s")
@@ -1607,6 +1628,41 @@ class DungeonTab(QWidget):
         self.btn_stop.setEnabled(False)
         self.lbl_state.setText("未运行")
         self._log(f"窗口{slot + 1} 已结束")
+
+    # ------------------------------------------------------------------
+    # F8 开始 / F9 停止（全局热键）
+    # ------------------------------------------------------------------
+    def _install_hotkeys(self) -> None:
+        self.hotkey_start.connect(self._on_hotkey_start,
+                                  Qt.ConnectionType.QueuedConnection)
+        self.hotkey_stop.connect(self._on_hotkey_stop,
+                                 Qt.ConnectionType.QueuedConnection)
+        try:
+            import keyboard as _kb
+        except Exception:
+            self._log("没装 keyboard 库，F8/F9 热键不可用")
+            return
+        ok = []
+        for key, sig in (("f8", self.hotkey_start), ("f9", self.hotkey_stop)):
+            try:
+                _kb.add_hotkey(key, sig.emit, suppress=False)
+                ok.append(key.upper())
+            except Exception as exc:
+                self._log(f"注册 {key.upper()} 失败：{exc}")
+        if ok:
+            self._log(f"全局热键已注册：{' / '.join(ok)}（F8 开始，F9 停止）")
+
+    def _on_hotkey_start(self) -> None:
+        if self.threads:
+            self._log("[F8] 已经在运行了")
+            return
+        self._log("[F8] 开始运行")
+        self._start_single(dry=False)
+
+    def _on_hotkey_stop(self) -> None:
+        self._log("[F9] 停止")
+        self._stop_all()
+        self._stop_single()
 
     # ------------------------------------------------------------------
     # 向导

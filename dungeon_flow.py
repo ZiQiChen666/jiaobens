@@ -64,6 +64,7 @@ DEFAULT_PROFILE: dict = {
         "open_map": "m",     # 开地图键（地图1/地图2 都用它）
         "pickup": "space",   # 拾取键
     },
+    "allow_grab": False,      # 是否允许抢占鼠标键盘（False=纯后台，不动光标不切前台）
     "input_mode": "hybrid",   # hybrid=只在点击时借鼠标（键盘走后台）；foreground=全程占用；background=纯后台
     "prime_activate": True,   # 后台模式下补发 WM_ACTIVATE/焦点消息
     "action_gap": 1.0,        # 动作之间的缓冲（秒）
@@ -120,8 +121,8 @@ DEFAULT_PROFILE: dict = {
     },
     "loop": {
         "link_fatigue": True,      # 打怪点挂机 ↔ 打BOSS 联动（按疲劳上下限切换）
-        "farm_seconds": 60.0,      # 打怪点每次挂机多久（到点再复检疲劳）
-        "fatigue_every": 20.0,     # 打怪期间每隔几秒查一次疲劳（0=不查）
+        "farm_seconds": 0.0,       # 0 = 一直挂到疲劳够为止（不建议设时长了）
+        "fatigue_every": 60.0,     # 挂机时每隔多少秒查一次疲劳（多开每个窗口独立查）
         "max_switch": 3,           # 疲劳变化导致换分支，最多切几次（防来回跳）
         "trash_seconds": 60.0,     # 打怪循环：打多久
         "trash_rounds": 1,         # 打怪循环：打几轮
@@ -467,6 +468,74 @@ class WinGame:
             pass
 
     # -- 前台模式 --
+    def allow_grab(self) -> bool:
+        """是否允许抢占鼠标键盘（勾了才借鼠标/切前台）。"""
+        return bool(self.profile.get("allow_grab", False))
+
+    def _post_aux(self, hwnd: int, message: int, wparam: int, lparam: int) -> bool:
+        try:
+            result = win32api.PostMessage(hwnd, message, wparam, lparam)
+            if result is None or int(result) != 0:
+                return True
+            return bool(_USER32.PostMessageW(hwnd, message, wparam, lparam))
+        except Exception:
+            try:
+                return bool(_USER32.PostMessageW(hwnd, message, wparam, lparam))
+            except Exception:
+                return False
+
+    def _cursor_inside(self) -> bool:
+        try:
+            x, y = win32api.GetCursorPos()
+            cx, cy = win32gui.ScreenToClient(self.hwnd, (x, y))
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            return left <= cx < right and top <= cy < bottom
+        except Exception:
+            return True
+
+    def prime_background_input(self) -> None:
+        """让游戏以为自己是激活/有焦点的（不切前台、不动光标）。
+
+        Unity 类游戏失去前台后会丢弃 WM_KEYDOWN，必须补这几条激活/焦点消息；
+        鼠标不在窗口里时再补一条 WM_MOUSEMOVE，让“鼠标在窗口内”的状态恢复。
+        """
+        if not win32gui.IsWindow(self.hwnd):
+            return
+        try:
+            fg = int(win32gui.GetForegroundWindow() or 0)
+        except Exception:
+            fg = 0
+        if fg != self.hwnd:
+            self._post_aux(self.hwnd, 0x001C, 1, 0)      # WM_ACTIVATEAPP
+            self._post_aux(self.hwnd, 0x0086, 1, 0)      # WM_NCACTIVATE
+            self._post_aux(self.hwnd, 0x0006, 1, fg)     # WM_ACTIVATE / WA_ACTIVE
+            self._post_aux(self.hwnd, 0x0007, fg, 0)     # WM_SETFOCUS
+        if not self._cursor_inside():
+            try:
+                _l, _t, cw, ch = win32gui.GetClientRect(self.hwnd)
+                x, y = int(cw) // 2, int(ch) // 2
+                self._post_aux(self.hwnd, 0x0200, 0,
+                               (x & 0xFFFF) | ((y & 0xFFFF) << 16))
+            except Exception:
+                pass
+
+    def message_target(self) -> int:
+        """真正接收键盘消息的窗口（Unity 常把焦点放在子窗口上）。"""
+        root = self.hwnd
+        try:
+            pid = wt.DWORD()
+            tid = int(_USER32.GetWindowThreadProcessId(root, ctypes.byref(pid)))
+            if tid:
+                info = app.GUITHREADINFO()
+                info.cbSize = ctypes.sizeof(app.GUITHREADINFO)
+                if _USER32.GetGUIThreadInfo(tid, ctypes.byref(info)) and info.hwndFocus:
+                    focus = int(info.hwndFocus)
+                    if focus == root or _USER32.IsChild(root, focus):
+                        return focus
+        except Exception:
+            pass
+        return root
+
     def input_mode(self) -> str:
         mode = str(self.profile.get("input_mode", "hybrid") or "hybrid").lower()
         return mode if mode in ("hybrid", "foreground", "background") else "hybrid"
@@ -497,9 +566,11 @@ class WinGame:
             pass
 
     def activate(self) -> bool:
-        """把游戏窗口切到前台（前台模式必须）。"""
+        """把游戏窗口切到前台（只有允许抢占时才真的切）。"""
         if not self.foreground_mode() or self.dry:
             return True
+        if not self.allow_grab():
+            return True   # 纯后台模式：不切前台，只发消息
         try:
             if int(win32gui.GetForegroundWindow() or 0) == self.hwnd:
                 return True
@@ -551,7 +622,7 @@ class WinGame:
         if self.dry:
             self.log(f"[DRY] click ({x},{y})")
             return True
-        if self.foreground_mode():
+        if self.foreground_mode() and self.allow_grab():
             hybrid = self.hybrid_mode()
             saved_cursor = None
             if hybrid:
@@ -611,14 +682,14 @@ class WinGame:
             scan = 0
         # 按键一律走 PostMessage：真实 keybd_event 会被中文输入法截成
         # VK_PROCESSKEY(229)，游戏就收不到 A / M 了；点击才需要真实鼠标。
-        if self.profile.get("prime_activate", True):
-            app.prime_background_input(self.hwnd, activate=True)
+        self.prime_background_input()
+        target = self.message_target()
         down_lp = 1 | (scan << 16)
         up_lp = down_lp | 0xC0000000
-        ok = self._post(win32con.WM_KEYDOWN, vk, down_lp)
+        ok = self._post_aux(target, win32con.WM_KEYDOWN, vk, down_lp)
         if hold > 0:
             self.sleep(hold)
-        ok = self._post(win32con.WM_KEYUP, vk, up_lp) and ok
+        ok = self._post_aux(target, win32con.WM_KEYUP, vk, up_lp) and ok
         return ok
 
 
@@ -1462,19 +1533,36 @@ class DungeonRunner:
         return self.fight_until_finish()
 
     def farm_round(self) -> bool:
-        """挂机：去「打怪点」打一段（默认 60s），期间查疲劳，够低就切去打BOSS。"""
+        """挂机：在「打怪点」一直打，每 fatigue_every 秒查一次疲劳。
+
+        · 疲劳 < -阈值 → 结束挂机（下一轮自动去打 BOSS）
+        · 其它情况继续打（不设总时长；farm_seconds>0 时才按它兜底）
+        """
         farm = self._farm()
         loop = self.p.get("loop") or {}
-        seconds = float(loop.get("farm_seconds", 60.0) or 60.0)
+        every = max(10.0, float(loop.get("fatigue_every", 60.0) or 60.0))
+        cap = float(loop.get("farm_seconds", 0.0) or 0.0)
         if not farm.get("farm_pt"):
             self.log("没标「打怪点」，没法挂机（请到「副本流程」页标一下）")
             return False
-        self.log(f"—— 打怪点挂机 {seconds:.0f}s（疲劳够了去打BOSS）——")
+        self.log(f"—— 打怪点挂机（每 {every:.0f}s 查一次疲劳；疲劳 <-阈值 去打BOSS）——")
         if not self._goto(farm.get("farm_pt"),
                           float(farm.get("travel_wait", 30.0)), "打怪点"):
             return False
         self.gap("到打怪点后缓冲")
-        self.combat(seconds, desc="打怪点挂机", action="farm")
+        total = 0.0
+        while not self._stopping():
+            self.combat(every, desc="打怪点挂机", action="farm")
+            total += every
+            if self._stopping():
+                return True
+            mode = self.resolve_mode()
+            if mode == "boss":
+                self.log("疲劳够了 → 结束挂机，准备去打 BOSS")
+                return True
+            if cap > 0 and total >= cap:
+                self.log(f"本次挂机到 {cap:.0f}s 上限（配置里的兜底）")
+                return True
         return True
 
     # -- 兼容旧接口：固定时长打 BOSS 点 --

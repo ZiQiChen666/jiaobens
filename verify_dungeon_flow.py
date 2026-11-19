@@ -412,7 +412,8 @@ r_link.fatigue_check = _next_fatigue
 ok_farm = r_link.run_round()
 clicks_link = [a[1] for a in game_link.actions if a[0] == "click"]
 check("疲劳 >+600 → 去打了打怪点", (0.20, 0.30) in clicks_link, str(clicks_link[:4]))
-check("打怪点挂机模式生效", r_link._mode == "farm", str(r_link._mode))
+check("挂机中疲劳降到 -阈值 → 自动切去打BOSS",
+      r_link._mode == "boss", str(r_link._mode))
 check("挂机没去副本入口", PT_DUNGEON not in clicks_link)
 
 # 第 2 轮：疲劳 -700 < -600 → 应该切去打 BOSS
@@ -503,6 +504,50 @@ r_wh2.run_round()
 check("关掉仓库 → 不点仓库图标",
       (0.92, 0.08) not in [a[1] for a in g_wh2.actions if a[0] == "click"])
 
+# ---- 7i) 后台按键：prime + 焦点子窗口；不允许抢占时不切前台 ---------
+p_bg = build_profile()
+p_bg["allow_grab"] = False
+g_bg = FakeGame()
+r_bg = df.DungeonRunner(g_bg, p_bg, log=lambda _s: None)
+win = df.WinGame.__new__(df.WinGame)          # 只测参数判断，不真的开窗口
+win.profile = {"allow_grab": False, "input_mode": "hybrid"}
+check("allow_grab=False 时不抢占", win.allow_grab() is False)
+win.profile = {"allow_grab": True, "input_mode": "hybrid"}
+check("allow_grab=True 时允许抢占", win.allow_grab() is True)
+check("默认配置里 allow_grab=False",
+      df.DEFAULT_PROFILE.get("allow_grab") is False)
+
+# 连续挂机：每 fatigue_every 查疲劳，< -阈值 就结束（不再按“段”停）
+p_farm = build_profile()
+p_farm["loop"] = dict(p_farm["loop"], link_fatigue=True, fatigue_every=10.0,
+                      farm_seconds=0.0, default_action="farm")
+p_farm["fatigue"] = {"enabled": True, "threshold": 600,
+                     "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
+p_farm["farm"]["farm_pt"] = [0.20, 0.30]
+p_farm["farm"]["hp_threshold"] = 0
+_seq2 = {"vals": [500, 200, -700], "i": 0}
+
+
+def _fat():
+    v = _seq2["vals"][min(_seq2["i"], 2)]
+    _seq2["i"] += 1
+    return v, 1000, ""
+
+
+g_farm = FakeGame()
+logs_farm = []
+r_farm = df.DungeonRunner(g_farm, p_farm, log=logs_farm.append)
+r_farm.hp_now = lambda: 5000
+r_farm.fatigue_check = _fat
+r_farm._mode = "farm"
+ok_farm = r_farm.farm_round()
+check("挂机一直打，直到疲劳 < -阈值", ok_farm is True)
+check("挂机结束时会打印“结束挂机”",
+      any("结束挂机" in l for l in logs_farm), str(logs_farm[-4:]))
+check("挂机期间一直在按 A（连续挂机）", 
+      [a[1] for a in g_farm.actions if a[0] == "tap"].count("a") > 20,
+      str([a[1] for a in g_farm.actions if a[0] == "tap"].count("a")))
+
 # ---- 8) 配置检查 ----------------------------------------------------
 check("配置里有 BOSS 身形 / BOSS 血条",
       "boss_present" in df.DEFAULT_PROFILE["farm"]
@@ -534,4 +579,4 @@ print()
 if fails:
     print("FAIL:", fails)
     sys.exit(1)
-print("PASS: 副本引擎 v3.18（喝药Q/6s + 一键放入仓库 + 疲劳联动 + 停下识别）全部通过")
+print("PASS: 副本引擎 v3.21（后台按键 + 连续挂机 + 抢占开关 + 喝药/仓库/联动）全部通过")
