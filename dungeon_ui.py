@@ -178,7 +178,7 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
         }
     elif where == "farm.boss_hp":
         profile.setdefault("farm", {})["boss_hp"] = {
-            "roi": roi_norm, "min_ink": 0.02, "miss": 3,
+            "roi": roi_norm, "min_fill": 0.15, "miss": 3,
         }
     elif where == "farm.arrived":
         sig = df.signature(df.crop_norm(f, roi_norm), 12)
@@ -576,6 +576,8 @@ class DungeonTab(QWidget):
             ("exit_confirm", "③「确认」按钮（第二下）", "shot"),
             ("fatigue_pt", "④ 疲劳图标（点一下弹疲劳值）", "shot"),
             ("mount_pt", "⑤「骑乘」按钮（未骑乘时点它）", "shot"),
+            ("wh_icon", "⑥ 仓库图标（点它打开仓库）", "shot"),
+            ("wh_deposit", "⑥「一键放入」按钮", "shot"),
         ]
         for i, (key, title, kind) in enumerate(items):
             btn = QPushButton("设置")
@@ -778,6 +780,11 @@ class DungeonTab(QWidget):
         self.edit_pickup_key.setFixedWidth(54)
         self.edit_pickup_key.editingFinished.connect(self._save_from_ui)
         row.addWidget(self.edit_pickup_key)
+        row.addWidget(QLabel("喝药键"))
+        self.edit_potion_key = QLineEdit()
+        self.edit_potion_key.setFixedWidth(44)
+        self.edit_potion_key.editingFinished.connect(self._save_from_ui)
+        row.addWidget(self.edit_potion_key)
         row.addWidget(QLabel("轮数(0=无限)"))
         self.spin_rounds = QSpinBox()
         self.spin_rounds.setRange(0, 9999)
@@ -807,6 +814,24 @@ class DungeonTab(QWidget):
         row_link.addWidget(self.chk_link)
         row_link.addWidget(_hint("阈值在下面「③ 退出副本后」那一栏调"), 1)
         g.addLayout(row_link, 4, 0, 1, 8)
+
+        row_wh = QHBoxLayout()
+        self.chk_warehouse = QCheckBox("打完 BOSS 一键放入仓库")
+        self.chk_warehouse.setChecked(True)
+        self.chk_warehouse.toggled.connect(self._save_from_ui)
+        row_wh.addWidget(self.chk_warehouse)
+        row_wh.addWidget(QLabel("ESC 次数"))
+        self.spin_esc_times = QSpinBox()
+        self.spin_esc_times.setRange(0, 5)
+        self.spin_esc_times.setValue(2)
+        self.spin_esc_times.setFixedWidth(60)
+        self.spin_esc_times.valueChanged.connect(self._save_from_ui)
+        row_wh.addWidget(self.spin_esc_times)
+        row_wh.addWidget(QLabel("每步缓冲"))
+        self.spin_wh_gap = self._dspin(0.0, 5.0, 0.5, None, 0, 0)
+        row_wh.addWidget(self.spin_wh_gap)
+        row_wh.addWidget(_hint("秒（仓库→一键放入→ESC 之间）"), 1)
+        g.addLayout(row_wh, 6, 0, 1, 8)
 
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("疲劳 < -阈值 打BOSS"))
@@ -1051,6 +1076,13 @@ class DungeonTab(QWidget):
             )
             self.edit_map_key.setText(str(keys.get("open_map", "m")))
             self.edit_pickup_key.setText(str(keys.get("pickup", "space")))
+            self.edit_potion_key.setText(
+                str((farm.get("potion_keys") or ["q"])[0])
+            )
+            wh = p.get("warehouse") or {}
+            self.chk_warehouse.setChecked(bool(wh.get("enabled", True)))
+            self.spin_esc_times.setValue(int(wh.get("esc_times", 2) or 2))
+            self.spin_wh_gap.setValue(float(wh.get("gap", 0.5)))
             self.spin_exit_settle.setValue(float(exit_cfg.get("settle", 10.0)))
             self.spin_gap.setValue(float((p.get("retry") or {}).get("gap", 8.0)))
             fatigue = p.get("fatigue") or {}
@@ -1067,6 +1099,9 @@ class DungeonTab(QWidget):
                 "fatigue_pt": ((p.get("fatigue") or {}).get("pt"), "④ 疲劳图标"),
                 "mount_pt": ((p.get("mount") or {}).get("mount_pt"), "⑤ 骑乘按钮"),
                 "farm_pt": (farm.get("farm_pt"), "① 打怪点"),
+                "wh_icon": ((p.get("warehouse") or {}).get("icon_pt"), "⑥ 仓库图标"),
+                "wh_deposit": ((p.get("warehouse") or {}).get("deposit_pt"),
+                               "⑥ 一键放入"),
             }
             for key, (pt, _name) in states.items():
                 lbl = self.lbl_pt[key]
@@ -1141,6 +1176,14 @@ class DungeonTab(QWidget):
         })
         p.setdefault("farm", {})["travel_wait"] = float(self.spin_boss_wait.value())
         p.setdefault("exit", {})["settle"] = float(self.spin_exit_settle.value())
+        p.setdefault("farm", {})["potion_keys"] = [
+            self.edit_potion_key.text().strip() or "q"
+        ]
+        p.setdefault("warehouse", {}).update({
+            "enabled": bool(self.chk_warehouse.isChecked()),
+            "esc_times": int(self.spin_esc_times.value()),
+            "gap": float(self.spin_wh_gap.value()),
+        })
         p.setdefault("fatigue", {}).update({
             "enabled": bool(self.chk_fatigue.isChecked()),
             "threshold": int(self.spin_fatigue.value()),
@@ -1212,6 +1255,8 @@ class DungeonTab(QWidget):
             "fatigue_pt": "点一下游戏里那个能弹出疲劳值的图标/按钮位置。",
             "mount_pt": "按 S 打开骑乘窗口，点一下里面的「骑乘」按钮。",
             "farm_pt": "打开地图1，点一下「打怪点」位置（疲劳不够时就在这挂机）。",
+            "wh_icon": "点一下打开仓库的那个图标/按钮（先打开仓库界面再截图）。",
+            "wh_deposit": "在仓库界面里点一下「一键放入」按钮。",
         }.get(key, "")
         if kind == "map":
             info += chr(10) + f"（点「重新截图」会先按一次开图键「{map_key}」）"
@@ -1231,6 +1276,10 @@ class DungeonTab(QWidget):
             current = (p.get("fatigue") or {}).get("pt")
         elif key == "farm_pt":
             current = (p.get("farm") or {}).get("farm_pt")
+        elif key == "wh_icon":
+            current = (p.get("warehouse") or {}).get("icon_pt")
+        elif key == "wh_deposit":
+            current = (p.get("warehouse") or {}).get("deposit_pt")
         elif key == "mount_pt":
             current = (p.get("mount") or {}).get("mount_pt")
 
@@ -1251,6 +1300,10 @@ class DungeonTab(QWidget):
             p.setdefault("fatigue", {})["pt"] = pt
         elif key == "farm_pt":
             p.setdefault("farm", {})["farm_pt"] = pt
+        elif key == "wh_icon":
+            p.setdefault("warehouse", {})["icon_pt"] = pt
+        elif key == "wh_deposit":
+            p.setdefault("warehouse", {})["deposit_pt"] = pt
         elif key == "mount_pt":
             p.setdefault("mount", {})["mount_pt"] = pt
         self._save()

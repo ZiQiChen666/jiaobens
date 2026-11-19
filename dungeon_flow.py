@@ -102,7 +102,7 @@ DEFAULT_PROFILE: dict = {
                          "sim": 0.60, "search": 1.6, "tol": 30.0,
                          "still_seconds": 0.8, "still_timeout": 12.0,
                          "still_diff": 0.015},  # BOSS 身形（多张样本 + 停下才识别）
-        "boss_hp": {"roi": None, "min_ink": 0.02, "miss": 3},               # BOSS 血条
+        "boss_hp": {"roi": None, "min_fill": 0.15, "miss": 3},              # BOSS 血条（亮像素占比）
         "finish": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},        # 旧版，已不用
         "boss_retry": 3,           # 没识别到「打怪点BOSS」就重新寻路几次
         "pickup_on_a": True,       # 每次平A后都按一次拾取
@@ -114,7 +114,7 @@ DEFAULT_PROFILE: dict = {
         "hp_roi": None,            # 血量数字区域（框了才按血量喝药）
         "hp_threshold": 1600,
         "hp_check_every": 2.0,
-        "potion_keys": ["q", "w"],
+        "potion_keys": ["q"],      # 血量低于阈值时只按 Q
         "potion_every": 6.0,       # 喝药间隔（低于阈值时每 6 秒喝一次）
         "pickup_every": 8.0,       # 挂机期间每隔几秒按一次拾取
     },
@@ -128,6 +128,15 @@ DEFAULT_PROFILE: dict = {
         "boss_seconds": 30.0,      # BOSS 循环：每只打多久
         "boss_rounds": 1,          # BOSS 循环：打几只
         "default_action": "boss",  # 疲劳在中间区间时做哪个：boss / farm
+    },
+    "warehouse": {
+        "enabled": True,
+        "icon_pt": None,       # 仓库图标（点它打开仓库）
+        "deposit_pt": None,    # 「一键放入」按钮
+        "gap": 0.5,            # 每步之间缓冲
+        "open_wait": 1.5,      # 点完仓库图标等界面出来
+        "esc_times": 2,        # 放完按几下 ESC 回主界面（默认 2，不多不少）
+        "after": "exit",       # 什么时候放：exit=退出副本后
     },
     "exit": {
         "exit_pt": None,           # 「退出副本」按钮（第一下）[nx, ny]
@@ -1239,7 +1248,11 @@ class DungeonRunner:
         return (self._farm().get(key) or {})
 
     def boss_hp_visible(self) -> bool:
-        """BOSS 血条还在不在（在=没死）。"""
+        """BOSS 血条还在不在（在=没死）。
+
+        用「亮像素占比」判断：血条是亮的，空的血条槽/背景是暗的。
+        这样即使血条正好铺满整个框也能量准（不会像 ink_ratio 那样被边框带偏）。
+        """
         spec = self._anchor_of("boss_hp")
         roi = (spec or {}).get("roi")
         if not roi:
@@ -1248,10 +1261,14 @@ class DungeonRunner:
         if frame is None:
             return True
         try:
-            fill = ink_ratio(crop_norm(frame, roi))
+            patch = crop_norm(frame, roi).astype(np.float32)
+            bright = patch.max(axis=2)
+            ratio = float((bright > 70).mean())
         except Exception:
             return True
-        return fill > float(spec.get("min_ink", 0.02) or 0.02)
+        need = float(spec.get("min_fill",
+                              spec.get("min_ink", 0.15)) or 0.15)
+        return ratio >= need
 
     def boss_present(self) -> bool:
         """「BOSS 身形」在不在（确认真的站到 BOSS 面前了）。"""
@@ -1308,7 +1325,7 @@ class DungeonRunner:
         pickup_on_a = bool(farm.get("pickup_on_a", True))
         pickup_every = float(farm.get("pickup_every", 8.0) or 0.0)
         potion_every = float(farm.get("potion_every", 6.0) or 0.0)
-        potion_keys = [str(k) for k in (farm.get("potion_keys") or ["q", "w"]) if str(k)]
+        potion_keys = [str(k) for k in (farm.get("potion_keys") or ["q"]) if str(k)]
         hp_threshold = int(farm.get("hp_threshold", 0) or 0)
         hp_every = float(farm.get("hp_check_every", 2.0) or 2.0)
         use_skills = bool(farm.get("use_skills", True))
@@ -1432,7 +1449,7 @@ class DungeonRunner:
         pickup_key = str(farm.get("pickup_key") or self._key("pickup", "space"))
         pickup_every = float(farm.get("pickup_every", 8.0) or 0.0)
         potion_every = float(farm.get("potion_every", 6.0) or 0.0)
-        potion_keys = [str(k) for k in (farm.get("potion_keys") or ["q", "w"]) if str(k)]
+        potion_keys = [str(k) for k in (farm.get("potion_keys") or ["q"]) if str(k)]
         hp_threshold = int(farm.get("hp_threshold", 0) or 0)
         hp_every = float(farm.get("hp_check_every", 2.0) or 2.0)
         use_skills = bool(farm.get("use_skills", True))
@@ -1570,6 +1587,37 @@ class DungeonRunner:
                 self.game.sleep(0.4)
         self.gap("拾取后缓冲")
 
+    def deposit_to_warehouse(self) -> bool:
+        """一键放入仓库：点仓库图标 → 点「一键放入」→ 按 2 下 ESC 回主界面。"""
+        cfg = self.p.get("warehouse") or {}
+        if not cfg.get("enabled", True):
+            return True
+        icon = cfg.get("icon_pt")
+        deposit = cfg.get("deposit_pt")
+        if not icon or not deposit:
+            self.log("没标「仓库图标 / 一键放入」点位，跳过放仓库")
+            return True
+        gap = max(0.0, float(cfg.get("gap", 0.5) or 0.0))
+        esc_times = max(0, int(cfg.get("esc_times", 2) or 0))
+        open_wait = max(0.0, float(cfg.get("open_wait", 1.5) or 0.0))
+
+        self.log("—— 一键放入仓库 ——")
+        self.log("点「仓库图标」打开仓库")
+        if not self.game.click_norm(icon):
+            self.log("点仓库图标失败，跳过放仓库")
+            return False
+        self.game.sleep(gap + open_wait)
+        self.log("点「一键放入」")
+        if not self.game.click_norm(deposit):
+            self.log("点「一键放入」失败，跳过")
+            return False
+        self.game.sleep(gap)
+        for i in range(esc_times):
+            self.log(f"按 ESC 回主界面（{i + 1}/{esc_times}）")
+            self.game.tap("esc")
+            self.game.sleep(gap)
+        return True
+
     def exit_dungeon(self) -> bool:
         """③ 退出：点「退出副本」→ 识别独立的「退出确认弹窗」→ 点「确认」。"""
         exit_cfg = self.p.get("exit") or {}
@@ -1646,6 +1694,10 @@ class DungeonRunner:
         if not self.exit_dungeon():
             return self._failed("退出副本失败")
         self.gap("退出后缓冲")
+        wh = self.p.get("warehouse") or {}
+        if wh.get("enabled", True) and str(wh.get("after", "exit")) == "exit":
+            if not self.deposit_to_warehouse():
+                return self._failed("放入仓库失败")
         return True
 
     def _failed(self, reason: str) -> bool:

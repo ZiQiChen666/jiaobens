@@ -168,7 +168,7 @@ def build_profile(**over):
             "boss_retry": 2,
             "boss_present": {"roi": ROI_BOSS_BODY, "sig": body_sig,
                              "grid": 12, "sim": 0.88},
-            "boss_hp": {"roi": ROI_BOSS_HP, "min_ink": 0.02, "miss": 2},
+            "boss_hp": {"roi": ROI_BOSS_HP, "min_fill": 0.15, "miss": 2},
         },
         "exit": {
             "exit_pt": list(PT_EXIT),
@@ -264,7 +264,7 @@ check("每次平A都拾取", game6.pickup_count >= game6.a_count - 1,
 
 # ---- 6) 没框血条 → 按时间上限停 --------------------------------------
 p7 = build_profile()
-p7["farm"]["boss_hp"] = {"roi": None, "min_ink": 0.02, "miss": 3}
+p7["farm"]["boss_hp"] = {"roi": None, "min_fill": 0.15, "miss": 3}
 p7["loop"] = dict(p7["loop"], boss_seconds=3.0)
 game7 = FakeGame()
 logs7 = []
@@ -444,12 +444,76 @@ r_nolink.run_round()
 check("关掉联动 → 直接走 BOSS 流程",
       PT_DUNGEON in [a[1] for a in g_nolink.actions if a[0] == "click"])
 
+# ---- 7g) 自动喝药：只按 Q，血量低于阈值每 6 秒一次 ------------------
+p_pot = build_profile()
+p_pot["farm"]["potion_keys"] = ["q"]
+p_pot["farm"]["potion_every"] = 6.0
+p_pot["farm"]["hp_threshold"] = 1600
+p_pot["loop"] = dict(p_pot["loop"], boss_seconds=20.0)
+g_pot = FakeGame(hp_dead_after_a=100000)   # 让战斗持续满 20 秒
+g_pot.state["body"] = True                  # 站在 BOSS 面前（血条在）
+logs_pot = []
+r_pot = df.DungeonRunner(g_pot, p_pot, log=logs_pot.append)
+r_pot.hp_now = lambda: 900          # 一直低于阈值
+r_pot.fight_until_finish()
+taps_pot = [a[1] for a in g_pot.actions if a[0] == "tap"]
+check("血量低于阈值 → 按 Q", "q" in taps_pot, str(taps_pot[:12]))
+check("不再按 W", "w" not in taps_pot, str([t for t in taps_pot if t == "w"][:3]))
+q_times = taps_pot.count("q")
+check("20 秒内大概按了 3 次 Q（6 秒一次）", 2 <= q_times <= 4, f"Q×{q_times}")
+
+g_pot2 = FakeGame(hp_dead_after_a=100000)
+g_pot2.state["body"] = True
+r_pot2 = df.DungeonRunner(g_pot2, p_pot, log=lambda _s: None)
+r_pot2.hp_now = lambda: 9000        # 血量充足
+r_pot2.fight_until_finish()
+check("血量充足 → 不喝药",
+      "q" not in [a[1] for a in g_pot2.actions if a[0] == "tap"])
+
+# ---- 7h) 一键放入仓库：两个点位 + ESC 两次 + 0.5s 缓冲 ---------------
+p_wh = build_profile()
+p_wh["warehouse"] = {"enabled": True, "icon_pt": [0.92, 0.08],
+                     "deposit_pt": [0.60, 0.30], "gap": 0.5,
+                     "open_wait": 1.0, "esc_times": 2, "after": "exit"}
+g_wh = FakeGame(fill_time=1.0, hp_dead_after_a=5)
+logs_wh = []
+r_wh = df.DungeonRunner(g_wh, p_wh, log=logs_wh.append)
+r_wh.hp_now = lambda: 5000
+ok_wh = r_wh.run_round()
+clicks_wh = [a[1] for a in g_wh.actions if a[0] == "click"]
+taps_wh = [a[1] for a in g_wh.actions if a[0] == "tap"]
+check("一轮成功（含放仓库）", ok_wh is True)
+check("点过仓库图标", (0.92, 0.08) in clicks_wh, str(clicks_wh))
+check("点过一键放入", (0.60, 0.30) in clicks_wh, str(clicks_wh))
+check("点仓库图标在一键放入之前",
+      clicks_wh.index((0.92, 0.08)) < clicks_wh.index((0.60, 0.30)))
+check("ESC 正好按 2 下", taps_wh.count("esc") == 2, str(taps_wh.count("esc")))
+check("日志有“一键放入仓库”", any("一键放入仓库" in l for l in logs_wh),
+      str(logs_wh[-4:]))
+
+# 关掉仓库 → 不点仓库
+p_wh_off = build_profile()
+p_wh_off["warehouse"] = {"enabled": False, "icon_pt": [0.92, 0.08],
+                         "deposit_pt": [0.60, 0.30]}
+g_wh_off = FakeGame(fill_time=1.0, hp_dead_after_a=5)
+g_wh2 = g_wh_off
+r_wh2 = df.DungeonRunner(g_wh_off, p_wh_off, log=lambda _s: None)
+r_wh2.hp_now = lambda: 5000
+r_wh2.run_round()
+check("关掉仓库 → 不点仓库图标",
+      (0.92, 0.08) not in [a[1] for a in g_wh2.actions if a[0] == "click"])
+
 # ---- 8) 配置检查 ----------------------------------------------------
 check("配置里有 BOSS 身形 / BOSS 血条",
       "boss_present" in df.DEFAULT_PROFILE["farm"]
       and "boss_hp" in df.DEFAULT_PROFILE["farm"])
 check("弹窗盲点阈值在配置里",
       "blind_confirm_after" in df.DEFAULT_PROFILE["enter"])
+check("喝药默认只按 Q", df.DEFAULT_PROFILE["farm"]["potion_keys"] == ["q"])
+check("仓库配置在默认里",
+      all(k in df.DEFAULT_PROFILE["warehouse"]
+          for k in ("enabled", "icon_pt", "deposit_pt", "gap", "esc_times"))
+      and df.DEFAULT_PROFILE["warehouse"]["esc_times"] == 2)
 check("联动配置在默认里",
       df.DEFAULT_PROFILE["loop"].get("link_fatigue") is True
       and "farm_seconds" in df.DEFAULT_PROFILE["loop"])
@@ -470,4 +534,4 @@ print()
 if fails:
     print("FAIL:", fails)
     sys.exit(1)
-print("PASS: 副本引擎 v3.16（停下识别 + 10张BOSS样本 + 进度条 + 血条判死）全部通过")
+print("PASS: 副本引擎 v3.18（喝药Q/6s + 一键放入仓库 + 疲劳联动 + 停下识别）全部通过")
