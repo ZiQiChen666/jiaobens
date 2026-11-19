@@ -940,7 +940,9 @@ class DungeonTab(QWidget):
         self.multi_combos: list[QComboBox] = []
         self.multi_seconds: list[QDoubleSpinBox] = []
         self.multi_state: list[QLabel] = []
+        self.multi_names: list[QLabel] = []
         self.multi_buttons: list[QPushButton] = []
+        self._name_readers: dict[int, object] = {}
         for i in range(4):
             combo = QComboBox()
             combo.setMinimumWidth(240)
@@ -953,30 +955,95 @@ class DungeonTab(QWidget):
             btn = QPushButton("开始")
             btn.setFixedWidth(72)
             btn.clicked.connect(lambda _=False, idx=i: self._toggle_slot(idx))
+            name_lbl = QLabel("角色: --")
+            name_lbl.setObjectName("muted")
+            name_lbl.setMinimumWidth(140)
+            combo.currentIndexChanged.connect(
+                lambda _=0, idx=i: self._refresh_slot_name(idx)
+            )
             g.addWidget(QLabel(f"窗口 {i + 1}"), i, 0)
             g.addWidget(combo, i, 1)
-            g.addWidget(QLabel("挂机"), i, 2)
-            g.addWidget(spin, i, 3)
-            g.addWidget(btn, i, 4)
-            g.addWidget(state, i, 5, 1, 3)
+            g.addWidget(name_lbl, i, 2)
+            g.addWidget(QLabel("挂机"), i, 3)
+            g.addWidget(spin, i, 4)
+            g.addWidget(btn, i, 5)
+            g.addWidget(state, i, 6, 1, 2)
             self.multi_combos.append(combo)
             self.multi_seconds.append(spin)
             self.multi_state.append(state)
+            self.multi_names.append(name_lbl)
             self.multi_buttons.append(btn)
         row = QHBoxLayout()
         btn_refresh = QPushButton("刷新窗口列表")
         btn_refresh.clicked.connect(self._refresh_windows)
+        btn_names = QPushButton("读取名字")
+        btn_names.setToolTip("用主界面「框选角色名区域」那块区域 OCR 读角色名")
+        btn_names.clicked.connect(self._read_all_names)
         btn_all = QPushButton("全部开始")
         btn_all.clicked.connect(lambda: [self._toggle_slot(i) for i in range(4)
                                         if self.multi_buttons[i].text() == "开始"])
         btn_stop = QPushButton("全部停止")
         btn_stop.clicked.connect(self._stop_all)
         row.addWidget(btn_refresh)
+        row.addWidget(btn_names)
         row.addWidget(btn_all)
         row.addWidget(btn_stop)
         row.addStretch(1)
         g.addLayout(row, 4, 0, 1, 8)
         return box
+
+    def _refresh_slot_name(self, index: int) -> None:
+        """刷新某一行的角色名（用主程序的 NameReader + 角色名区域）。"""
+        if not (0 <= index < len(self.multi_names)):
+            return
+        label = self.multi_names[index]
+        hwnd = self.multi_combos[index].currentData()
+        if not hwnd:
+            label.setText("角色: --")
+            return
+        roi = getattr(self.host, "_name_roi_norm", None)
+        if not roi:
+            title = self.multi_combos[index].currentText()
+            label.setText(f"角色: {title.split(' [0x')[0][:12]}")
+            label.setToolTip("主界面还没框选「角色名区域」，先用窗口标题显示")
+            return
+        if win32gui and win32gui.IsIconic(int(hwnd)):
+            label.setText("角色: 窗口最小化")
+            return
+        old = self._name_readers.get(index)
+        if old is not None and getattr(old, "isRunning", lambda: False)():
+            try:
+                old.stop()
+            except Exception:
+                pass
+        label.setText("角色: 读取中…")
+        try:
+            reader = app.NameReader(int(hwnd), roi, parent=self)
+        except Exception as exc:
+            label.setText("角色: 读取失败")
+            self._log(f"读角色名失败：{exc}")
+            return
+        self._name_readers[index] = reader
+
+        def on_result(name: str, message: str, idx: int = index) -> None:
+            if not (0 <= idx < len(self.multi_names)):
+                return
+            text = (name or "").strip()
+            if text:
+                self.multi_names[idx].setText(f"角色: {text}")
+                self.multi_names[idx].setStyleSheet(
+                    "color: #15803d; font-weight: 600;"
+                )
+            else:
+                self.multi_names[idx].setText("角色: 识别失败")
+                self.multi_names[idx].setToolTip(str(message))
+
+        reader.result.connect(on_result)
+        reader.start()
+
+    def _read_all_names(self) -> None:
+        for i in range(len(self.multi_combos)):
+            self._refresh_slot_name(i)
 
     def _build_run(self) -> QWidget:
         box = QGroupBox("运行（单窗口）")
@@ -1258,6 +1325,8 @@ class DungeonTab(QWidget):
                 if index >= 0:
                     combo.setCurrentIndex(index)
                     break
+        for i in range(len(self.multi_combos)):
+            self._refresh_slot_name(i)
 
     # ------------------------------------------------------------------
     # 标定动作
