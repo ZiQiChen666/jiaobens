@@ -385,12 +385,75 @@ ok_still = r_still.wait_scene_still(0.4, 3.0, 0.015)
 check("画面在动时会一直等", any("画面已静止" in l for l in logs_still)
       or any("还在动" in l for l in logs_still), str(logs_still[-3:]))
 
+# ---- 7f) 挂机 ↔ 打BOSS 联动（按疲劳滞回切换）------------------------
+p_link = build_profile()
+p_link["loop"] = dict(p_link["loop"], link_fatigue=True, farm_seconds=5.0,
+                      fatigue_every=0.5, default_action="farm")
+p_link["fatigue"] = {"enabled": True, "threshold": 600,
+                     "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
+p_link["farm"]["farm_pt"] = [0.20, 0.30]
+_seq = {"values": [800, 800, -700, -700, 700, 700], "i": 0}
+
+
+def _next_fatigue():
+    vals = _seq["values"]
+    v = vals[min(_seq["i"], len(vals) - 1)]
+    _seq["i"] += 1
+    return v, 1000, ""
+
+
+game_link = FakeGame(fill_time=1.0, hp_dead_after_a=5)
+logs_link = []
+r_link = df.DungeonRunner(game_link, p_link, log=logs_link.append)
+r_link.hp_now = lambda: 5000
+r_link.fatigue_check = _next_fatigue
+
+# 第 1 轮：疲劳 800 > +600 → 应该去「打怪点」挂机
+ok_farm = r_link.run_round()
+clicks_link = [a[1] for a in game_link.actions if a[0] == "click"]
+check("疲劳 >+600 → 去打了打怪点", (0.20, 0.30) in clicks_link, str(clicks_link[:4]))
+check("打怪点挂机模式生效", r_link._mode == "farm", str(r_link._mode))
+check("挂机没去副本入口", PT_DUNGEON not in clicks_link)
+
+# 第 2 轮：疲劳 -700 < -600 → 应该切去打 BOSS
+_seq["i"] = 2
+game_link.actions.clear()
+ok_boss = r_link.run_round()
+clicks2 = [a[1] for a in game_link.actions if a[0] == "click"]
+check("疲劳 < -600 → 切去打 BOSS", r_link._mode == "boss", str(r_link._mode))
+check("切过去后真的进副本了", PT_DUNGEON in clicks2, str(clicks2[:5]))
+check("日志有“切到打BOSS”", any("切到打BOSS" in l for l in logs_link),
+      str([l for l in logs_link if "切到" in l][-2:]))
+
+# 第 3 轮：疲劳 700 > +600 → 切回挂机
+_seq["i"] = 4
+game_link.actions.clear()
+r_link.run_round()
+clicks3 = [a[1] for a in game_link.actions if a[0] == "click"]
+check("疲劳 >+600 → 切回打怪点", r_link._mode == "farm", str(r_link._mode))
+check("切回后确实去了打怪点", (0.20, 0.30) in clicks3, str(clicks3[:4]))
+
+# 关闭联动 → 永远走 BOSS
+p_nolink = build_profile()
+p_nolink["loop"] = dict(p_nolink["loop"], link_fatigue=False)
+g_nolink = FakeGame(fill_time=1.0, hp_dead_after_a=5)
+r_nolink = df.DungeonRunner(g_nolink, p_nolink, log=lambda _s: None)
+r_nolink.hp_now = lambda: 5000
+r_nolink.fatigue_check = lambda: (900, 1000, "")
+r_nolink.run_round()
+check("关掉联动 → 直接走 BOSS 流程",
+      PT_DUNGEON in [a[1] for a in g_nolink.actions if a[0] == "click"])
+
 # ---- 8) 配置检查 ----------------------------------------------------
 check("配置里有 BOSS 身形 / BOSS 血条",
       "boss_present" in df.DEFAULT_PROFILE["farm"]
       and "boss_hp" in df.DEFAULT_PROFILE["farm"])
 check("弹窗盲点阈值在配置里",
       "blind_confirm_after" in df.DEFAULT_PROFILE["enter"])
+check("联动配置在默认里",
+      df.DEFAULT_PROFILE["loop"].get("link_fatigue") is True
+      and "farm_seconds" in df.DEFAULT_PROFILE["loop"])
+check("疲劳阈值默认 600", df.DEFAULT_PROFILE["fatigue"]["threshold"] == 600)
 check("识别阈值可配（sim / sim_loose / poll）",
       all(k in df.DEFAULT_PROFILE["detect"]
           for k in ("sim", "sim_loose", "ink_min", "poll")))

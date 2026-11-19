@@ -568,6 +568,7 @@ class DungeonTab(QWidget):
         self.lbl_pt = {}
         self.btn_pt = {}
         items = [
+            ("farm_pt", "① 打怪点（地图1，挂机用）", "map"),
             ("dungeon_pt", "① 副本入口（地图1）", "map"),
             ("enter_confirm", "① 弹窗「进入游戏」按钮", "shot"),
             ("boss_pt", "② BOSS 点（地图2）", "map"),
@@ -795,6 +796,18 @@ class DungeonTab(QWidget):
         row.addStretch(1)
         g.addLayout(row, 3, 0, 1, 8)
 
+        row_link = QHBoxLayout()
+        self.chk_link = QCheckBox("打怪点挂机 ↔ 打BOSS 联动（按疲劳切换）")
+        self.chk_link.setChecked(True)
+        self.chk_link.setToolTip(
+            "勾选：先在打怪点挂机，疲劳 < -阈值 就去刷BOSS；"
+            "刷到疲劳 > +阈值 就回打怪点挂机。"
+        )
+        self.chk_link.toggled.connect(self._save_from_ui)
+        row_link.addWidget(self.chk_link)
+        row_link.addWidget(_hint("阈值在下面「③ 退出副本后」那一栏调"), 1)
+        g.addLayout(row_link, 4, 0, 1, 8)
+
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("疲劳 < -阈值 打BOSS"))
         self.spin_boss_seconds = self._dspin(5.0, 600.0, 30.0, None, 0, 0)
@@ -807,7 +820,7 @@ class DungeonTab(QWidget):
         row2.addWidget(self.spin_boss_rounds)
         row2.addWidget(QLabel("只"))
         row2.addSpacing(16)
-        row2.addWidget(QLabel("疲劳 > +阈值 打怪"))
+        row2.addWidget(QLabel("疲劳 > +阈值 打怪点挂机"))
         self.spin_trash_seconds = self._dspin(5.0, 1800.0, 60.0, None, 0, 0)
         row2.addWidget(self.spin_trash_seconds)
         row2.addWidget(QLabel("秒 ×"))
@@ -816,14 +829,14 @@ class DungeonTab(QWidget):
         self.spin_trash_rounds.setFixedWidth(60)
         self.spin_trash_rounds.valueChanged.connect(self._save_from_ui)
         row2.addWidget(self.spin_trash_rounds)
-        row2.addWidget(QLabel("轮"))
+        row2.addWidget(QLabel("秒/段"))
         row2.addSpacing(16)
         row2.addWidget(QLabel("打怪时每"))
-        self.spin_fatigue_every = self._dspin(0.0, 600.0, 60.0, None, 0, 0)
+        self.spin_fatigue_every = self._dspin(0.0, 600.0, 20.0, None, 0, 0)
         row2.addWidget(self.spin_fatigue_every)
         row2.addWidget(QLabel("秒查疲劳(0=不查)"))
         row2.addStretch(1)
-        g.addLayout(row2, 4, 0, 1, 8)
+        g.addLayout(row2, 5, 0, 1, 8)
         return box
 
     def _dspin(self, low: float, high: float, value: float,
@@ -849,7 +862,7 @@ class DungeonTab(QWidget):
         g.addWidget(QLabel("疲劳阈值"), 0, 2)
         self.spin_fatigue = QSpinBox()
         self.spin_fatigue.setRange(0, 999999)
-        self.spin_fatigue.setValue(800)
+        self.spin_fatigue.setValue(600)
         self.spin_fatigue.setFixedWidth(100)
         self.spin_fatigue.valueChanged.connect(self._save_from_ui)
         g.addWidget(self.spin_fatigue, 0, 3)
@@ -1013,7 +1026,8 @@ class DungeonTab(QWidget):
             self.spin_boss_rounds.setValue(int(loop.get("boss_rounds", 1) or 1))
             self.spin_trash_seconds.setValue(float(loop.get("trash_seconds", 60.0)))
             self.spin_trash_rounds.setValue(int(loop.get("trash_rounds", 1) or 1))
-            self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 60.0)))
+            self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 20.0)))
+            self.chk_link.setChecked(bool(loop.get("link_fatigue", True)))
             detect = p.get("detect") or {}
             self.spin_sim.setValue(float(detect.get("sim", 0.80)))
             self.spin_sim_loose.setValue(float(detect.get("sim_loose", 0.60)))
@@ -1052,6 +1066,7 @@ class DungeonTab(QWidget):
                 "exit_confirm": (exit_cfg.get("confirm_pt"), "③ 确认"),
                 "fatigue_pt": ((p.get("fatigue") or {}).get("pt"), "④ 疲劳图标"),
                 "mount_pt": ((p.get("mount") or {}).get("mount_pt"), "⑤ 骑乘按钮"),
+                "farm_pt": (farm.get("farm_pt"), "① 打怪点"),
             }
             for key, (pt, _name) in states.items():
                 lbl = self.lbl_pt[key]
@@ -1143,6 +1158,8 @@ class DungeonTab(QWidget):
             "trash_seconds": float(self.spin_trash_seconds.value()),
             "trash_rounds": int(self.spin_trash_rounds.value()),
             "fatigue_every": float(self.spin_fatigue_every.value()),
+            "link_fatigue": bool(self.chk_link.isChecked()),
+            "farm_seconds": float(self.spin_trash_seconds.value()),
             "pickup_on_a": bool(self.chk_pickup_on_a.isChecked()),
         })
         p["action_gap"] = float(self.spin_action_gap.value())
@@ -1194,6 +1211,7 @@ class DungeonTab(QWidget):
             "exit_confirm": "把确认弹窗显示出来，点「确认/确定」按钮（第二下）。",
             "fatigue_pt": "点一下游戏里那个能弹出疲劳值的图标/按钮位置。",
             "mount_pt": "按 S 打开骑乘窗口，点一下里面的「骑乘」按钮。",
+            "farm_pt": "打开地图1，点一下「打怪点」位置（疲劳不够时就在这挂机）。",
         }.get(key, "")
         if kind == "map":
             info += chr(10) + f"（点「重新截图」会先按一次开图键「{map_key}」）"
@@ -1211,6 +1229,8 @@ class DungeonTab(QWidget):
             current = (p.get("exit") or {}).get("confirm_pt")
         elif key == "fatigue_pt":
             current = (p.get("fatigue") or {}).get("pt")
+        elif key == "farm_pt":
+            current = (p.get("farm") or {}).get("farm_pt")
         elif key == "mount_pt":
             current = (p.get("mount") or {}).get("mount_pt")
 
@@ -1229,6 +1249,8 @@ class DungeonTab(QWidget):
             p.setdefault("exit", {})["confirm_pt"] = pt
         elif key == "fatigue_pt":
             p.setdefault("fatigue", {})["pt"] = pt
+        elif key == "farm_pt":
+            p.setdefault("farm", {})["farm_pt"] = pt
         elif key == "mount_pt":
             p.setdefault("mount", {})["mount_pt"] = pt
         self._save()

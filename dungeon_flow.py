@@ -119,7 +119,9 @@ DEFAULT_PROFILE: dict = {
         "pickup_every": 8.0,       # 挂机期间每隔几秒按一次拾取
     },
     "loop": {
-        "fatigue_every": 60.0,     # 打怪/打BOSS 期间每隔几秒查一次疲劳（0=不查）
+        "link_fatigue": True,      # 打怪点挂机 ↔ 打BOSS 联动（按疲劳上下限切换）
+        "farm_seconds": 60.0,      # 打怪点每次挂机多久（到点再复检疲劳）
+        "fatigue_every": 20.0,     # 打怪期间每隔几秒查一次疲劳（0=不查）
         "max_switch": 3,           # 疲劳变化导致换分支，最多切几次（防来回跳）
         "trash_seconds": 60.0,     # 打怪循环：打多久
         "trash_rounds": 1,         # 打怪循环：打几轮
@@ -142,7 +144,7 @@ DEFAULT_PROFILE: dict = {
         "enabled": True,           # 每轮退出副本后检测一次疲劳
         "pt": None,                # 疲劳图标点位 [nx, ny]（点一下弹提示）
         "roi": None,               # 疲劳提示文字区域；空则用主界面已框的
-        "threshold": 800,          # 当前疲劳 < 这个值就算「疲劳不足」
+        "threshold": 600,          # 疲劳下限/上限：< -阈值 去打BOSS，> +阈值 回打怪点
         "farm_seconds": 300.0,     # 疲劳不足时普通挂机打怪多久
     },
     "detect": {
@@ -586,6 +588,7 @@ class DungeonRunner:
         self.stopped = False
         self._last_frame = None
         self._switch_to: Optional[str] = None
+        self._mode: Optional[str] = None   # 联动模式：farm / boss
 
     # -- 日志 / 工具 --
     def log(self, text: str) -> None:
@@ -1176,6 +1179,46 @@ class DungeonRunner:
             return "farm"
         return default
 
+    def fatigue_value(self):
+        """读一次疲劳值，返回当前值（读不到返回 None）。"""
+        cfg = self.p.get("fatigue") or {}
+        if not cfg.get("enabled", True):
+            return None
+        current, maximum, msg = self.fatigue_check()
+        if current is None:
+            self.log(f"疲劳读不到（{msg}）")
+            return None
+        self.log(f"当前疲劳 {current}/{maximum}")
+        return current
+
+    def resolve_mode(self) -> str:
+        """联动：现在的模式该是「farm」还是「boss」。
+
+        滞回切换（不会来回跳）：
+          · 挂机中：疲劳 < -阈值  → 去打 BOSS
+          · 打BOSS中：疲劳 > +阈值 → 回打怪点挂机
+        """
+        loop = self.p.get("loop") or {}
+        cfg = self.p.get("fatigue") or {}
+        default = str(loop.get("default_action") or "farm")
+        threshold = abs(int(cfg.get("threshold", 600) or 0))
+        if self._mode is None:
+            self._mode = default
+        current = self.fatigue_value()
+        if current is None or not threshold:
+            self.log(f"按当前模式继续：{self._mode}")
+            return self._mode
+        if self._mode == "farm" and current < -threshold:
+            self._mode = "boss"
+            self.log(f"疲劳 {current} < -{threshold} → 切到打BOSS")
+            return "boss"
+        if self._mode == "boss" and current > threshold:
+            self._mode = "farm"
+            self.log(f"疲劳 {current} > +{threshold} → 切回打怪点挂机")
+            return "farm"
+        self.log(f"疲劳 {current}（±{threshold}）→ 继续 {self._mode}")
+        return self._mode
+
     def decide_action(self) -> str:
         """在打怪点读疲劳：< -阈值 打BOSS；> +阈值 打怪；中间用默认。"""
         cfg = self.p.get("fatigue") or {}
@@ -1342,6 +1385,22 @@ class DungeonRunner:
         if not self.goto_boss_point():
             return False
         return self.fight_until_finish()
+
+    def farm_round(self) -> bool:
+        """挂机：去「打怪点」打一段（默认 60s），期间查疲劳，够低就切去打BOSS。"""
+        farm = self._farm()
+        loop = self.p.get("loop") or {}
+        seconds = float(loop.get("farm_seconds", 60.0) or 60.0)
+        if not farm.get("farm_pt"):
+            self.log("没标「打怪点」，没法挂机（请到「副本流程」页标一下）")
+            return False
+        self.log(f"—— 打怪点挂机 {seconds:.0f}s（疲劳够了去打BOSS）——")
+        if not self._goto(farm.get("farm_pt"),
+                          float(farm.get("travel_wait", 30.0)), "打怪点"):
+            return False
+        self.gap("到打怪点后缓冲")
+        self.combat(seconds, desc="打怪点挂机", action="farm")
+        return True
 
     # -- 兼容旧接口：固定时长打 BOSS 点 --
     def farm_at_boss(self, seconds: Optional[float] = None) -> bool:
@@ -1556,7 +1615,7 @@ class DungeonRunner:
 
     # -- 一轮 --
     def run_round(self, seconds: Optional[float] = None) -> bool:
-        """一轮：打怪点 → 副本入口 → 弹窗进本 → 进度条 → BOSS 点 → 打怪完成 → 退出。"""
+        """一轮：按疲劳决定【打怪点挂机】还是【打BOSS副本】。"""
         self.log("=== 开始一轮 ===")
         if getattr(self.game, "foreground_mode", None) and self.game.foreground_mode():
             self.log("切到游戏窗口（前台模式：会用真实鼠标键盘）")
@@ -1564,6 +1623,21 @@ class DungeonRunner:
                 self.game.activate()
             except Exception:
                 pass
+        loop = self.p.get("loop") or {}
+        if bool(loop.get("link_fatigue", True)):
+            mode = self.resolve_mode()
+        else:
+            mode = "boss"
+        if mode == "farm":
+            self._mode = "farm"
+            if not self.farm_round():
+                return self._failed("打怪点挂机失败")
+            return True
+        self._mode = "boss"
+        return self.boss_round(seconds)
+
+    def boss_round(self, seconds: Optional[float] = None) -> bool:
+        """一次 BOSS 副本：进本 → BOSS 点 → 打怪 → 拾取 → 退出。"""
         if not self.enter_dungeon():
             return self._failed("进副本失败")
         if not self.run_loops():
