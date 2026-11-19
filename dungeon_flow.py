@@ -684,6 +684,9 @@ class WinGame:
         # VK_PROCESSKEY(229)，游戏就收不到 A / M 了；点击才需要真实鼠标。
         self.prime_background_input()
         target = self.message_target()
+        if target != self.hwnd and not getattr(self, "_logged_target", False):
+            self._logged_target = True
+            self.log(f"按键投递到焦点子窗口 0x{target:X}（Unity 常见）")
         down_lp = 1 | (scan << 16)
         up_lp = down_lp | 0xC0000000
         ok = self._post_aux(target, win32con.WM_KEYDOWN, vk, down_lp)

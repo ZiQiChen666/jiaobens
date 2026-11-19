@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import threading
 from typing import Optional
@@ -714,8 +715,8 @@ class DungeonTab(QWidget):
         pair(2, 2, "每轮间隔", "spin_gap", 0.0, 3600.0, 8.0)
         pair(3, 0, "喝药间隔", "spin_potion", 1.0, 60.0, 6.0)
         pair(3, 2, "拾取间隔", "spin_pickup", 0.0, 120.0, 8.0)
-        pair(4, 0, "打怪上限", "spin_seconds", 5.0, 3600.0, 60.0)
-        pair(4, 2, "挂机查疲劳", "spin_trash_seconds", 10.0, 600.0, 60.0)
+        pair(4, 0, "打BOSS上限", "spin_seconds", 5.0, 1000.0, 120.0)
+        pair(4, 2, "查疲劳间隔", "spin_trash_seconds", 10.0, 600.0, 60.0)
 
         g.addWidget(QLabel("没弹窗重试"), 5, 0)
         self.spin_retry = QSpinBox()
@@ -753,25 +754,6 @@ class DungeonTab(QWidget):
         g.addWidget(self.lbl_hp, 7, 1, 1, 3)
 
         # ---------- BOSS / 打怪 循环 ----------
-        g.addWidget(QLabel("疲劳 < -阈值 打BOSS"), 8, 0)
-        self.spin_boss_seconds = self._dspin(5.0, 600.0, 30.0, None, 0, 0)
-        g.addWidget(self.spin_boss_seconds, 8, 1)
-        self.spin_boss_rounds = QSpinBox()
-        self.spin_boss_rounds.setRange(1, 99)
-        self.spin_boss_rounds.setSuffix(" 只")
-        self.spin_boss_rounds.setMinimumWidth(80)
-        self.spin_boss_rounds.valueChanged.connect(self._save_from_ui)
-        g.addWidget(self.spin_boss_rounds, 8, 2)
-        g.addWidget(QLabel("疲劳 > +阈值 打怪点"), 8, 3)
-
-        self.spin_trash_rounds = QSpinBox()
-        self.spin_trash_rounds.setRange(1, 99)
-        self.spin_trash_rounds.setSuffix(" 轮")
-        self.spin_trash_rounds.setMinimumWidth(80)
-        self.spin_trash_rounds.valueChanged.connect(self._save_from_ui)
-        g.addWidget(self.spin_trash_rounds, 9, 1)
-
-        # ---------- 开关行 ----------
         self.chk_link = QCheckBox("打怪点挂机 ↔ 打BOSS 联动（按疲劳切换）")
         self.chk_link.setChecked(True)
         self.chk_link.setToolTip(
@@ -938,7 +920,7 @@ class DungeonTab(QWidget):
         box = QGroupBox("多开（每个窗口可设不同挂机时长）")
         g = QGridLayout(box)
         self.multi_combos: list[QComboBox] = []
-        self.multi_seconds: list[QDoubleSpinBox] = []
+        self.multi_seconds: list[QDoubleSpinBox] = []   # 已废弃：挂机不再设时长
         self.multi_state: list[QLabel] = []
         self.multi_names: list[QLabel] = []
         self.multi_buttons: list[QPushButton] = []
@@ -946,10 +928,6 @@ class DungeonTab(QWidget):
         for i in range(4):
             combo = QComboBox()
             combo.setMinimumWidth(240)
-            spin = QDoubleSpinBox()
-            spin.setRange(5.0, 3600.0)
-            spin.setSuffix(" 秒")
-            spin.setFixedWidth(100)
             state = QLabel("未运行")
             state.setObjectName("muted")
             btn = QPushButton("开始")
@@ -964,12 +942,9 @@ class DungeonTab(QWidget):
             g.addWidget(QLabel(f"窗口 {i + 1}"), i, 0)
             g.addWidget(combo, i, 1)
             g.addWidget(name_lbl, i, 2)
-            g.addWidget(QLabel("挂机"), i, 3)
-            g.addWidget(spin, i, 4)
-            g.addWidget(btn, i, 5)
-            g.addWidget(state, i, 6, 1, 2)
+            g.addWidget(btn, i, 3)
+            g.addWidget(state, i, 4, 1, 4)
             self.multi_combos.append(combo)
-            self.multi_seconds.append(spin)
             self.multi_state.append(state)
             self.multi_names.append(name_lbl)
             self.multi_buttons.append(btn)
@@ -1118,13 +1093,16 @@ class DungeonTab(QWidget):
             farm = p.get("farm") or {}
             exit_cfg = p.get("exit") or {}
             keys = p.get("keys") or {}
+            loop = p.get("loop") or {}
 
             self.spin_entry_wait.setValue(float(enter.get("travel_wait", 40.0)))
             self.spin_dialog_timeout.setValue(float(enter.get("dialog_timeout", 20.0)))
             self.spin_retry.setValue(int(enter.get("retry", 3) or 3))
             self.spin_load_wait.setValue(float(enter.get("load_wait", 10.0)))
             self.spin_boss_wait.setValue(float(farm.get("travel_wait", 30.0)))
-            self.spin_seconds.setValue(float(farm.get("seconds", 30.0)))
+            self.spin_seconds.setValue(
+                float(loop.get("boss_seconds", farm.get("seconds", 120.0)) or 120.0)
+            )
             self.spin_hp.setValue(int(farm.get("hp_threshold", 0) or 0))
             self.spin_potion.setValue(float(farm.get("potion_every", 6.0)))
             self.spin_pickup.setValue(float(farm.get("pickup_every", 8.0)))
@@ -1133,12 +1111,10 @@ class DungeonTab(QWidget):
             loop = p.get("loop") or {}
             self.chk_mount.setChecked(bool(mount.get("enabled", True)))
             self.edit_mount_key.setText(str(mount.get("key", "s")))
-            self.spin_boss_seconds.setValue(float(loop.get("boss_seconds", 30.0)))
-            self.spin_boss_rounds.setValue(int(loop.get("boss_rounds", 1) or 1))
+
             self.spin_trash_seconds.setValue(
                 float(loop.get("fatigue_every", 60.0))
             )
-            self.spin_trash_rounds.setValue(int(loop.get("trash_rounds", 1) or 1))
             self.spin_fatigue_every.setValue(float(loop.get("fatigue_every", 60.0)))
             self.chk_link.setChecked(bool(loop.get("link_fatigue", True)))
             detect = p.get("detect") or {}
@@ -1285,10 +1261,10 @@ class DungeonTab(QWidget):
             "rest_text": self.edit_rest_text.text().strip() or "休息",
         })
         p.setdefault("loop", {}).update({
-            "boss_seconds": float(self.spin_boss_seconds.value()),
-            "boss_rounds": int(self.spin_boss_rounds.value()),
+            "boss_seconds": float(self.spin_seconds.value()),
+            "boss_rounds": 1,
             "trash_seconds": float(self.spin_trash_seconds.value()),
-            "trash_rounds": int(self.spin_trash_rounds.value()),
+            "trash_rounds": 1,
             "fatigue_every": float(self.spin_trash_seconds.value()),
             "link_fatigue": bool(self.chk_link.isChecked()),
             "farm_seconds": 0.0,
@@ -1635,16 +1611,16 @@ class DungeonTab(QWidget):
         self._log(f"① 按「{self.edit_map_key.text().strip() or 'm'}」开地图1 → 点副本入口 "
                   f"→ 等 {self.spin_entry_wait.value():.0f}s → 等进本弹窗"
                   f"（识别到才点「进入游戏」）→ 等加载 {self.spin_load_wait.value():.0f}s")
-        self._log(f"② 开地图2 → 点 BOSS 点 → 等 {self.spin_boss_wait.value():.0f}s "
-                  f"→ 挂机 {self.spin_seconds.value():.0f}s（喝药 {self.spin_potion.value():.0f}s / "
-                  f"拾取 {self.spin_pickup.value():.0f}s）")
+        self._log(
+            f"② 疲劳 < -阈值 → 打BOSS（上限 {self.spin_seconds.value():.0f}s，血条没了就结束）；"
+            f"疲劳 > +阈值 → 回打怪点挂机；每 {self.spin_trash_seconds.value():.0f}s 查一次疲劳"
+        )
         self._log(f"③ 点「退出副本」→ 识别退出确认弹窗 → 点「确认」→ 等 {self.spin_exit_settle.value():.0f}s")
-        self._launch(0, hwnd, rounds if not dry else 1, dry=dry,
-                     seconds=float(self.spin_seconds.value()))
+        self._launch(0, hwnd, rounds if not dry else 1, dry=dry)
 
     def _launch(self, slot: int, hwnd: int, rounds: Optional[int],
-                dry: bool, seconds: float) -> None:
-        profile = df.copy_profile_for_slot(self.profile, seconds)
+                dry: bool = False) -> None:
+        profile = json.loads(json.dumps(self.profile))
         thread = DungeonThread(
             hwnd, profile, rounds, dry=dry,
             prefix=f"[窗口{slot + 1}] ", parent=self,
@@ -1657,7 +1633,7 @@ class DungeonTab(QWidget):
         self.threads[slot] = thread
         self.multi_buttons[slot].setText("停止")
         self.multi_state[slot].setText("运行中…")
-        self._log(f"窗口{slot + 1} 开始（挂机 {seconds:.0f}s）"
+        self._log(f"窗口{slot + 1} 开始（按疲劳自动挂机/打BOSS）"
                   + ("（试跑，不发按键）" if dry else ""))
         thread.start()
 
@@ -1676,10 +1652,9 @@ class DungeonTab(QWidget):
         if not hwnd:
             QMessageBox.warning(self, "没有窗口", "这一行还没选游戏窗口。")
             return
-        seconds = float(self.multi_seconds[slot].value())
         self._save_from_ui()
         self._launch(slot, int(hwnd), int(self.spin_rounds.value()) or None,
-                     dry=False, seconds=seconds)
+                     dry=False)
 
     def _stop_all(self) -> None:
         for slot, thread in list(self.threads.items()):
