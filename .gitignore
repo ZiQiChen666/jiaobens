@@ -14,3 +14,6 @@ last_probe_session.txt
 *.tmp
 loopback_target_events.jsonl
 raw_only_target.json
+
+# 备用打包目录（主程序运行时无法覆盖 dist）
+dist_v*/

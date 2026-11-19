@@ -674,6 +674,17 @@ class DungeonTab(QWidget):
         g.addWidget(self.lbl_finish, row0 + 7, 1)
         g.addWidget(btn_bosshp, row0 + 7, 2)
 
+        self.chk_death_body = QCheckBox(
+            "血条打死了也不消失时：BOSS 身形连续 3 次不见也算打完"
+        )
+        self.chk_death_body.setToolTip(
+            "有些 BOSS 死了血条还挂着（或变成灰色/空条）。\n"
+            "勾上后会再用「BOSS 身形」判断：连续几次认不到 BOSS 就判定打完。\n"
+            "没框 BOSS 血条时，这个会自动启用。"
+        )
+        self.chk_death_body.toggled.connect(self._save_from_ui)
+        g.addWidget(self.chk_death_body, row0 + 8, 0, 1, 4)
+
         row = QHBoxLayout()
         row.addWidget(QLabel("未骑乘文字"))
         self.edit_mount_text = QLineEdit("骑乘")
@@ -686,7 +697,7 @@ class DungeonTab(QWidget):
         self.edit_rest_text.editingFinished.connect(self._save_from_ui)
         row.addWidget(self.edit_rest_text)
         row.addWidget(_hint("读到「未骑乘文字」才点「骑乘」；读到「已骑乘文字」就不点"), 1)
-        g.addLayout(row, row0 + 8, 0, 1, 3)
+        g.addLayout(row, row0 + 9, 0, 1, 3)
         return box
 
     def _build_farm(self) -> QWidget:
@@ -1300,6 +1311,7 @@ class DungeonTab(QWidget):
                 float(loop.get("fatigue_every", 60.0))
             )
             self.chk_link.setChecked(bool(loop.get("link_fatigue", True)))
+            self.chk_death_body.setChecked(bool(farm.get("death_by_body", False)))
             detect = p.get("detect") or {}
             self.spin_sim.setValue(float(detect.get("sim", 0.80)))
             self.spin_sim_loose.setValue(float(detect.get("sim_loose", 0.60)))
@@ -1449,6 +1461,9 @@ class DungeonTab(QWidget):
             "mount_text": self.edit_mount_text.text().strip() or "骑乘",
             "rest_text": self.edit_rest_text.text().strip() or "休息",
         })
+        p.setdefault("farm", {})["death_by_body"] = bool(
+            self.chk_death_body.isChecked()
+        )
         p.setdefault("loop", {}).update({
             "boss_seconds": float(self.spin_seconds.value()),
             "fatigue_every": float(self.spin_trash_seconds.value()),
@@ -1756,6 +1771,10 @@ class DungeonTab(QWidget):
             missing.append("③「退出副本」按钮")
         if not exit_cfg.get("confirm_pt"):
             missing.append("③「确认」按钮")
+        if not (farm.get("boss_hp") or {}).get("roi") and not (
+            farm.get("boss_present") or {}
+        ).get("roi"):
+            missing.append("② BOSS 身形 或 ③ BOSS 血条（至少框一个，否则识别不了死亡）")
         return missing
 
     def _start_single(self, dry: bool) -> None:
