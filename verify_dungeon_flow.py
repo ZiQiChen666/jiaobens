@@ -922,6 +922,64 @@ check("真实点击前后有屏蔽/恢复输入",
       "block_user_input(True)" in _grab_src
       and "block_user_input(False)" in _grab_src)
 
+# ---- 多开不互相卡节奏：OCR 抢不到锁就跳过，不挡攻击 ----
+check("能识别「多开的兄弟窗口」标题",
+      df.is_game_title("CreatureCurios - 冰牙鲨鱼") is True
+      and df.is_game_title("Chrome") is False
+      and df.is_game_title("CreatureCurios 后台按键器") is True)
+
+p_mo = build_profile()
+p_mo["farm"]["boss_hp"] = {"roi": ROI_BOSS_HP, "mode": "ocr", "kill_hp": 0,
+                           "miss": 2, "ocr_every": 0.0, "grace": 0.0}
+g_mo = FakeGame()
+g_mo.state["body"] = True
+r_mo = df.DungeonRunner(g_mo, p_mo, log=lambda _s: None)
+_calls = {"n": 0}
+_real_ocr2 = df.app.ocr_text_from_bgra
+
+
+def _counting_ocr(data, w, h, rect):
+    _calls["n"] += 1
+    return "冰牙鲨 18000/18000"
+
+
+df.app.ocr_text_from_bgra = _counting_ocr
+try:
+    # 先正常读一次
+    r_mo._hp_ocr_at = -1.0
+    check("OCR 正常时能读到血量", r_mo.boss_hp_visible() is True)
+    _before = _calls["n"]
+    # 另一个窗口（另一个线程）占着 OCR 锁
+    _held = threading.Event()
+    _free = threading.Event()
+
+    def _holder():
+        df._OCR_LOCK.acquire()
+        _held.set()
+        _free.wait(3.0)
+        df._OCR_LOCK.release()
+
+    _ht = threading.Thread(target=_holder, daemon=True)
+    _ht.start()
+    _held.wait(2.0)
+    try:
+        r_mo._hp_ocr_at = -1.0
+        _t0 = g_mo.t
+        got = r_mo.boss_hp_visible()
+        _dt = g_mo.t - _t0
+    finally:
+        _free.set()
+        _ht.join(2.0)
+    check("别的窗口在 OCR 时：立刻返回、不调用 OCR",
+          got is True and _calls["n"] == _before, f"calls={_calls['n']}")
+    check("跳过时不会卡住（耗时≈0）", _dt < 0.2, f"{_dt:.2f}s")
+    check("跳过时打了标记（外层据此不记漏读）", r_mo._hp_skipped is True)
+    r_mo._hp_ocr_at = -1.0
+    r_mo.boss_hp_visible()
+    check("正常读到后跳过标记清掉", r_mo._hp_skipped is False)
+finally:
+    df.app.ocr_text_from_bgra = _real_ocr2
+
 # ---- 打怪期间完全不碰鼠标（只发后台按键）----
 class _InputSpy(FakeGame):
     def __init__(self):

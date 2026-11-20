@@ -400,6 +400,7 @@ class DungeonTab(QWidget):
         self.threads: dict[int, DungeonThread] = {}
         self._nav_recorder = None
         self._nav_pending = False
+        self._multi_warned = False
         self._loading = True
         self.setStyleSheet(LIGHT_QSS)
 
@@ -1894,6 +1895,13 @@ class DungeonTab(QWidget):
         self.multi_state[slot].setText("运行中…")
         self._log(f"窗口{slot + 1} 开始（按疲劳自动挂机/打BOSS）"
                   + ("（试跑，不发按键）" if dry else ""))
+        if (not self._multi_warned and len(self.threads) >= 2
+                and self.chk_allow_grab.isChecked()
+                and (self.combo_input_mode.currentData() or "hybrid") != "background"):
+            self._multi_warned = True
+            self._log("多开提示：现在是「借真实鼠标点击」模式，几个窗口会互相抢前台，"
+                      "打怪节奏容易被打断。多开建议把「输入模式」改成『纯后台』"
+                      "（或者至少勾着「点击时短暂屏蔽外部鼠标键盘」）")
         thread.start()
 
     def _toggle_slot(self, slot: int) -> None:

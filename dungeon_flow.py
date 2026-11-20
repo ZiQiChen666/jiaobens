@@ -67,6 +67,13 @@ _INPUT_LOCK = threading.RLock()
 _OCR_LOCK = threading.RLock()
 
 
+def is_game_title(title: str, keyword: str = "CreatureCurios") -> bool:
+    """标题里有没有游戏关键字（用来识别「多开的兄弟窗口」）。"""
+    t = str(title or "").lower()
+    k = str(keyword or "CreatureCurios").lower()
+    return bool(k) and k in t
+
+
 def block_user_input(block: bool) -> bool:
     """短暂屏蔽真实鼠标/键盘（需要管理员权限；失败返回 False）。
 
@@ -752,12 +759,28 @@ class WinGame:
                 pass
 
     def pin_user_foreground(self) -> None:
-        """记下「你正在用的窗口」，挂机时用它把前台还给你。"""
+        """记下「你正在用的窗口」，挂机时用它把前台还给你。
+
+        多开时前台很可能是**另一个游戏窗口**——那个不能记，否则一会儿
+        就把兄弟窗口抢到前台，打断它的打怪节奏。
+        """
         try:
             fg = int(win32gui.GetForegroundWindow() or 0)
         except Exception:
             fg = 0
-        self._user_fg = fg if fg and fg != self.hwnd else 0
+        if not fg or fg == self.hwnd:
+            fg = 0
+        elif self._is_sibling_window(fg):
+            fg = 0
+        self._user_fg = fg
+
+    def _is_sibling_window(self, hwnd: int) -> bool:
+        """这个窗口是不是同一个游戏（多开的兄弟窗口）。"""
+        try:
+            title = win32gui.GetWindowText(hwnd) or ""
+        except Exception:
+            return False
+        return is_game_title(title, (self.profile or {}).get("window_title"))
 
     def restore_user_foreground(self, quiet: bool = False) -> None:
         """把前台还给你（前台/混合模式都生效）；按键本身一直是后台发送的。"""
@@ -960,6 +983,8 @@ class DungeonRunner:
         self._hp_seen = False
         self._hp_ocr_at = -1.0
         self._hp_ocr_visible = True
+        self._hp_ocr_skips = 0
+        self._hp_skipped = False
         self._last_hp_detail = ""
         self._icon_checks = 0
         self._icon_miss_shot = False
@@ -1963,8 +1988,7 @@ class DungeonRunner:
         w, h, data = frame
         try:
             rect = app.roi_from_norm(tuple(float(v) for v in roi), w, h)
-            with _OCR_LOCK:
-                return app.ocr_text_from_bgra(data, w, h, rect)
+            return app.ocr_text_from_bgra(data, w, h, rect)
         except Exception as exc:
             self.log(f"血量 OCR 失败：{type(exc).__name__}: {exc}")
             return ""
@@ -1980,8 +2004,20 @@ class DungeonRunner:
         now = self.game.now()
         if now < self._hp_ocr_at:
             return self._hp_ocr_visible
-        self._hp_ocr_at = now + every
-        text = self.boss_hp_ocr_text()
+        # 多开时 OCR 引擎是共用的：拿不到锁就跳过这一轮，绝不让别的窗口
+        # 把本窗口的攻击节奏卡住（跳过不算漏读，不会误判死亡）。
+        if not _OCR_LOCK.acquire(blocking=False):
+            self._hp_ocr_skips += 1
+            self._hp_skipped = True
+            if self._hp_ocr_skips == 1:
+                self.log("另一个窗口正在 OCR 血量 → 本轮跳过（不挡攻击节奏）")
+            return self._hp_ocr_visible
+        self._hp_skipped = False
+        try:
+            self._hp_ocr_at = now + every
+            text = self.boss_hp_ocr_text()
+        finally:
+            _OCR_LOCK.release()
         current, maximum = app.parse_hp_text(text)
         if maximum is not None and (current is None
                                     or maximum < current
@@ -2015,6 +2051,8 @@ class DungeonRunner:
         if not (spec or {}).get("roi"):
             return True  # 没框血条 → 用时间上限
         mode = str(spec.get("mode", "ocr") or "ocr").lower()
+        if mode != "ocr":
+            self._hp_skipped = False
         if mode == "ocr":
             return self.boss_hp_ocr_visible()
         if mode == "icon":
@@ -2129,6 +2167,7 @@ class DungeonRunner:
         self._hp_seen = False
         self._hp_ocr_at = -1.0
         self._hp_ocr_visible = True
+        self._hp_ocr_skips = 0
         hp_mode = str((hp_spec or {}).get("mode", "ocr") or "ocr").lower()
         self._hp_mode = hp_mode
         self.restore_user_foreground()
@@ -2210,6 +2249,9 @@ class DungeonRunner:
                              f"{getattr(self, '_last_hp_detail', '')}{pres}")
                 if visible:
                     misses = 0
+                elif getattr(self, "_hp_skipped", False):
+                    # 本轮是"别的窗口在 OCR"跳过的，既不算漏读也不清零
+                    pass
                 else:
                     misses += 1
                     ratio = getattr(self, "_last_hp_ratio", None)
