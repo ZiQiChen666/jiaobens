@@ -66,6 +66,18 @@ _INPUT_LOCK = threading.RLock()
 # 多开时几个窗口会同时想 OCR；RapidOCR 那个引擎不是多线程安全的，串起来。
 _OCR_LOCK = threading.RLock()
 
+
+def block_user_input(block: bool) -> bool:
+    """短暂屏蔽真实鼠标/键盘（需要管理员权限；失败返回 False）。
+
+    只在「用真实鼠标点一下」的那一小段时间里用：
+    防止你正好动鼠标/点键盘，把这一下点到别的窗口上去。
+    """
+    try:
+        return bool(app._USER32.BlockInput(bool(block)))
+    except Exception:
+        return False
+
 DEFAULT_PROFILE: dict = {
     "name": "默认副本",
     "window_title": "CreatureCurios",
@@ -74,6 +86,7 @@ DEFAULT_PROFILE: dict = {
         "pickup": "space",   # 拾取键
     },
     "allow_grab": False,      # 是否允许抢占鼠标键盘（False=纯后台，不动光标不切前台）
+    "block_input": True,      # 真实点击那一瞬间短暂屏蔽外部鼠标键盘（需管理员）
     "input_mode": "hybrid",   # hybrid=只在点击时借鼠标（键盘走后台）；foreground=全程占用；background=纯后台
     "prime_activate": True,   # 后台模式下补发 WM_ACTIVATE/焦点消息
     "action_gap": 1.0,        # 动作之间的缓冲（秒）
@@ -586,6 +599,7 @@ class WinGame:
         self._focus_saved = 0
         self._user_fg = 0
         self._logged_target = False
+        self._block_input_ok: Optional[bool] = None   # None=还没试过
 
     # -- 基础 --
     def now(self) -> float:
@@ -839,6 +853,17 @@ class WinGame:
         hybrid = self.hybrid_mode()
         with _INPUT_LOCK:
             saved_cursor = None
+            blocked = False
+            if self.profile.get("block_input", True) and self._block_input_ok is not False:
+                blocked = block_user_input(True)
+                if self._block_input_ok is None:
+                    self._block_input_ok = blocked
+                    if blocked:
+                        self.log("点击时已临时屏蔽外部鼠标键盘"
+                                 "（点完立刻恢复；若点击失效请取消勾选）")
+                    else:
+                        self.log("点击时屏蔽外部鼠标键盘失败（需要以管理员运行）"
+                                 "→ 不屏蔽，继续点击")
             if hybrid:
                 try:
                     saved_cursor = win32api.GetCursorPos()
@@ -875,6 +900,8 @@ class WinGame:
                 # 用户要求：抢完鼠标键盘要回到原来的界面。
                 if hybrid:
                     self.release_focus(quiet=True)
+                if blocked:
+                    block_user_input(False)
 
     def tap(self, name: str, hold: float = 0.05) -> bool:
         """后台投递按键（前台模式下也用投递，避免输入法把按键吃掉）。"""
@@ -1658,6 +1685,23 @@ class DungeonRunner:
         except (TypeError, ValueError):
             return -600, 600
 
+    def next_action_for(self, current, action: Optional[str]) -> Optional[str]:
+        """疲劳 → 该不该换分支（滞回，不来回跳）。
+
+        · 正在打小怪：只有 疲劳 < 下限 才换去「打BOSS」，中间区间一直打怪；
+        · 正在打BOSS：只有 疲劳 > 上限 才换回「打怪」，中间区间一直打BOSS；
+        · 还没定分支（action 为空）：按 action_for_fatigue 选初始分支。
+        返回 None = 保持当前分支。
+        """
+        if current is None:
+            return None
+        low, high = self.fatigue_limits()
+        if action == "farm":
+            return "boss" if current < low else None
+        if action == "boss":
+            return "farm" if current > high else None
+        return self.action_for_fatigue(current)
+
     def action_for_fatigue(self, current) -> str:
         """疲劳值 → 该做哪个：< 下限 去打BOSS；> 上限 去打怪；其余用默认。"""
         loop = self.p.get("loop") or {}
@@ -2290,13 +2334,14 @@ class DungeonRunner:
                 if current is None:
                     self.log(f"疲劳读不到（{msg}），继续{desc}")
                 else:
-                    want = self.action_for_fatigue(current)
                     low, high = self.fatigue_limits()
+                    want = self.next_action_for(current, action)
                     self.log(f"{desc}中查疲劳 {current}/{maximum}"
                              f"（下限 {low} / 上限 {high}）"
-                             + ("" if want == action else
-                                " → 该换分支了：" + ("打BOSS" if want == "boss" else "打怪")))
-                    if want != action:
+                             + (" → 该换分支了："
+                                + ("打BOSS" if want == "boss" else "打怪")
+                                if want else " → 继续" + desc))
+                    if want:
                         self._switch_to = want
                         break
             if elapsed >= seconds:

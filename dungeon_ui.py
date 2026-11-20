@@ -816,6 +816,15 @@ class DungeonTab(QWidget):
         )
         self.combo_input_mode.currentIndexChanged.connect(self._save_from_ui)
         row_mode.addWidget(self.combo_input_mode)
+        self.chk_block_input = QCheckBox("点击时短暂屏蔽外部鼠标键盘")
+        self.chk_block_input.setChecked(True)
+        self.chk_block_input.setToolTip(
+            "用真实鼠标点那一下（不到 0.5 秒）临时屏蔽你的鼠标/键盘，"
+            "防止你正好动鼠标把这一下点到别的窗口。"
+            "需要本程序以管理员运行；如果勾了之后点击失效，就取消勾选。"
+        )
+        self.chk_block_input.toggled.connect(self._save_from_ui)
+        row_mode.addWidget(self.chk_block_input)
         row_mode.addStretch(1)
         g.addLayout(row_mode, 13, 0, 1, 4)
 
@@ -1344,6 +1353,7 @@ class DungeonTab(QWidget):
                     label.setText("未设置")
                     label.setStyleSheet("color: #444444;")
             self.chk_allow_grab.setChecked(bool(p.get("allow_grab", False)))
+            self.chk_block_input.setChecked(bool(p.get("block_input", True)))
             nav = p.get("nav_macro") or {}
             self.chk_nav_macro.setChecked(bool(nav.get("enabled", False)))
             self.chk_nav_fallback.setChecked(bool(nav.get("fallback", False)))
@@ -1496,6 +1506,7 @@ class DungeonTab(QWidget):
         })
         p.setdefault("retry", {})["rounds"] = int(self.spin_rounds.value())
         p["allow_grab"] = bool(self.chk_allow_grab.isChecked())
+        p["block_input"] = bool(self.chk_block_input.isChecked())
         p["input_mode"] = self.combo_input_mode.currentData() or "hybrid"
         nav = p.setdefault("nav_macro", {})
         nav["enabled"] = bool(self.chk_nav_macro.isChecked())

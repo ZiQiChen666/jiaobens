@@ -876,6 +876,77 @@ try:
 except OSError:
     pass
 
+# ---- 疲劳滞回：在打怪就一直打到 < 下限；在打BOSS就打到 > 上限 ----
+def _run_combat(vals, action):
+    p_h = build_profile()
+    p_h["fatigue"] = {"enabled": True, "low": -800, "high": 800,
+                      "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
+    p_h["loop"] = dict(p_h["loop"], fatigue_every=1.0)
+    g_h = FakeGame()
+    logs_h = []
+    r_h = df.DungeonRunner(g_h, p_h, log=logs_h.append)
+    seq_h = {"i": 0}
+
+    def _fc():
+        v = vals[min(seq_h["i"], len(vals) - 1)]
+        seq_h["i"] += 1
+        return v, 1000, ""
+
+    r_h.fatigue_check = _fc
+    r_h._switch_to = None
+    r_h.combat(3.0, desc="打怪点挂机", action=action)
+    return r_h, logs_h
+
+
+r_h1, _ = _run_combat([700, 700, 700], "farm")
+check("打怪中疲劳 700（没跌破下限 -800）→ 继续打怪，不切BOSS",
+      r_h1._switch_to is None, str(r_h1._switch_to))
+r_h2, _ = _run_combat([-900, -900], "farm")
+check("打怪中疲劳 -900 < 下限 -800 → 切去打BOSS",
+      r_h2._switch_to == "boss", str(r_h2._switch_to))
+r_h3, _ = _run_combat([700, 700], "boss")
+check("打BOSS中疲劳 700（没超过上限 800）→ 继续打，不收尾",
+      r_h3._switch_to is None, str(r_h3._switch_to))
+r_h4, _ = _run_combat([900, 900], "boss")
+check("打BOSS中疲劳 900 > 上限 800 → 切回打怪",
+      r_h4._switch_to == "farm", str(r_h4._switch_to))
+
+# ---- 点击时屏蔽外部鼠标键盘 ----
+import inspect as _inspect
+
+check("默认开启「点击时屏蔽输入」", df.DEFAULT_PROFILE.get("block_input") is True)
+check("block_user_input(False) 可安全调用（不会卡住输入）",
+      df.block_user_input(False) in (True, False))
+_grab_src = _inspect.getsource(df.WinGame._grab_click)
+check("真实点击前后有屏蔽/恢复输入",
+      "block_user_input(True)" in _grab_src
+      and "block_user_input(False)" in _grab_src)
+
+# ---- 打怪期间完全不碰鼠标（只发后台按键）----
+class _InputSpy(FakeGame):
+    def __init__(self):
+        super().__init__()
+        self.kinds = []
+
+    def tap(self, name):
+        self.kinds.append(("tap", name))
+        return super().tap(name)
+
+    def click_norm(self, point):
+        self.kinds.append(("click",))
+        return super().click_norm(point)
+
+
+g_spy = _InputSpy()
+r_spy = df.DungeonRunner(g_spy, build_profile(), log=lambda _s: None)
+r_spy.hp_now = lambda: 5000
+r_spy.combat(2.0, desc="打怪验证")
+check("打怪期间一次鼠标点击都没有（鼠标在哪都能打）",
+      not any(k[0] == "click" for k in g_spy.kinds), str(g_spy.kinds[:6]))
+check("打怪期间在发 A / 拾取空格",
+      ("tap", "a") in g_spy.kinds and ("tap", "space") in g_spy.kinds,
+      str(g_spy.kinds[:6]))
+
 # ---- 打怪挂机走后台（不需要窗口在前台）----
 class _FgGame(FakeGame):
     def __init__(self):
