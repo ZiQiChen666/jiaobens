@@ -93,7 +93,19 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
 
     fatigue = p.setdefault("fatigue", {})
     fatigue["enabled"] = bool(answers.get("fatigue_enabled", True))
-    fatigue["threshold"] = max(0, int(answers.get("fatigue_threshold") or 0))
+    try:
+        low = int(answers.get("fatigue_low", -600))
+    except (TypeError, ValueError):
+        low = -600
+    try:
+        high = int(answers.get("fatigue_high", 600))
+    except (TypeError, ValueError):
+        high = 600
+    if low >= high:
+        low, high = -abs(low or 600), abs(high or 600)
+    fatigue["low"] = low
+    fatigue["high"] = high
+    fatigue.pop("threshold", None)
     if answers.get("fatigue_pt"):
         fatigue["pt"] = [round(float(v), 5) for v in answers["fatigue_pt"]]
 
@@ -121,8 +133,8 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
             "没骑就点「骑乘」→ 关弹窗"
         )
     plan.append(
-        f"打怪点按疲劳分流：打小怪时疲劳 < -{fatigue['threshold']} 就去打BOSS；"
-        f"打BOSS时疲劳 > +{fatigue['threshold']} 就回打怪点打小怪；"
+        f"打怪点按疲劳分流：疲劳 < 下限 {fatigue['low']} → 去打BOSS；"
+        f"疲劳 > 上限 {fatigue['high']} → 回打怪点打小怪（后台按键，不占窗口）；"
         f"不设挂机时长，每 {loop['fatigue_every']:.0f}s 查一次疲劳"
     )
     plan.append(
@@ -206,7 +218,10 @@ class DungeonWizard(QDialog):
             "pickup_every": float(farm.get("pickup_every", 8.0)),
             "use_skills": bool(farm.get("use_skills", True)),
             "fatigue_enabled": bool(fatigue.get("enabled", True)),
-            "fatigue_threshold": int(fatigue.get("threshold", 800) or 0),
+            "fatigue_low": int(fatigue.get("low", -abs(
+                int(fatigue.get("threshold", 600) or 0)))),
+            "fatigue_high": int(fatigue.get("high", abs(
+                int(fatigue.get("threshold", 600) or 0)))),
             "fatigue_pt": fatigue.get("pt"),
             "fatigue_every": float((self.profile.get("loop") or {}).get("fatigue_every", 60.0)),
             "farm_pt": (self.profile.get("farm") or {}).get("farm_pt"),
@@ -296,7 +311,8 @@ class DungeonWizard(QDialog):
         self.answers["use_skills"] = bool(self.chk_skills.isChecked())
         self.answers["hp_threshold"] = int(self.spin_hp.value())
         self.answers["fatigue_enabled"] = bool(self.chk_fatigue.isChecked())
-        self.answers["fatigue_threshold"] = int(self.spin_fatigue.value())
+        self.answers["fatigue_low"] = int(self.spin_fatigue_low.value())
+        self.answers["fatigue_high"] = int(self.spin_fatigue_high.value())
         self.answers["fatigue_every"] = float(self.spin_fatigue_every.value())
         self.answers["pickup_on_a"] = bool(self.chk_pickup_on_a.isChecked())
         self.answers["action_gap"] = float(self.spin_action_gap.value())
@@ -352,7 +368,7 @@ class DungeonWizard(QDialog):
         ))
         lay.addWidget(_hint(
             "③ 退出：时间到 → 点「退出副本」→ 点「确认」→ 等加载 → "
-            "检测疲劳值，低于阈值就先普通挂机打怪一段时间，再进下一轮。"
+            "疲劳 < 下限 去打BOSS，> 上限 回打怪点打小怪，循环往复。"
         ))
         lay.addWidget(_hint(
             "所有时间都能改：走进副本 40s、等弹窗 20s、进本加载 10s、"
@@ -498,7 +514,7 @@ class DungeonWizard(QDialog):
         row_farm = QHBoxLayout()
         btn_farm = QPushButton("① 截图并点「打怪点」")
         btn_farm.setToolTip(
-            "地图2 上平时打小怪的位置；疲劳 < -阈值 才从这里去打 BOSS"
+            "地图2 上平时打小怪的位置；疲劳 < 下限 才从这里去打 BOSS"
         )
         btn_farm.clicked.connect(self._pick_farm_pt)
         self.lbl_farm = QLabel(self._pt_text(self.answers.get("farm_pt")))
@@ -654,13 +670,20 @@ class DungeonWizard(QDialog):
         self.chk_fatigue.setChecked(bool(self.answers["fatigue_enabled"]))
         lay.addWidget(self.chk_fatigue)
         g = QGridLayout()
-        g.addWidget(QLabel("疲劳阈值"), 0, 0)
-        self.spin_fatigue = QSpinBox()
-        self.spin_fatigue.setRange(0, 999999)
-        self.spin_fatigue.setValue(int(self.answers["fatigue_threshold"]))
-        self.spin_fatigue.setFixedWidth(110)
-        g.addWidget(self.spin_fatigue, 0, 1)
-        g.addWidget(_hint("打小怪时 < -阈值 就去打BOSS；打BOSS时 > +阈值 就回打怪点"), 0, 2, 1, 3)
+        g.addWidget(QLabel("疲劳下限"), 0, 0)
+        self.spin_fatigue_low = QSpinBox()
+        self.spin_fatigue_low.setRange(-999999, 999999)
+        self.spin_fatigue_low.setValue(int(self.answers["fatigue_low"]))
+        self.spin_fatigue_low.setFixedWidth(110)
+        g.addWidget(self.spin_fatigue_low, 0, 1)
+        g.addWidget(_hint("疲劳 < 下限 → 去打BOSS（可填负数）"), 0, 2, 1, 3)
+        g.addWidget(QLabel("疲劳上限"), 1, 0)
+        self.spin_fatigue_high = QSpinBox()
+        self.spin_fatigue_high.setRange(-999999, 999999)
+        self.spin_fatigue_high.setValue(int(self.answers["fatigue_high"]))
+        self.spin_fatigue_high.setFixedWidth(110)
+        g.addWidget(self.spin_fatigue_high, 1, 1)
+        g.addWidget(_hint("疲劳 > 上限 → 回打怪点打小怪"), 1, 2, 1, 3)
         lay.addLayout(g)
 
         row = QHBoxLayout()

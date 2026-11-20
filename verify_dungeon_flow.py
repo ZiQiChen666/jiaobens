@@ -833,7 +833,90 @@ check("旧键已清掉（max_switch / finish）",
       and "finish" not in df.DEFAULT_PROFILE["farm"])
 check("打完 BOSS 的补拾取次数写进默认配置",
       df.DEFAULT_PROFILE["farm"].get("pickup_times") == 3)
-check("疲劳阈值默认 600", df.DEFAULT_PROFILE["fatigue"]["threshold"] == 600)
+check("疲劳上下限默认 -600 / +600",
+      df.DEFAULT_PROFILE["fatigue"].get("low") == -600
+      and df.DEFAULT_PROFILE["fatigue"].get("high") == 600)
+
+# ---- 疲劳下限/上限可以分开设，互不影响 ----
+p_lim = build_profile()
+p_lim["fatigue"] = {"enabled": True, "low": -500, "high": 900,
+                    "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
+r_lim = df.DungeonRunner(FakeGame(), p_lim, log=lambda _s: None)
+check("疲劳 < 下限(-500) → 去打BOSS",
+      r_lim.action_for_fatigue(-501) == "boss", r_lim.action_for_fatigue(-501))
+check("疲劳在上下限之间 → 保持默认",
+      r_lim.action_for_fatigue(800) == "boss"
+      and r_lim.action_for_fatigue(0) == "boss")
+check("疲劳 > 上限(900) → 回打怪点",
+      r_lim.action_for_fatigue(901) == "farm", r_lim.action_for_fatigue(901))
+check("上下限读得回来（-500 / 900）", r_lim.fatigue_limits() == (-500, 900),
+      str(r_lim.fatigue_limits()))
+# 旧标定只有 threshold 时按 ±threshold 折算
+p_old = {"fatigue": {"enabled": True, "threshold": 700}}
+check("旧标定 threshold=700 → 折算成 -700 / +700",
+      df._normalize_profile(p_old)["fatigue"]["low"] == -700
+      and df._normalize_profile(p_old)["fatigue"]["high"] == 700,
+      str(df._normalize_profile(p_old)["fatigue"]))
+
+# 旧存档只有 threshold：加载时要折成 low/high（别被默认 -600/600 盖掉）
+import json as _json
+import os as _os
+import tempfile as _tempfile
+
+_tmp_fat = _os.path.join(_tempfile.gettempdir(), "dungeon_legacy_fatigue.json")
+with open(_tmp_fat, "w", encoding="utf-8") as _fh:
+    _json.dump({"fatigue": {"enabled": True, "threshold": 791}}, _fh)
+_p_legacy = df.load_profile(_tmp_fat)
+check("旧存档 threshold=791 → 加载成 -791 / +791",
+      _p_legacy["fatigue"].get("low") == -791
+      and _p_legacy["fatigue"].get("high") == 791,
+      str(_p_legacy["fatigue"]))
+try:
+    _os.remove(_tmp_fat)
+except OSError:
+    pass
+
+# ---- 打怪挂机走后台（不需要窗口在前台）----
+class _FgGame(FakeGame):
+    def __init__(self):
+        super().__init__()
+        self.pinned = 0
+        self.restored = 0
+
+    def pin_user_foreground(self):
+        self.pinned += 1
+
+    def restore_user_foreground(self, quiet=False):
+        self.restored += 1
+
+
+p_bg = build_profile()
+p_bg["fatigue"] = {"enabled": True, "low": -600, "high": 600,
+                   "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
+p_bg["loop"] = dict(p_bg["loop"], link_fatigue=True, fatigue_every=10.0,
+                    default_action="farm")
+p_bg["farm"]["farm_pt"] = [0.20, 0.30]
+g_bg = _FgGame()
+logs_bg = []
+r_bg = df.DungeonRunner(g_bg, p_bg, log=logs_bg.append)
+_bg_vals = [0, -700]
+_bg_i = {"i": 0}
+
+
+def _bg_fatigue():
+    v = _bg_vals[min(_bg_i["i"], len(_bg_vals) - 1)]
+    _bg_i["i"] += 1
+    return v, 1000, ""
+
+
+r_bg.fatigue_check = _bg_fatigue
+r_bg.run_round()
+check("打怪前记下你的窗口、到点后把前台还给你",
+      g_bg.pinned >= 1 and g_bg.restored >= 1,
+      f"pinned={g_bg.pinned} restored={g_bg.restored}")
+check("打怪挂机日志写明后台发键",
+      any("后台 PostMessage 发送" in l for l in logs_bg),
+      str([l for l in logs_bg if "后台" in l]))
 check("识别阈值可配（sim / sim_loose / poll）",
       all(k in df.DEFAULT_PROFILE["detect"]
           for k in ("sim", "sim_loose", "ink_min", "poll")))

@@ -172,7 +172,8 @@ DEFAULT_PROFILE: dict = {
         "enabled": True,           # 是否按疲劳自动切换分支
         "pt": None,                # 疲劳图标点位 [nx, ny]（点一下弹提示）
         "roi": None,               # 疲劳提示文字区域；空则用主界面已框的
-        "threshold": 600,          # 疲劳上下限：< -阈值 去打BOSS，> +阈值 回打怪点
+        "low": -600,               # 疲劳下限：< 下限 → 去打BOSS
+        "high": 600,               # 疲劳上限：> 上限 → 回打怪点打小怪
     },
     "detect": {
         "poll": 0.2,        # 轮询间隔（越小越灵敏）
@@ -307,6 +308,16 @@ def load_profile(path: Optional[str] = None) -> dict:
     except Exception as exc:
         print(f"[警告] 读取标定失败：{type(exc).__name__}: {exc}")
         return json.loads(json.dumps(DEFAULT_PROFILE))
+    # 旧版只有 fatigue.threshold（±一个数）：先折成 low/high，别被默认值盖掉
+    try:
+        fat = data.get("fatigue")
+        if isinstance(fat, dict) and fat.get("threshold") is not None:
+            th = abs(int(fat.get("threshold") or 0))
+            if th:
+                fat.setdefault("low", -th)
+                fat.setdefault("high", th)
+    except Exception:
+        pass
     merged = _merge(DEFAULT_PROFILE, data)
     return _normalize_profile(merged)
 
@@ -331,6 +342,15 @@ def _normalize_profile(p: dict) -> dict:
             body["search"] = max(float(body.get("search") or 1.0), 1.6)
             body["tol"] = max(float(body.get("tol") or 18.0), 30.0)
             p.setdefault("farm", {})["boss_present"] = body
+        fat = (p.get("fatigue") or {})
+        if isinstance(fat, dict):
+            if fat.get("low") is None or fat.get("high") is None:
+                th = abs(int(fat.get("threshold", 600) or 0))
+                if fat.get("low") is None:
+                    fat["low"] = -th
+                if fat.get("high") is None:
+                    fat["high"] = th
+            p.setdefault("fatigue", {}).update(fat)
         hp = ((p.get("farm") or {}).get("boss_hp") or {})
         if isinstance(hp, dict) and hp.get("roi"):
             # v3.25.6：判死回到 v3.24.0 tag 的「亮像素占比」。
@@ -564,6 +584,7 @@ class WinGame:
         self.stop_event = stop_event
         self.last_error = ""
         self._focus_saved = 0
+        self._user_fg = 0
         self._logged_target = False
 
     # -- 基础 --
@@ -713,6 +734,32 @@ class WinGame:
                 app._force_foreground_window(saved)
                 if not quiet:
                     self.log("已把前台/光标还给原来的窗口（键盘继续后台发送）")
+            except Exception:
+                pass
+
+    def pin_user_foreground(self) -> None:
+        """记下「你正在用的窗口」，挂机时用它把前台还给你。"""
+        try:
+            fg = int(win32gui.GetForegroundWindow() or 0)
+        except Exception:
+            fg = 0
+        self._user_fg = fg if fg and fg != self.hwnd else 0
+
+    def restore_user_foreground(self, quiet: bool = False) -> None:
+        """把前台还给你（前台/混合模式都生效）；按键本身一直是后台发送的。"""
+        fg = int(getattr(self, "_user_fg", 0) or 0)
+        self._user_fg = 0
+        if not fg:
+            return
+        with _INPUT_LOCK:
+            try:
+                if not win32gui.IsWindow(fg):
+                    return
+                if int(win32gui.GetForegroundWindow() or 0) != self.hwnd:
+                    return
+                app._force_foreground_window(fg)
+                if not quiet:
+                    self.log("已把前台还给你（挂机按键继续走后台 PostMessage）")
             except Exception:
                 pass
 
@@ -1434,6 +1481,15 @@ class DungeonRunner:
             except Exception:
                 pass
 
+    def restore_user_foreground(self) -> None:
+        """把前台还给用户（挂机/打架时窗口不用留在前台）。"""
+        fn = getattr(self.game, "restore_user_foreground", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
     def gap(self, name: str = "动作缓冲") -> None:
         seconds = float(self.p.get("action_gap", 1.0) or 0.0)
         if seconds > 0:
@@ -1587,17 +1643,31 @@ class DungeonRunner:
         return False
 
     # -- ② 打怪点：看疲劳决定去 BOSS 还是打怪 --
-    def action_for_fatigue(self, current) -> str:
-        """疲劳值 → 该做哪个：< -阈值 打BOSS；> +阈值 打怪；其余用默认。"""
+    def fatigue_limits(self) -> tuple[int, int]:
+        """疲劳下限/上限（旧标定只有 threshold 时，按 ±threshold 折算）。"""
         cfg = self.p.get("fatigue") or {}
+        low, high = cfg.get("low"), cfg.get("high")
+        if low is None or high is None:
+            th = abs(int(cfg.get("threshold", 600) or 0))
+            if low is None:
+                low = -th
+            if high is None:
+                high = th
+        try:
+            return int(low), int(high)
+        except (TypeError, ValueError):
+            return -600, 600
+
+    def action_for_fatigue(self, current) -> str:
+        """疲劳值 → 该做哪个：< 下限 去打BOSS；> 上限 去打怪；其余用默认。"""
         loop = self.p.get("loop") or {}
         default = str(loop.get("default_action") or "boss")
-        threshold = abs(int(cfg.get("threshold", 800) or 0))
-        if current is None or not threshold:
+        if current is None:
             return default
-        if current < -threshold:
+        low, high = self.fatigue_limits()
+        if current < low:
             return "boss"
-        if current > threshold:
+        if current > high:
             return "farm"
         return default
 
@@ -1617,28 +1687,27 @@ class DungeonRunner:
         """联动：现在的模式该是「farm」还是「boss」。
 
         滞回切换（不会来回跳）：
-          · 挂机中：疲劳 < -阈值  → 去打 BOSS
-          · 打BOSS中：疲劳 > +阈值 → 回打怪点挂机
+          · 挂机中：疲劳 < 下限  → 去打 BOSS
+          · 打BOSS中：疲劳 > 上限 → 回打怪点挂机
         """
         loop = self.p.get("loop") or {}
-        cfg = self.p.get("fatigue") or {}
         default = str(loop.get("default_action") or "farm")
-        threshold = abs(int(cfg.get("threshold", 600) or 0))
+        low, high = self.fatigue_limits()
         if self._mode is None:
             self._mode = default
         current = self.fatigue_value()
-        if current is None or not threshold:
+        if current is None:
             self.log(f"按当前模式继续：{self._mode}")
             return self._mode
-        if self._mode == "farm" and current < -threshold:
+        if self._mode == "farm" and current < low:
             self._mode = "boss"
-            self.log(f"疲劳 {current} < -{threshold} → 切到打BOSS")
+            self.log(f"疲劳 {current} < 下限 {low} → 切到打BOSS")
             return "boss"
-        if self._mode == "boss" and current > threshold:
+        if self._mode == "boss" and current > high:
             self._mode = "farm"
-            self.log(f"疲劳 {current} > +{threshold} → 切回打怪点挂机")
+            self.log(f"疲劳 {current} > 上限 {high} → 切回打怪点挂机")
             return "farm"
-        self.log(f"疲劳 {current}（±{threshold}）→ 继续 {self._mode}")
+        self.log(f"疲劳 {current}（下限 {low} / 上限 {high}）→ 继续 {self._mode}")
         return self._mode
 
     def _anchor_of(self, key: str) -> dict:
@@ -2018,6 +2087,9 @@ class DungeonRunner:
         self._hp_ocr_visible = True
         hp_mode = str((hp_spec or {}).get("mode", "ocr") or "ocr").lower()
         self._hp_mode = hp_mode
+        self.restore_user_foreground()
+        self.log("打BOSS：A/技能/拾取全部后台 PostMessage 发送"
+                 "（窗口不用在前台）")
         if (hp_spec or {}).get("roi"):
             if hp_mode == "icon":
                 self.capture_boss_icon()
@@ -2119,12 +2191,12 @@ class DungeonRunner:
                 next_fatigue = elapsed + loop_fat
                 current, maximum, _msg = self.fatigue_check()
                 if current is not None:
-                    threshold = abs(int((self.p.get("fatigue") or {}).get(
-                        "threshold", 600) or 0))
-                    self.log(f"打怪中查疲劳 {current}/{maximum}（阈值 ±{threshold}）")
-                    if threshold and self.action_for_fatigue(current) == "farm":
-                        # 涨到 +阈值：这轮 BOSS 收尾（拾取 → 退本），下一轮回打怪点
-                        self.log(f"疲劳 {current} > +{threshold} → 这轮 BOSS 收尾，"
+                    low, high = self.fatigue_limits()
+                    self.log(f"打怪中查疲劳 {current}/{maximum}"
+                             f"（下限 {low} / 上限 {high}）")
+                    if current > high:
+                        # 涨到上限：这轮 BOSS 收尾（拾取 → 退本），下一轮回打怪点
+                        self.log(f"疲劳 {current} > 上限 {high} → 这轮 BOSS 收尾，"
                                  "下一轮回打怪点打小怪")
                         break
 
@@ -2149,13 +2221,17 @@ class DungeonRunner:
         if not farm.get("farm_pt"):
             self.log("没标「打怪点」，没法挂机（请到「副本流程」页标一下）")
             return False
+        low, high = self.fatigue_limits()
         self.log(f"—— 打怪点挂机（不设时长；每 {every:.0f}s 查一次疲劳，"
-                 f"疲劳 <-阈值 去打BOSS）——")
+                 f"疲劳 < 下限 {low} 就去打BOSS）——")
         if not self._goto(farm.get("farm_pt"),
                           float(farm.get("travel_wait", 30.0)), "打怪点"):
             return False
         self.gap("到打怪点后缓冲")
         self.release_focus()
+        self.restore_user_foreground()
+        self.log("打怪点挂机：A/技能/拾取全部后台 PostMessage 发送"
+                 "（窗口不用在前台，鼠标也不用在游戏里）")
         while not self._stopping():
             self.combat(every, desc="打怪点挂机", action="farm")
             if self._stopping():
@@ -2163,7 +2239,7 @@ class DungeonRunner:
             if self._switch_to == "boss":
                 self._switch_to = None
                 self._mode = "boss"
-                self.log("疲劳 < -阈值 → 切到打BOSS（结束挂机）")
+                self.log(f"疲劳 < 下限 {low} → 切到打BOSS（结束挂机）")
                 return True
         return True
 
@@ -2215,8 +2291,9 @@ class DungeonRunner:
                     self.log(f"疲劳读不到（{msg}），继续{desc}")
                 else:
                     want = self.action_for_fatigue(current)
-                    threshold = abs(int(fatigue_cfg.get("threshold", 800) or 0))
-                    self.log(f"{desc}中查疲劳 {current}/{maximum}（阈值 ±{threshold}）"
+                    low, high = self.fatigue_limits()
+                    self.log(f"{desc}中查疲劳 {current}/{maximum}"
+                             f"（下限 {low} / 上限 {high}）"
                              + ("" if want == action else
                                 " → 该换分支了：" + ("打BOSS" if want == "boss" else "打怪")))
                     if want != action:
@@ -2400,12 +2477,16 @@ class DungeonRunner:
             mode_name = self.game.input_mode()
         except Exception:
             mode_name = "hybrid"
-        if mode_name == "foreground" and getattr(self.game, "allow_grab", lambda: False)():
-            self.log("前台模式：整个流程占用鼠标键盘")
+        # 记下你现在用的窗口：点击时借了前台，打完/走到位就还给你
+        pin = getattr(self.game, "pin_user_foreground", None)
+        if callable(pin):
             try:
-                self.game.activate()
+                pin()
             except Exception:
                 pass
+        if mode_name == "foreground" and getattr(self.game, "allow_grab", lambda: False)():
+            self.log("前台模式：点击时用真实鼠标（点完会把前台还给你，"
+                     "打怪/打BOSS的按键都走后台）")
         loop = self.p.get("loop") or {}
         if bool(loop.get("link_fatigue", True)):
             mode = self.resolve_mode()
@@ -2473,6 +2554,7 @@ class DungeonRunner:
             return self._failed("退出副本失败")
         self.gap("退出后缓冲")
         self.release_focus()
+        self.restore_user_foreground()
         wh = self.p.get("warehouse") or {}
         if wh.get("enabled", True) and str(wh.get("after", "exit")) == "exit":
             if not self.deposit_to_warehouse():

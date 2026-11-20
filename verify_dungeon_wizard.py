@@ -37,7 +37,8 @@ answers = {
     "pickup_every": 9.0,
     "use_skills": True,
     "fatigue_enabled": True,
-    "fatigue_threshold": 600,
+    "fatigue_low": -500,
+    "fatigue_high": 900,
     "fatigue_pt": [0.10, 0.90],
     "farm_pt": [0.60, 0.60],
     "fatigue_every": 60.0,
@@ -62,9 +63,11 @@ check("拾取间隔", profile["farm"]["pickup_every"] == 9.0)
 check("退出后加载 10s", profile["exit"]["settle"] == 10.0)
 check("退出两个点", profile["exit"]["exit_pt"] == [0.94, 0.05]
       and profile["exit"]["confirm_pt"] == [0.55, 0.68])
-check("疲劳：开启 + 阈值 + 图标点",
+check("疲劳：开启 + 上下限 + 图标点",
       profile["fatigue"]["enabled"] is True
-      and profile["fatigue"]["threshold"] == 600
+      and profile["fatigue"]["low"] == -500
+      and profile["fatigue"]["high"] == 900
+      and "threshold" not in profile["fatigue"]
       and profile["fatigue"]["pt"] == [0.1, 0.9])
 check("每轮间隔", profile["retry"]["gap"] == 12.0)
 check("步骤表 3 步 + 疲劳说明", len(plan) >= 3
@@ -134,7 +137,8 @@ try:
     wiz.spin_pickup.setValue(8.0)
     wiz.spin_hp.setValue(1600)
     wiz.chk_fatigue.setChecked(True)
-    wiz.spin_fatigue.setValue(800)
+    wiz.spin_fatigue_low.setValue(-700)
+    wiz.spin_fatigue_high.setValue(1000)
     wiz.spin_fatigue_every.setValue(60.0)
     wiz.spin_exit_settle.setValue(10.0)
     wiz.spin_gap.setValue(8.0)
@@ -157,8 +161,9 @@ try:
     check("保存跑向 BOSS 30s", saved["farm"]["travel_wait"] == 30.0)
     check("保存 BOSS 上限 30s", saved["loop"]["boss_seconds"] == 30.0)
     check("保存退出后加载 10s", saved["exit"]["settle"] == 10.0)
-    check("保存疲劳设置", saved["fatigue"]["enabled"] is True
-          and saved["fatigue"]["threshold"] == 800
+    check("保存疲劳上下限", saved["fatigue"]["enabled"] is True
+          and saved["fatigue"]["low"] == -700
+          and saved["fatigue"]["high"] == 1000
           and saved["fatigue"]["pt"] == [0.1, 0.9])
     check("保存了打怪点", saved["farm"]["farm_pt"] == [0.6, 0.6])
     check("保存了疲劳检查间隔",

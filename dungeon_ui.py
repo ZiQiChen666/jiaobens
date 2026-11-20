@@ -768,8 +768,8 @@ class DungeonTab(QWidget):
         self.chk_link = QCheckBox("打怪点挂机 ↔ 打BOSS 联动（按疲劳切换）")
         self.chk_link.setChecked(True)
         self.chk_link.setToolTip(
-            "勾选：先在打怪点挂机，疲劳 < -阈值 就去刷BOSS；"
-            "刷到疲劳 > +阈值 就回打怪点挂机。"
+            "勾选：先在打怪点挂机，疲劳 < 下限 就去刷BOSS；"
+            "刷到疲劳 > 上限 就回打怪点挂机。"
         )
         self.chk_link.toggled.connect(self._save_from_ui)
         g.addWidget(self.chk_link, 10, 0, 1, 4)
@@ -1082,24 +1082,34 @@ class DungeonTab(QWidget):
         self.lbl_nav_macro.setText(f"已录制：{clicks} 次点击 / {keys} 个按键")
 
     def _build_exit(self) -> QWidget:
-        box = QGroupBox("④ 疲劳联动：按上下阈值自动切换打怪 / 打BOSS")
+        box = QGroupBox("④ 疲劳联动：低于下限打BOSS / 高于上限打小怪")
         g = QGridLayout(box)
-        self.chk_fatigue = QCheckBox("启用疲劳检测（每 1 分钟查一次，按上下阈值切换）")
+        self.chk_fatigue = QCheckBox("启用疲劳检测（每 1 分钟查一次，按上下限切换）")
         self.chk_fatigue.setChecked(True)
         self.chk_fatigue.toggled.connect(self._save_from_ui)
         g.addWidget(self.chk_fatigue, 0, 0, 1, 3)
 
-        g.addWidget(QLabel("疲劳阈值 ±"), 0, 3)
-        self.spin_fatigue = QSpinBox()
-        self.spin_fatigue.setRange(0, 999999)
-        self.spin_fatigue.setValue(600)
-        self.spin_fatigue.setFixedWidth(100)
-        self.spin_fatigue.setToolTip(
-            "打小怪时：疲劳 < -阈值 → 去打BOSS；"
-            "打BOSS时：疲劳 > +阈值 → 回打怪点打小怪。"
+        g.addWidget(QLabel("疲劳下限"), 0, 3)
+        self.spin_fatigue_low = QSpinBox()
+        self.spin_fatigue_low.setRange(-999999, 999999)
+        self.spin_fatigue_low.setValue(-600)
+        self.spin_fatigue_low.setFixedWidth(100)
+        self.spin_fatigue_low.setToolTip(
+            "疲劳 < 下限 → 去打 BOSS（可填负数，例如 -800）"
         )
-        self.spin_fatigue.valueChanged.connect(self._save_from_ui)
-        g.addWidget(self.spin_fatigue, 0, 4)
+        self.spin_fatigue_low.valueChanged.connect(self._save_from_ui)
+        g.addWidget(self.spin_fatigue_low, 0, 4)
+
+        g.addWidget(QLabel("疲劳上限"), 0, 5)
+        self.spin_fatigue_high = QSpinBox()
+        self.spin_fatigue_high.setRange(-999999, 999999)
+        self.spin_fatigue_high.setValue(600)
+        self.spin_fatigue_high.setFixedWidth(100)
+        self.spin_fatigue_high.setToolTip(
+            "疲劳 > 上限 → 回打怪点打小怪（可填负数，例如 +500）"
+        )
+        self.spin_fatigue_high.valueChanged.connect(self._save_from_ui)
+        g.addWidget(self.spin_fatigue_high, 0, 6)
 
         self.btn_fatigue_roi = QPushButton("框疲劳提示区域（可选）")
         self.btn_fatigue_roi.clicked.connect(self._pick_fatigue_roi)
@@ -1107,8 +1117,8 @@ class DungeonTab(QWidget):
         self.lbl_fatigue_roi = QLabel("未设置（会沿用主界面「疲劳检测」框过的区域）")
         g.addWidget(self.lbl_fatigue_roi, 1, 1, 1, 6)
         g.addWidget(_hint(
-            "不需要设挂机时长：每 60 秒查一次疲劳。"
-            "打小怪时疲劳 < -阈值 就去打BOSS；打BOSS时疲劳 > +阈值 就回打怪点。"
+            "不设挂机时长：每 60 秒查一次疲劳。"
+            "疲劳 < 下限 → 结束打怪去打BOSS；疲劳 > 上限 → 回打怪点打小怪。"
         ), 2, 0, 1, 8)
         return box
 
@@ -1358,7 +1368,14 @@ class DungeonTab(QWidget):
             self.spin_gap.setValue(float((p.get("retry") or {}).get("gap", 8.0)))
             fatigue = p.get("fatigue") or {}
             self.chk_fatigue.setChecked(bool(fatigue.get("enabled", True)))
-            self.spin_fatigue.setValue(int(fatigue.get("threshold", 800) or 0))
+            f_low = fatigue.get("low")
+            f_high = fatigue.get("high")
+            if f_low is None or f_high is None:
+                f_th = abs(int(fatigue.get("threshold", 600) or 0))
+                f_low = -f_th if f_low is None else f_low
+                f_high = f_th if f_high is None else f_high
+            self.spin_fatigue_low.setValue(int(f_low))
+            self.spin_fatigue_high.setValue(int(f_high))
 
             states = {
                 "dungeon_pt": (enter.get("dungeon_pt"), "① 副本入口"),
@@ -1456,8 +1473,10 @@ class DungeonTab(QWidget):
         })
         p.setdefault("fatigue", {}).update({
             "enabled": bool(self.chk_fatigue.isChecked()),
-            "threshold": int(self.spin_fatigue.value()),
+            "low": int(self.spin_fatigue_low.value()),
+            "high": int(self.spin_fatigue_high.value()),
         })
+        (p.get("fatigue") or {}).pop("threshold", None)
         p.setdefault("mount", {}).update({
             "enabled": bool(self.chk_mount.isChecked()),
             "key": self.edit_mount_key.text().strip() or "s",
@@ -1838,8 +1857,10 @@ class DungeonTab(QWidget):
         if nav.get("enabled") and nav.get("events"):
             self._log("引路宏：已启用（进本/跑向 BOSS 用录制的鼠标宏，不点地图点位）")
         self._log(
-            f"② 疲劳 < -阈值 → 打BOSS（上限 {self.spin_seconds.value():.0f}s，血条没了就结束）；"
-            f"疲劳 > +阈值 → 回打怪点挂机；不设挂机时长，"
+            f"② 疲劳 < 下限 {self.spin_fatigue_low.value()} → 打BOSS"
+            f"（上限 {self.spin_seconds.value():.0f}s，血条没了就结束）；"
+            f"疲劳 > 上限 {self.spin_fatigue_high.value()} → 回打怪点挂机"
+            f"（后台按键，不占窗口）；不设挂机时长，"
             f"每 {self.spin_fatigue_every.value():.0f}s 查一次疲劳"
         )
         self._log(f"③ 点「退出副本」→ 识别退出确认弹窗 → 点「确认」→ 等 {self.spin_exit_settle.value():.0f}s")
