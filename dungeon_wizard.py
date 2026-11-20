@@ -148,6 +148,8 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
         missing.append("进本弹窗识别区域（没有它就只能盲点确认）")
     if not farm.get("boss_pt"):
         missing.append("地图2 的 BOSS 点")
+    if bool(loop.get("link_fatigue", True)) and not farm.get("farm_pt"):
+        missing.append("地图2 的打怪点（疲劳联动挂机用）")
     if not exit_cfg.get("exit_pt"):
         missing.append("「退出副本」按钮")
     if fatigue.get("enabled") and not (fatigue.get("pt") or fatigue.get("roi")):
@@ -295,7 +297,6 @@ class DungeonWizard(QDialog):
         self.answers["hp_threshold"] = int(self.spin_hp.value())
         self.answers["fatigue_enabled"] = bool(self.chk_fatigue.isChecked())
         self.answers["fatigue_threshold"] = int(self.spin_fatigue.value())
-        self.answers["boss_seconds"] = float(self.spin_seconds.value())
         self.answers["fatigue_every"] = float(self.spin_fatigue_every.value())
         self.answers["pickup_on_a"] = bool(self.chk_pickup_on_a.isChecked())
         self.answers["action_gap"] = float(self.spin_action_gap.value())
@@ -311,7 +312,12 @@ class DungeonWizard(QDialog):
         if self.index >= len(self._pages) - 1:
             self.profile, self.plan_lines = compose_profile(self.profile, self.answers)
             try:
-                df.save_profile(self.profile)
+                # 有命名方案就写进当前方案，否则写默认标定（不然向导白标一遍）
+                name = df.active_name()
+                if name:
+                    df.save_dungeon(name, self.profile)
+                else:
+                    df.save_profile(self.profile)
             except Exception as exc:
                 QMessageBox.warning(self, "保存失败", str(exc))
                 return
@@ -489,15 +495,25 @@ class DungeonWizard(QDialog):
             "程序会先跑到那里读疲劳值，再决定是打 BOSS 还是打怪；"
             "然后再点 BOSS 所在的位置。"
         ))
+        row_farm = QHBoxLayout()
+        btn_farm = QPushButton("① 截图并点「打怪点」")
+        btn_farm.setToolTip(
+            "地图2 上平时打小怪的位置；疲劳 < -阈值 才从这里去打 BOSS"
+        )
+        btn_farm.clicked.connect(self._pick_farm_pt)
+        self.lbl_farm = QLabel(self._pt_text(self.answers.get("farm_pt")))
+        row_farm.addWidget(btn_farm)
+        row_farm.addWidget(self.lbl_farm, 1)
+        lay.addLayout(row_farm)
         row_boss = QHBoxLayout()
-        btn = QPushButton("① 截图并点「副本内 BOSS 点」")
+        btn = QPushButton("② 截图并点「副本内 BOSS 点」")
         btn.clicked.connect(self._pick_boss)
         self.lbl_boss = QLabel(self._pt_text(self.answers.get("boss_pt")))
         row_boss.addWidget(btn)
         row_boss.addWidget(self.lbl_boss, 1)
         lay.addLayout(row_boss)
         row_flag = QHBoxLayout()
-        btn_bossflag = QPushButton("② 框住「BOSS 身形」")
+        btn_bossflag = QPushButton("③ 框住「BOSS 身形」")
         btn_bossflag.setToolTip("框住 BOSS 本体；相似度高才开始打，不够就重新寻路")
         btn_bossflag.clicked.connect(lambda: self._pick_farm_roi("boss_present"))
         self.lbl_bossflag = QLabel("未设置")
@@ -506,8 +522,9 @@ class DungeonWizard(QDialog):
         lay.addLayout(row_flag)
 
         row_finish = QHBoxLayout()
-        btn_finish = QPushButton("③ 框住「BOSS 血条」")
-        btn_finish.setToolTip("框住 BOSS 头顶血条；血条连续几次不见就判定打完")
+        btn_finish = QPushButton("④ 框住 BOSS 血量图标")
+        btn_finish.setToolTip("框住 BOSS 头顶血条，或那个「打 BOSS 才出现」的图标；"
+                             "开打时拍下它的样子，图标连续几次消失就判定打完")
         btn_finish.clicked.connect(lambda: self._pick_farm_roi("boss_hp"))
         self.lbl_finish = QLabel("未设置")
         row_finish.addWidget(btn_finish)
@@ -528,8 +545,9 @@ class DungeonWizard(QDialog):
         titles = {
             "boss_present": ("BOSS 身形",
                              "框住 BOSS 本体（别框会动的特效）"),
-            "boss_hp": ("BOSS 血条",
-                        "框住 BOSS 头顶那条血条（打怪时看它在不在）"),
+            "boss_hp": ("BOSS 血量图标",
+                        "框住 BOSS 头顶的血条，或者那个「打 BOSS 才出现」的图标；"
+                        "开打时拍下它的样子，图标消失就判定打完"),
         }
         title, info = titles.get(which, ("识别区域", ""))
         if dui.pick_region(self, self.hwnd, self.profile, f"farm.{which}",
@@ -555,6 +573,11 @@ class DungeonWizard(QDialog):
         self._pick_point("boss_pt", "点 BOSS 点",
                          "这里显示的是地图2（副本地图）。点一下 BOSS 所在的位置。", True)
         self.lbl_boss.setText(self._pt_text(self.answers.get("boss_pt")))
+
+    def _pick_farm_pt(self) -> None:
+        self._pick_point("farm_pt", "点打怪点",
+                         "这里显示的是地图2（副本地图）。点一下平时打小怪的位置。", True)
+        self.lbl_farm.setText(self._pt_text(self.answers.get("farm_pt")))
 
     def _page_farm(self) -> QWidget:
         page = QWidget()

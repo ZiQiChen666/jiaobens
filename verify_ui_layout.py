@@ -104,6 +104,105 @@ if tab is not None:
     scan(tab, "副本流程页")
 
 
+def check_widgets_are_saved(path: str = "dungeon_ui.py") -> None:
+    """静态检查：每个输入控件都必须被 _save_from_ui 读到（防“死控件”）。
+
+    上一版就出过这种坑：界面里多了一个“打怪时每”=spin_fatigue_every，
+    但 _save_from_ui 只读另一个 spin，改它完全没效果，
+    界面重叠检查也抓不到。这里不创建窗口，直接比 AST，纯静态、可重复。
+    """
+    import ast
+    import os
+
+    target = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    tree = ast.parse(open(target, encoding="utf-8").read())
+    cls = next(n for n in tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "DungeonTab")
+    prefixes = ("spin_", "chk_", "edit_")
+    created = set()
+    save_reads = set()
+    for node in cls.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Attribute)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "self"
+                    and sub.attr.startswith(prefixes)):
+                if node.name == "_save_from_ui":
+                    save_reads.add(sub.attr)
+            if (isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Name)
+                    and sub.func.id == "pair"
+                    and len(sub.args) >= 4
+                    and isinstance(sub.args[3], ast.Constant)):
+                created.add(str(sub.args[3].value))
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                for t in targets:
+                    if (isinstance(t, ast.Attribute)
+                            and isinstance(t.value, ast.Name)
+                            and t.value.id == "self"
+                            and t.attr.startswith(prefixes)):
+                        created.add(t.attr)
+    dead = sorted(created - save_reads)
+    check(f"{path}：{len(created)} 个输入控件都接进了保存（无死控件）",
+          not dead, "没被 _save_from_ui 读到：" + "、".join(dead))
+
+
+check_widgets_are_saved()
+
+if tab is not None:
+    check("副本页实例已创建", True)
+
+
+def check_missing_items(tab) -> None:
+    """勾了引路宏（而且有录制内容）就不该再要求地图点位。"""
+    import json
+
+    p = tab.profile
+    backup = json.dumps(p, sort_keys=True, ensure_ascii=False)
+    try:
+        nav = p.setdefault("nav_macro", {})
+        nav["enabled"] = True
+        nav["fallback"] = False
+        nav["events"] = [{"type": "key_down", "t": 0.0, "name": "m"}]
+        enter = p.setdefault("enter", {})
+        enter["dungeon_pt"] = None
+        enter["confirm_pt"] = None
+        farm = p.setdefault("farm", {})
+        farm["boss_pt"] = None
+        farm["farm_pt"] = [0.20, 0.30]
+        p.setdefault("loop", {})["link_fatigue"] = True
+        exit_cfg = p.setdefault("exit", {})
+        exit_cfg["exit_pt"] = [0.94, 0.05]
+        exit_cfg["confirm_pt"] = [0.55, 0.68]
+        miss = tab._missing_items()
+        check("用了引路宏 → 不再要求副本入口/BOSS 点", miss == [], str(miss))
+        nav["fallback"] = True
+        miss2 = tab._missing_items()
+        check("勾了「回退地图点位」→ 又要求地图点位",
+              any("副本入口" in m for m in miss2)
+              and any("BOSS 点" in m for m in miss2), str(miss2))
+        nav["events"] = []
+        miss3 = tab._missing_items()
+        check("引路宏没内容 → 退回要求地图点位", len(miss3) >= 3, str(miss3))
+        nav["events"] = [{"type": "key_down", "t": 0.0, "name": "m"}]
+        nav["fallback"] = False
+        farm["farm_pt"] = None
+        miss4 = tab._missing_items()
+        check("没标打怪点（且开着联动）→ 提前拦下",
+              any("打怪点" in m for m in miss4), str(miss4))
+    finally:
+        p.clear()
+        p.update(json.loads(backup))
+
+
+if tab is not None:
+    check_missing_items(tab)
+
+
 def check_group_overlaps(widget, path: str):
     """把每个 QGroupBox 里直接子控件两两比几何，找“真叠在一起”。"""
     from PySide6.QtWidgets import QGroupBox
@@ -148,7 +247,27 @@ wiz = DungeonWizard(wins[0][0] if wins else 0, df.load_profile("__none__.json"))
 for idx in range(len(wiz._pages)):
     wiz._go(idx)
     scan(wiz._pages[idx], f"向导第{idx + 1}页")
+# 收尾：把热键/托盘/后台线程清掉再退出。
+# 不清理的话 keyboard 的钩子线程会和解释器退出抢资源，
+# 偶发退出码 127（输出全 PASS 但进程"崩"了）。
+try:
+    w._quitting = True
+    w._cleanup()
+except Exception:
+    pass
+try:
+    if getattr(w, "_tray", None) is not None:
+        w._tray.hide()
+except Exception:
+    pass
+try:
+    import keyboard as _kb
+    _kb.unhook_all()
+except Exception:
+    pass
 w.close()
+del w
+qa.processEvents()
 
 print()
 if fails:

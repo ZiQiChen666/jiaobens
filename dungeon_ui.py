@@ -178,9 +178,12 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
             "still_seconds": 0.8, "still_timeout": 12.0, "still_diff": 0.015,
         }
     elif where == "farm.boss_hp":
-        # 和 v3.24 tag 一致：亮度占比 >= min_fill(0.15) 算血条还在
+        # 死亡判定：开打时拿这块区域拍基准，图标消失（不像了）= 打完；
+        # 没拍到基准时回退到亮度占比（和 v3.24 tag 一致）。
         profile.setdefault("farm", {})["boss_hp"] = {
-            "roi": roi_norm, "min_fill": 0.15, "miss": 3,
+            "roi": roi_norm, "mode": "icon", "grid": 12,
+            "sim": 0.75, "tol": 30.0, "min_same": 0.35, "color_tol": 40,
+            "min_fill": 0.15, "miss": 3,
         }
     elif where == "farm.arrived":
         sig = df.signature(df.crop_norm(f, roi_norm), 12)
@@ -201,8 +204,13 @@ def pick_region(parent, hwnd: int, profile: dict, where: str,
         }
     else:
         return False
+    # 存到「当前副本方案」里（有命名方案时别写默认标定，否则下次打开就丢）
     try:
-        df.save_profile(profile)
+        name = df.active_name()
+        if name:
+            df.save_dungeon(name, profile)
+        else:
+            df.save_profile(profile)
     except Exception:
         pass
     return True
@@ -671,7 +679,7 @@ class DungeonTab(QWidget):
         btn_bosshp.clicked.connect(lambda: self._pick_extra_roi("farm.boss_hp"))
         self.lbl_finish = QLabel("未设置")
         self.lbl_finish.setObjectName("muted")
-        g.addWidget(QLabel("③ BOSS 血条区域（血条没了 = 打完）"), row0 + 7, 0)
+        g.addWidget(QLabel("③ BOSS 血量图标（图标没了 = 打完）"), row0 + 7, 0)
         g.addWidget(self.lbl_finish, row0 + 7, 1)
         g.addWidget(btn_bosshp, row0 + 7, 2)
 
@@ -720,7 +728,7 @@ class DungeonTab(QWidget):
         pair(3, 0, "喝药间隔", "spin_potion", 1.0, 60.0, 6.0)
         pair(3, 2, "拾取间隔", "spin_pickup", 0.0, 120.0, 8.0)
         pair(4, 0, "打BOSS上限", "spin_seconds", 5.0, 1000.0, 120.0)
-        pair(4, 2, "查疲劳间隔", "spin_trash_seconds", 10.0, 600.0, 60.0)
+        pair(4, 2, "查疲劳间隔", "spin_fatigue_every", 10.0, 600.0, 60.0)
 
         g.addWidget(QLabel("没弹窗重试"), 5, 0)
         self.spin_retry = QSpinBox()
@@ -1051,11 +1059,17 @@ class DungeonTab(QWidget):
 
     def _clear_nav_macro(self) -> None:
         nav = self.profile.setdefault("nav_macro", {})
+        was_enabled = bool(nav.get("enabled"))
         nav["events"] = []
         nav["meta"] = {}
+        # 清空后顺手取消启用，免得「勾着引路宏但没内容」静默退回地图点击
+        nav["enabled"] = False
+        self.chk_nav_macro.setChecked(False)
         self._save()
         self._update_nav_macro_label()
-        self._log("引路宏：已清空")
+        self._log("引路宏：已清空"
+                  + ("，并取消「用引路宏导航」（会退回地图点位）"
+                     if was_enabled else ""))
 
     def _update_nav_macro_label(self) -> None:
         nav = self.profile.get("nav_macro") or {}
@@ -1297,8 +1311,8 @@ class DungeonTab(QWidget):
             self.chk_mount.setChecked(bool(mount.get("enabled", True)))
             self.edit_mount_key.setText(str(mount.get("key", "s")))
 
-            self.spin_trash_seconds.setValue(
-                float(loop.get("fatigue_every", 60.0))
+            self.spin_fatigue_every.setValue(
+                float(loop.get("fatigue_every", 60.0) or 60.0)
             )
             self.chk_link.setChecked(bool(loop.get("link_fatigue", True)))
             detect = p.get("detect") or {}
@@ -1452,7 +1466,7 @@ class DungeonTab(QWidget):
         })
         p.setdefault("loop", {}).update({
             "boss_seconds": float(self.spin_seconds.value()),
-            "fatigue_every": float(self.spin_trash_seconds.value()),
+            "fatigue_every": float(self.spin_fatigue_every.value()),
             "link_fatigue": bool(self.chk_link.isChecked()),
             "pickup_on_a": bool(self.chk_pickup_on_a.isChecked()),
         })
@@ -1660,14 +1674,15 @@ class DungeonTab(QWidget):
             "farm.boss_present": ("BOSS 身形",
                                   "框住 BOSS 本体（身上的特征，不要框会动的特效）；"
                                   "跑到 BOSS 点后相似度够高才开始打，不够就重新寻路"),
-            "farm.boss_hp": ("BOSS 血条区域",
-                             "框住 BOSS 头顶那条血条；打怪过程中血条连续几次不见了，"
-                             "就判定 BOSS 已死"),
+            "farm.boss_hp": ("BOSS 血量图标",
+                             "框住 BOSS 头顶的血条，或者那个「打 BOSS 才出现」的图标；"
+                             "开打时程序会拍下它的样子，图标连续几次消失就判定 BOSS 已死"),
         }
         title, info = titles.get(where, ("识别区域", ""))
         if pick_region(self, hwnd, self.profile, where, title, info):
             self._load_ui()
-            self._log(f"已设置：{title}")
+            name = df.active_name() or "默认标定"
+            self._log(f"已设置：{title}（已写入「{name}」）")
 
     def _pick_mount_roi(self, which: str) -> None:
         hwnd = self._hwnd()
@@ -1734,6 +1749,9 @@ class DungeonTab(QWidget):
             return
         game = df.WinGame(hwnd, self.profile, log=self._log)
         runner = df.DungeonRunner(game, self.profile, log=self._log)
+        if ((self.profile.get("farm") or {}).get("boss_hp") or {}).get("roi"):
+            # 拿当前画面当基准，这样日志里能直接看到「图标相似度」
+            runner.capture_boss_icon(samples=1, gap=0.0)
         info = runner.probe()
         if not info:
             self._log("看一眼：截图失败")
@@ -1741,22 +1759,34 @@ class DungeonTab(QWidget):
         self._log("看一眼：" + "  ".join(f"{k}={v}" for k, v in info.items()))
 
     def _missing_items(self) -> list[str]:
-        """开跑前检查，缺什么直接告诉用户。"""
+        """开跑前检查，缺什么直接告诉用户。
+
+        勾了引路宏（而且录了事件）时，进本/跑向 BOSS 靠宏回放，不再需要
+        地图点位；只有勾了「宏失败回退地图点位」才反过来要求地图点。
+        """
         p = self.profile
         enter = p.get("enter") or {}
         farm = p.get("farm") or {}
         exit_cfg = p.get("exit") or {}
+        nav = p.get("nav_macro") or {}
+        nav_ready = bool(nav.get("enabled")) and bool(nav.get("events"))
+        use_map_points = (not nav_ready) or bool(nav.get("fallback"))
         missing = []
-        if not enter.get("dungeon_pt"):
-            missing.append("① 副本入口（地图1）")
-        if not enter.get("confirm_pt"):
-            missing.append("① 弹窗「进入游戏」按钮")
-        if not farm.get("boss_pt"):
-            missing.append("② BOSS 点（地图2）")
+        if use_map_points:
+            if not enter.get("dungeon_pt"):
+                missing.append("① 副本入口（地图1）")
+            if not enter.get("confirm_pt"):
+                missing.append("① 弹窗「进入游戏」按钮")
+            if not farm.get("boss_pt"):
+                missing.append("② BOSS 点（地图2）")
         if not exit_cfg.get("exit_pt"):
             missing.append("③「退出副本」按钮")
         if not exit_cfg.get("confirm_pt"):
             missing.append("③「确认」按钮")
+        # 联动挂机还需要「打怪点」，否则跑到一半才报「没标打怪点」
+        if bool((p.get("loop") or {}).get("link_fatigue", True)) \
+                and not farm.get("farm_pt"):
+            missing.append("② 打怪点（地图2，疲劳联动挂机用）")
         return missing
 
     def _start_single(self, dry: bool) -> None:
@@ -1810,7 +1840,7 @@ class DungeonTab(QWidget):
         self._log(
             f"② 疲劳 < -阈值 → 打BOSS（上限 {self.spin_seconds.value():.0f}s，血条没了就结束）；"
             f"疲劳 > +阈值 → 回打怪点挂机；不设挂机时长，"
-            f"每 {self.spin_trash_seconds.value():.0f}s 查一次疲劳"
+            f"每 {self.spin_fatigue_every.value():.0f}s 查一次疲劳"
         )
         self._log(f"③ 点「退出副本」→ 识别退出确认弹窗 → 点「确认」→ 等 {self.spin_exit_settle.value():.0f}s")
         self._launch(0, hwnd, rounds if not dry else 1, dry=dry)

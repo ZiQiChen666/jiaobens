@@ -82,6 +82,8 @@ check("页面默认值：40/24/10/30/30/10",
 
 profile2, plan2 = dw.compose_profile(base, {})
 check("全部跳过也不崩，并列出缺失", any(l.startswith("还差") for l in plan2), str(plan2))
+check("全部跳过时也点名「打怪点」",
+      any("打怪点" in l for l in plan2), str(plan2))
 
 a = df.copy_profile_for_slot(profile, 60)
 b = df.copy_profile_for_slot(profile, 300)
@@ -93,11 +95,14 @@ check("多开不再设挂机时长（只改 BOSS 上限）",
 
 # ---- 界面走一遍 -------------------------------------------------------
 _real_save = df.save_profile
+_real_active = df.active_name
 _real_path = df.profile_path
 tmp = os.path.join(tempfile.gettempdir(), "wizard_verify3.json")
 if os.path.exists(tmp):
     os.remove(tmp)
 df.save_profile = lambda prof, path=None: _real_save(prof, tmp)
+# 本机可能挂着命名方案；强制走「默认标定」分支，保证写的是 tmp
+df.active_name = lambda: ""
 df.profile_path = lambda: tmp
 
 try:
@@ -110,6 +115,9 @@ try:
     wiz = dw.DungeonWizard(hwnd, df.load_profile("__no_such_profile__.json"))
     check("向导页数 = 9（介绍/进本/弹窗/BOSS/挂机/疲劳/骑乘/退出/汇总）",
           len(wiz._pages) == 9, str(len(wiz._pages)))
+    check("BOSS 页有「打怪点」按钮和标签",
+          hasattr(wiz, "lbl_farm") and wiz.lbl_farm.text() == "未设置",
+          getattr(getattr(wiz, "lbl_farm", None), "text", lambda: "?")())
 
     wiz.answers.update({
         "entry_pt": [0.30, 0.55], "confirm_pt": [0.50, 0.55],
@@ -165,6 +173,7 @@ except Exception:
     check("向导界面测试", False)
 finally:
     df.save_profile = _real_save
+    df.active_name = _real_active
     df.profile_path = _real_path
     try:
         os.remove(tmp)

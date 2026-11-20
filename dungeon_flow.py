@@ -63,6 +63,9 @@ ACTIVE_NAME_FILE = "dungeon_active.txt"
 # 这样 A 窗口在点地图时，B 窗口不会同时把光标/前台抢走。
 _INPUT_LOCK = threading.RLock()
 
+# 多开时几个窗口会同时想 OCR；RapidOCR 那个引擎不是多线程安全的，串起来。
+_OCR_LOCK = threading.RLock()
+
 DEFAULT_PROFILE: dict = {
     "name": "默认副本",
     "window_title": "CreatureCurios",
@@ -117,8 +120,12 @@ DEFAULT_PROFILE: dict = {
                          "sim": 0.60, "search": 1.6, "tol": 30.0,
                          "still_seconds": 0.8, "still_timeout": 12.0,
                          "still_diff": 0.015},  # BOSS 身形（多张样本 + 停下才识别）
-        "boss_hp": {"roi": None, "min_fill": 0.15, "miss": 3},  # BOSS 血条（v3.24 tag：亮度占比）
-        "finish": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},        # 旧版，已不用
+        "boss_hp": {"roi": None, "mode": "ocr", "kill_hp": 0, "miss": 3,
+                    "ocr_every": 2.0, "grace": 6.0, "min_fill": 0.15},
+        # ↑ BOSS 死亡判定（默认 mode=ocr，和主程序 BossWatcher 同一套）：
+        #   对框住的区域 OCR 读「名字 + 当前/最大血量」；
+        #   读到 0（或 ≤kill_hp）→ 死；连续 miss 次读不到（血条/名字消失）→ 死。
+        #   mode=bright 是 v3.24 tag 的亮度占比；mode=icon 才是"开打拍基准比图标"。
         "boss_retry": 3,           # 没识别到「打怪点BOSS」就重新寻路几次
         "map_radius": 0.02,        # 重试时在 BOSS 点周围绕圈微调（归一化半径）
         "pickup_on_a": True,       # 每次平A后都按一次拾取
@@ -133,11 +140,11 @@ DEFAULT_PROFILE: dict = {
         "potion_keys": ["q"],      # 血量低于阈值时只按 Q
         "potion_every": 6.0,       # 喝药间隔（低于阈值时每 6 秒喝一次）
         "pickup_every": 8.0,       # 挂机期间每隔几秒按一次拾取
+        "pickup_times": 3,         # 打完 BOSS、退出前再拾取几次
     },
     "loop": {
         "link_fatigue": True,      # 打怪点挂机 ↔ 打BOSS 联动（按疲劳上下限切换）
         "fatigue_every": 60.0,     # 打怪/挂机时每隔多少秒查一次疲劳（多开每个窗口独立查）
-        "max_switch": 3,           # 疲劳变化导致换分支，最多切几次（防来回跳）
         "boss_seconds": 120.0,     # BOSS 战上限（血条一直不消失时兜底；最大 1000s）
         "default_action": "farm",  # 疲劳在中间区间时做哪个：boss / farm
     },
@@ -324,6 +331,26 @@ def _normalize_profile(p: dict) -> dict:
             body["search"] = max(float(body.get("search") or 1.0), 1.6)
             body["tol"] = max(float(body.get("tol") or 18.0), 30.0)
             p.setdefault("farm", {})["boss_present"] = body
+        hp = ((p.get("farm") or {}).get("boss_hp") or {})
+        if isinstance(hp, dict) and hp.get("roi"):
+            # v3.25.6：判死回到 v3.24.0 tag 的「亮像素占比」。
+            # 只有标定里明确写 mode=icon 才用「开打拍基准比图标」那套。
+            if hp.get("use_icon"):
+                hp["mode"] = "icon"
+            elif str(hp.get("mode", "")).lower() == "bright":
+                hp["mode"] = "bright"
+            else:
+                # 之前自动写进去的 icon / bar / ink 统统回到 OCR（最可靠那个）
+                hp["mode"] = "ocr"
+            hp.setdefault("kill_hp", 0)
+            hp.setdefault("ocr_every", 2.0)
+            hp.setdefault("grace", 6.0)
+            hp.setdefault("sim", 0.75)
+            hp.setdefault("grid", 12)
+            hp.setdefault("tol", 30.0)
+            hp.setdefault("min_same", 0.35)
+            hp.setdefault("color_tol", 40)
+            p.setdefault("farm", {})["boss_hp"] = hp
     except Exception:
         pass
     return p
@@ -387,6 +414,106 @@ def ink_ratio(patch: np.ndarray, tol: int = 36) -> float:
     flat = patch.reshape(-1, 3).astype(np.int16)
     dev = np.abs(flat - bg).max(axis=1)
     return float((dev > tol).mean())
+
+
+def color_signature(patch: np.ndarray, grid: int = 12) -> list[float]:
+    """按格降采样成 RGB 特征（灰度签名对"只变颜色"不敏感，这里补上）。"""
+    if patch is None or patch.size == 0:
+        return []
+    h, w = patch.shape[:2]
+    gh = max(1, min(int(grid), h))
+    gw = max(1, min(int(grid), w))
+    ys = np.linspace(0, h, gh + 1).astype(int)
+    xs = np.linspace(0, w, gw + 1).astype(int)
+    out: list[float] = []
+    for i in range(gh):
+        y0, y1 = ys[i], max(ys[i] + 1, ys[i + 1])
+        for j in range(gw):
+            x0, x1 = xs[j], max(xs[j] + 1, xs[j + 1])
+            m = patch[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
+            out.extend([round(float(m[0]), 1), round(float(m[1]), 1),
+                        round(float(m[2]), 1)])
+    return out
+
+
+def color_similarity(a, b, tol: float = 30.0) -> float:
+    """1.0 = 每格三个通道都一样；按「变色格子比例」算。"""
+    if not a or not b or len(a) != len(b) or len(a) % 3:
+        return 0.0
+    da = np.asarray(a, np.float32).reshape(-1, 3)
+    db = np.asarray(b, np.float32).reshape(-1, 3)
+    return float(1.0 - (np.abs(da - db).max(axis=1) > tol).mean())
+
+
+def same_color_ratio(patch: np.ndarray, ref, tol: int = 40) -> float:
+    """和参考主色接近的像素占比（0~1）。
+
+    BOSS 血量条/图标这类 HUD，形状会随掉血/特效一直变（结构相似度靠不住），
+    但「整块还是不是那个颜色」很稳：BOSS 活着时一片暖色，死后变回背景色。
+    """
+    if patch is None or ref is None or patch.size == 0:
+        return 0.0
+    try:
+        dev = np.abs(patch.astype(np.int16) - np.asarray(ref, np.int16)).max(axis=2)
+        return float((dev <= max(1, int(tol))).mean())
+    except Exception:
+        return 0.0
+
+
+def bar_mask(patch: np.ndarray) -> np.ndarray:
+    """找出「像血条」的红/橙/黄/绿像素。
+
+    游戏里血条通常是高饱和的红/橙/绿，背景是蓝色天空/灰色场景。
+    只按亮度判断会被亮背景骗过去，所以这里按颜色找条带。
+    """
+    if patch.size == 0:
+        return np.zeros(patch.shape[:2], dtype=bool)
+    p = patch.astype(np.int16)
+    r, g, b = p[:, :, 0], p[:, :, 1], p[:, :, 2]
+    red = (r > 90) & (r > g + 25) & (r > b + 25)
+    green = (g > 90) & (g > r + 20) & (g > b + 10)
+    yellow = ((r > 120) & (g > 90) & (b < 110)
+              & (r >= g - 20) & (g > b + 30))
+    return red | green | yellow
+
+
+def bar_row_scores(patch: np.ndarray) -> np.ndarray:
+    mask = bar_mask(patch)
+    if mask.size == 0:
+        return np.zeros(0, dtype=float)
+    return mask.mean(axis=1)
+
+
+def bar_score(patch: np.ndarray, band=None) -> float:
+    """血条内容分数：条带里最像血条的那一行占整行的比例。
+
+    取「最大行」而不是整块平均：ROI 框大了也没关系，只要血条那一行有内容。
+    """
+    if patch.size == 0:
+        return 0.0
+    if band:
+        try:
+            y0, y1 = float(band[0]), float(band[1])
+            h = patch.shape[0]
+            a = max(0, min(h, int(round(y0 * h))))
+            b = max(a + 1, min(h, int(round(y1 * h))))
+            patch = patch[a:b]
+        except (TypeError, ValueError, IndexError):
+            pass
+    scores = bar_row_scores(patch)
+    return float(scores.max()) if scores.size else 0.0
+
+
+def bar_band(patch: np.ndarray, min_score: float = 0.05):
+    """从框选时的截图里找血条所在的行带，存成 ROI 内的相对坐标。"""
+    scores = bar_row_scores(patch)
+    if scores.size == 0 or float(scores.max()) < min_score:
+        return None
+    h = patch.shape[0]
+    best = int(scores.argmax())
+    y0 = max(0, best - 2)
+    y1 = min(h, best + 3)
+    return [round(y0 / max(1, h), 4), round(y1 / max(1, h), 4)]
 
 
 def signature(patch: np.ndarray, grid: int = 12) -> list[float]:
@@ -753,6 +880,16 @@ class DungeonRunner:
         self._last_frame = None
         self._switch_to: Optional[str] = None
         self._mode: Optional[str] = None   # 联动模式：farm / boss
+        # 开打时拍下来的「BOSS 血量图标」基准；图标没了就判死
+        self._boss_icon_sigs: list[list[float]] = []
+        self._boss_icon_color = None
+        self._hp_seen = False
+        self._hp_ocr_at = -1.0
+        self._hp_ocr_visible = True
+        self._last_hp_detail = ""
+        self._icon_checks = 0
+        self._icon_miss_shot = False
+        self._last_hp_metric = "图标相似度"
 
     # -- 日志 / 工具 --
     def log(self, text: str) -> None:
@@ -992,9 +1129,21 @@ class DungeonRunner:
             patch = crop_norm(frame, hp_spec["roi"])
             ratio = self.boss_hp_ratio()
             ink = ink_ratio(patch)
-            out["BOSS血条"] = (
+            extra = ""
+            if self._boss_icon_sigs:
+                grid = int((hp_spec or {}).get("grid", 12) or 12)
+                tol = float((hp_spec or {}).get("tol", 30.0) or 30.0)
+                csig = color_signature(patch, grid)
+                best = max(color_similarity(csig, ref, tol)
+                           for ref in self._boss_icon_sigs)
+                same = same_color_ratio(
+                    patch, getattr(self, "_boss_icon_color", None),
+                    int((hp_spec or {}).get("color_tol", 40) or 40))
+                extra = (f" / 同色 {same * 100:.0f}%"
+                         f" / 图标相似度 {best * 100:.0f}%")
+            out["BOSS血量图标"] = (
                 (f"亮度 {ratio * 100:.0f}%" if ratio is not None else "亮度读取失败")
-                + f" / 内容 {ink * 100:.0f}%"
+                + f" / 内容 {ink * 100:.0f}%" + extra
             )
         prog = self._progress_spec()
         if (prog or {}).get("roi"):
@@ -1221,8 +1370,8 @@ class DungeonRunner:
         """回放录制的鼠标宏（点击 + 按键），用归一化客户区坐标。
 
         点击走 WinGame.click_norm：允许抢占时是真实鼠标（点完还原光标/前台），
-        不允许抢占时是后台 PostMessage。多开时整段拿 _INPUT_LOCK，
-        不会和别的窗口抢鼠标。
+        不允许抢占时是后台 PostMessage。多开时每次点击各自拿 _INPUT_LOCK，
+        不会和别的窗口同时抢鼠标（但两个窗口的宏仍会交错执行）。
         """
         cfg = self.nav_macro()
         events = [e for e in (cfg.get("events") or []) if isinstance(e, dict)]
@@ -1492,24 +1641,42 @@ class DungeonRunner:
         self.log(f"疲劳 {current}（±{threshold}）→ 继续 {self._mode}")
         return self._mode
 
-    def decide_action(self) -> str:
-        """在打怪点读疲劳：< -阈值 打BOSS；> +阈值 打怪；中间用默认。"""
-        cfg = self.p.get("fatigue") or {}
-        if not cfg.get("enabled", True):
-            return str((self.p.get("loop") or {}).get("default_action") or "boss")
-        current, maximum, msg = self.fatigue_check()
-        if current is None:
-            default = str((self.p.get("loop") or {}).get("default_action") or "boss")
-            self.log(f"疲劳读不到（{msg}），按默认做：{default}")
-            return default
-        threshold = abs(int(cfg.get("threshold", 800) or 0))
-        action = self.action_for_fatigue(current)
-        self.log(f"当前疲劳 {current}/{maximum}（阈值 ±{threshold}）→ "
-                 + ("循环打 BOSS" if action == "boss" else "循环打怪"))
-        return action
-
     def _anchor_of(self, key: str) -> dict:
         return (self._farm().get(key) or {})
+
+    def boss_hp_bar_score(self) -> Optional[float]:
+        """BOSS 血条区域的「条带内容」分数（0~1）；没框/截图失败返回 None。"""
+        spec = self._anchor_of("boss_hp")
+        roi = (spec or {}).get("roi")
+        if not roi:
+            return None
+        frame = self.grab()
+        if frame is None:
+            return None
+        try:
+            patch = crop_norm(frame, roi)
+            return float(bar_score(patch, (spec or {}).get("band")))
+        except Exception:
+            return None
+
+    def boss_hp_ink(self) -> Optional[float]:
+        """BOSS 血条区域的「内容占比」（和背景不同的像素比例）；没框/截图失败返回 None。
+
+        boss_hp_visible() 里 mode=ink 会调它；之前只调不定义，
+        用旧标定（mode=ink）会直接 AttributeError。
+        """
+        spec = self._anchor_of("boss_hp")
+        roi = (spec or {}).get("roi")
+        if not roi:
+            return None
+        frame = self.grab()
+        if frame is None:
+            return None
+        try:
+            patch = crop_norm(frame, roi)
+            return float(ink_ratio(patch, int(spec.get("tol", 36) or 36)))
+        except Exception:
+            return None
 
     def boss_hp_ratio(self) -> Optional[float]:
         """BOSS 血条区域的亮度占比（0~1）；没框/截图失败返回 None。"""
@@ -1527,37 +1694,258 @@ class DungeonRunner:
         except Exception:
             return None
 
-    def boss_hp_visible(self) -> bool:
-        """BOSS 血条还在不在（在=没死）。—— 和 v3.24.0 tag 完全一致。
+    def _save_patch(self, patch, tag: str) -> str:
+        """把一块区域存成 png（排错用：确认程序截到的到底是哪块）。"""
+        folder = getattr(self.game, "snapshot_dir", "") or ""
+        if not folder:
+            return ""
+        try:
+            from PIL import Image
+            os.makedirs(folder, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%H%M%S")
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in tag)[:40]
+            path = os.path.join(folder, f"{stamp}_{safe}.png")
+            img = np.ascontiguousarray(patch[:, :, :3]).astype(np.uint8)
+            Image.fromarray(img).save(path)
+            return path
+        except Exception as exc:
+            self.log(f"区域截图保存失败：{exc}")
+            return ""
 
-        用「亮像素占比」判断：血条是亮的，空的血条槽/背景是暗的。
+    def capture_boss_icon(self, samples: int = 3, gap: float = 0.25) -> list:
+        """开打时把「你框住的那个 BOSS 血量图标」拍几张当基准。
+
+        存两样东西：
+          · 主色（这块区域开打时的颜色）→ 判死看「同色占比」；
+          · 结构签名 → 作为补充，形状没变也算还在。
+        原因是血条/图标会随掉血、特效一直变，单看形状会一开打就误判。
         """
         spec = self._anchor_of("boss_hp")
         roi = (spec or {}).get("roi")
+        self._boss_icon_sigs = []
+        self._boss_icon_color = None
+        self._icon_checks = 0
+        self._icon_miss_shot = False
+        self._last_hp_detail = ""
         if not roi:
-            return True  # 没框血条 → 用时间上限
-        ratio = self.boss_hp_ratio()
-        if ratio is None:
+            self.log("没框「BOSS 血量图标」→ 判死只能按打BOSS上限停"
+                     "（到「点位」里框一下打 BOSS 时出现的血量图标）")
+            return []
+        mode = str((spec or {}).get("mode", "icon") or "icon")
+        sim = float((spec or {}).get("sim", 0.75) or 0.75)
+        miss = max(1, int((spec or {}).get("miss", 3) or 3))
+        min_same = float((spec or {}).get("min_same", 0.35) or 0.35)
+        grid = int((spec or {}).get("grid", 12) or 12)
+        self.log(f"BOSS 血量图标已加载：x={float(roi[0]):.4f} y={float(roi[1]):.4f} "
+                 f"w={float(roi[2]):.4f} h={float(roi[3]):.4f}"
+                 f" / 方式 {mode} / 同色≥{min_same * 100:.0f}%"
+                 f" 或 相似度≥{sim * 100:.0f}% / miss {miss}")
+        sigs: list[list[float]] = []
+        patches = []
+        for i in range(max(1, int(samples))):
+            if self._stopping():
+                break
+            frame = self.grab()
+            if frame is not None:
+                try:
+                    patch = crop_norm(frame, roi)
+                    if not patches:
+                        self.log(f"图标区域实际像素：{patch.shape[1]}×{patch.shape[0]}")
+                    patches.append(patch)
+                    sig = color_signature(patch, grid)
+                    if sig and all(color_similarity(sig, old, 30.0) < 0.98
+                                   for old in sigs):
+                        sigs.append(sig)
+                except Exception as exc:
+                    self.log(f"图标区域解析失败：{exc}")
+            if i + 1 < samples:
+                self.game.sleep(max(0.0, float(gap)))
+        self._boss_icon_sigs = sigs
+        if patches:
+            try:
+                self._boss_icon_color = np.median(
+                    patches[0].reshape(-1, 3), axis=0
+                ).astype(np.int16)
+            except Exception:
+                self._boss_icon_color = None
+        if sigs and self._boss_icon_color is not None:
+            color = self._boss_icon_color
+            base_same = same_color_ratio(
+                patches[0], color, int((spec or {}).get("color_tol", 40) or 40))
+            self.log(f"BOSS 血量图标基准：主色 RGB"
+                     f"({color[0]},{color[1]},{color[2]})"
+                     f" / 开打同色 {base_same * 100:.0f}%"
+                     f" / 结构样本 {len(sigs)} 张")
+            path = self._save_patch(patches[0], "boss_icon_base")
+            if path:
+                self.log(f"基准截图已存：{path}")
+        else:
+            self._boss_icon_sigs = []
+            self.log("BOSS 血量图标基准没拍到 → 回退到亮度占比判死")
+        return self._boss_icon_sigs
+
+    def boss_icon_visible(self) -> bool:
+        """框住的 BOSS 血量图标还在不在（和开打时的样子比）。
+
+        两条信号，任一成立就算「还在」：
+          1) 和开打主色相同的像素占比 ≥ min_same（默认 35%）；
+          2) 结构相似度 ≥ sim（默认 75%）。
+        只用第 2 条会出问题：血条掉血/特效会把形状改掉，开打 1 秒就误判死亡。
+        """
+        spec = self._anchor_of("boss_hp")
+        roi = (spec or {}).get("roi")
+        sigs = self._boss_icon_sigs
+        color = getattr(self, "_boss_icon_color", None)
+        if not roi or (not sigs and color is None):
             return True
-        need = float(spec.get("min_fill",
-                              spec.get("min_ink", 0.15)) or 0.15)
-        self._last_hp_ratio = ratio
+        frame = self.grab()
+        if frame is None:
+            return True
+        try:
+            patch = crop_norm(frame, roi)
+        except Exception:
+            return True
+        color_tol = int((spec or {}).get("color_tol", 40) or 40)
+        min_same = float((spec or {}).get("min_same", 0.35) or 0.35)
+        sim = float((spec or {}).get("sim", 0.75) or 0.75)
+        tol = float((spec or {}).get("tol", 30.0) or 30.0)
+        grid = int((spec or {}).get("grid", 12) or 12)
+
+        same = same_color_ratio(patch, color, color_tol)
+        best = 0.0
+        if sigs:
+            try:
+                sig = color_signature(patch, grid)
+                best = max(color_similarity(sig, ref, tol) for ref in sigs)
+            except Exception:
+                best = 0.0
+        visible = (same >= min_same) or (best >= sim)
+        detail = (f"同色 {same * 100:.0f}%（<{min_same * 100:.0f}%）"
+                  f" / 相似 {best * 100:.0f}%（<{sim * 100:.0f}%）")
+        self._last_hp_detail = detail
+        self._last_hp_ratio = max(same, best)
+        self._last_hp_need = min_same
+        self._last_hp_metric = "同色/相似"
+
+        self._icon_checks = int(getattr(self, "_icon_checks", 0)) + 1
+        if self._icon_checks <= 3 or not visible:
+            self.log(f"图标比对 {self._icon_checks}：{detail} → "
+                     + ("还在" if visible else "不见了"))
+        if not visible and not getattr(self, "_icon_miss_shot", False):
+            self._icon_miss_shot = True
+            path = self._save_patch(patch, "boss_icon_miss")
+            if path:
+                self.log(f"「不像了」那一刻的截图已存：{path}")
+        return visible
+
+    def boss_hp_ocr_text(self) -> str:
+        """对「BOSS 血量图标」区域做 OCR（和主程序 BossWatcher 一样）。"""
+        spec = self._anchor_of("boss_hp")
+        roi = (spec or {}).get("roi")
+        if not roi:
+            return ""
+        frame = self.grab()
+        if frame is None:
+            return ""
+        w, h, data = frame
+        try:
+            rect = app.roi_from_norm(tuple(float(v) for v in roi), w, h)
+            with _OCR_LOCK:
+                return app.ocr_text_from_bgra(data, w, h, rect)
+        except Exception as exc:
+            self.log(f"血量 OCR 失败：{type(exc).__name__}: {exc}")
+            return ""
+
+    def boss_hp_ocr_visible(self) -> bool:
+        """按 OCR 读到的 BOSS 血量判断还在不在。
+
+        返回 False 只表示「这一次没读到」——连续 miss 次才由外层判死，
+        这样偶发 OCR 失败不会直接误杀。
+        """
+        spec = self._anchor_of("boss_hp")
+        every = max(0.5, float((spec or {}).get("ocr_every", 2.0) or 2.0))
+        now = self.game.now()
+        if now < self._hp_ocr_at:
+            return self._hp_ocr_visible
+        self._hp_ocr_at = now + every
+        text = self.boss_hp_ocr_text()
+        current, maximum = app.parse_hp_text(text)
+        if maximum is not None and (current is None
+                                    or maximum < current
+                                    or maximum > max(current * 20, 20)):
+            maximum = None          # 把等级数字读进最大值了，丢掉
+        kill_hp = max(0, int((spec or {}).get("kill_hp", 0) or 0))
+        if current is None:
+            self._hp_ocr_visible = False
+            snippet = "".join(str(text or "").split())[:24]
+            self._last_hp_detail = f"OCR 没读到血量（{snippet or '空'}）"
+        else:
+            first = not self._hp_seen
+            self._hp_seen = True
+            self._hp_ocr_visible = current > kill_hp
+            self._last_hp_detail = (f"血量 {current}/{maximum}" if maximum
+                                    else f"血量 {current}")
+            if first:
+                self.log(f"BOSS 血量 OCR 已生效：{self._last_hp_detail}")
+        self._last_hp_ratio = 1.0 if self._hp_ocr_visible else 0.0
+        self._last_hp_need = 1.0
+        self._last_hp_metric = "血量OCR"
+        return self._hp_ocr_visible
+
+    def boss_hp_visible(self) -> bool:
+        """BOSS 还在不在（在=没死）。
+
+        默认 mode=ocr：OCR 读「名字 + 当前/最大血量」（主程序 BossWatcher 同款）。
+        mode=bright：v3.24.0 tag 的亮像素占比；mode=icon：开打拍基准比图标。
+        """
+        spec = self._anchor_of("boss_hp")
+        if not (spec or {}).get("roi"):
+            return True  # 没框血条 → 用时间上限
+        mode = str(spec.get("mode", "ocr") or "ocr").lower()
+        if mode == "ocr":
+            return self.boss_hp_ocr_visible()
+        if mode == "icon":
+            if self._boss_icon_sigs:
+                return self.boss_icon_visible()
+            mode = "bright"      # 没基准 → 用 tag 的亮度占比兼底
+        if mode == "bright":
+            ratio = self.boss_hp_ratio()
+            if ratio is None:
+                return True
+            need = float(spec.get("min_fill",
+                                  spec.get("min_ink", 0.15)) or 0.15)
+            self._last_hp_ratio = ratio
+            self._last_hp_need = need
+            self._last_hp_metric = "亮度"
+            self._last_hp_detail = (f"亮度 {ratio * 100:.0f}%"
+                                    f"（<{need * 100:.0f}%）")
+            self._last_hp_bright = ratio
+            return ratio >= need
+        if mode == "ink":
+            ink = self.boss_hp_ink()
+            if ink is None:
+                return True
+            need = float(spec.get("min_ink", 0.02) or 0.02)
+            self._last_hp_ratio = ink
+            self._last_hp_need = need
+            self._last_hp_metric = "内容"
+            self._last_hp_detail = ""
+            return ink >= need
+        score = self.boss_hp_bar_score()
+        if score is None:
+            return True
+        need = float(spec.get("min_bar", 0.10) or 0.10)
+        self._last_hp_ratio = score
         self._last_hp_need = need
-        return ratio >= need
+        self._last_hp_metric = "条带"
+        self._last_hp_detail = ""
+        return score >= need
 
     def boss_present(self) -> bool:
         """「BOSS 身形」在不在（确认真的站到 BOSS 面前了）。"""
         spec = self._anchor_of("boss_present")
         if not (spec or {}).get("roi"):
             return True  # 没标就默认到了
-        frame = self.grab()
-        return bool(frame is not None and self.anchor_visible(spec, frame))
-
-    def finish_visible(self) -> bool:
-        """「打怪完成」标志出现没有。"""
-        spec = self._anchor_of("finish")
-        if not (spec or {}).get("roi"):
-            return False
         frame = self.grab()
         return bool(frame is not None and self.anchor_visible(spec, frame))
 
@@ -1595,7 +1983,7 @@ class DungeonRunner:
         return False
 
     def fight_until_finish(self) -> bool:
-        """③ 挂机打怪：每次平A都拾取；BOSS 血条消失（连续 N 次看不到）= 打完。"""
+        """③ 挂机打怪：每次平A都拾取；BOSS 血量图标消失（连续 N 次看不到）= 打完。"""
         farm = self._farm()
         loop = self.p.get("loop") or {}
         seconds = min(1000.0,
@@ -1613,15 +2001,38 @@ class DungeonRunner:
         need_miss = max(1, int((hp_spec or {}).get("miss", 3) or 3))
         poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
         loop_fat = float(loop.get("fatigue_every", 60.0) or 0.0)
-        watch_fatigue = bool((self.p.get("fatigue") or {}).get("enabled", True)) and loop_fat > 0
+        # 只有开了「打怪点 ↔ 打BOSS 联动」才在 BOSS 战里查疲劳，
+        # 否则查了也没地方可切，只会白白按一次疲劳图标。
+        watch_fatigue = (
+            bool(loop.get("link_fatigue", True))
+            and loop_fat > 0
+            and bool((self.p.get("fatigue") or {}).get("enabled", True))
+        )
 
         self.release_focus()
         self.log(f"开始打怪（上限 {seconds:.0f}s；"
-                 + ("BOSS 血条消失就算打完）" if (hp_spec or {}).get("roi")
-                    else "没框血条，按时间停）"))
+                 + ("BOSS 血量图标没了就算打完）" if (hp_spec or {}).get("roi")
+                    else "没框 BOSS 血量图标，只能按时间停）"))
+        self._hp_seen = False
+        self._hp_ocr_at = -1.0
+        self._hp_ocr_visible = True
+        hp_mode = str((hp_spec or {}).get("mode", "ocr") or "ocr").lower()
+        self._hp_mode = hp_mode
+        if (hp_spec or {}).get("roi"):
+            if hp_mode == "icon":
+                self.capture_boss_icon()
+            elif hp_mode == "ocr":
+                self.log(f"判死方式：OCR 读 BOSS 血量"
+                         f"（每 {float((hp_spec or {}).get('ocr_every', 2.0) or 2.0):.1f}s 读一次，"
+                         f"连续 {need_miss} 次读不到 = 打完）")
+            else:
+                self.log(f"判死方式：亮像素占比（v3.24.0 tag 同款）"
+                         f" / 阈值 {float((hp_spec or {}).get('min_fill', 0.15) or 0.15) * 100:.0f}%"
+                         f" / miss {need_miss}")
         start = self.game.now()
-        next_s1 = next_s2 = next_potion = next_pickup = next_hp = 0.0
-        next_fatigue = next_pickup = next_check = 0.0
+        next_s1 = next_s2 = 0.0
+        next_potion = next_hp = next_fatigue = next_check = 0.0
+        next_beat = 0.0
         next_pickup = pickup_every
         hp_low = False
         misses = 0
@@ -1660,25 +2071,62 @@ class DungeonRunner:
 
             if (hp_spec or {}).get("roi") and elapsed >= next_check:
                 next_check = elapsed + poll
-                if self.boss_hp_visible():
+                grace = float((hp_spec or {}).get("grace", 6.0) or 0.0)
+                if (getattr(self, "_hp_mode", "") == "ocr"
+                        and not self._hp_seen and elapsed < grace):
+                    # 刚开打血条可能还没显示出来，先给个宽限期，别急着判死
+                    visible = True
+                    self._last_hp_detail = f"等 BOSS 血量出现（宽限 {grace:.0f}s）"
+                else:
+                    visible = self.boss_hp_visible()
+                # 每 10 秒打一行「全部指标」，BOSS 死的时候到底哪个数变了，
+                # 看这一行就能判断，不用猜。
+                if elapsed >= next_beat:
+                    next_beat = elapsed + 10.0
+                    body_spec = self._anchor_of("boss_present")
+                    pres = ""
+                    if (body_spec or {}).get("roi"):
+                        bf = self.grab()
+                        if bf is not None:
+                            sim_b, _ink_b = self.anchor_metrics(body_spec, bf)
+                            pres = f" / BOSS身形相似 {sim_b:.2f}"
+                    self.log(f"血量监测（{elapsed:.0f}s）："
+                             f"{getattr(self, '_last_hp_detail', '')}{pres}")
+                if visible:
                     misses = 0
                 else:
                     misses += 1
                     ratio = getattr(self, "_last_hp_ratio", None)
                     need = getattr(self, "_last_hp_need", None)
+                    detail = getattr(self, "_last_hp_detail", "")
                     extra = ""
-                    if ratio is not None and need is not None:
-                        extra = f"（亮度 {ratio * 100:.0f}% < {need * 100:.0f}%）"
-                    self.log(f"BOSS 血条不见了（{misses}/{need_miss}）{extra}")
+                    if detail:
+                        extra = f"（{detail}）"
+                    elif ratio is not None and need is not None:
+                        metric = getattr(self, "_last_hp_metric", "亮度")
+                        extra = (f"（{metric} {ratio * 100:.0f}% < "
+                                 f"{need * 100:.0f}%）")
+                    self.log(f"BOSS 血量图标不见了（{misses}/{need_miss}）{extra}")
                     if misses >= need_miss:
-                        self.log(f"BOSS 血条连续 {misses} 次不见 → 判定打完")
+                        self.log(f"BOSS 血量图标连续 {misses} 次不见 → 判定打完")
+                        try:
+                            self.game.snapshot("boss_dead")
+                        except Exception:
+                            pass
                         break
 
             if watch_fatigue and elapsed >= next_fatigue:
                 next_fatigue = elapsed + loop_fat
                 current, maximum, _msg = self.fatigue_check()
                 if current is not None:
-                    self.log(f"打怪中查疲劳 {current}/{maximum}")
+                    threshold = abs(int((self.p.get("fatigue") or {}).get(
+                        "threshold", 600) or 0))
+                    self.log(f"打怪中查疲劳 {current}/{maximum}（阈值 ±{threshold}）")
+                    if threshold and self.action_for_fatigue(current) == "farm":
+                        # 涨到 +阈值：这轮 BOSS 收尾（拾取 → 退本），下一轮回打怪点
+                        self.log(f"疲劳 {current} > +{threshold} → 这轮 BOSS 收尾，"
+                                 "下一轮回打怪点打小怪")
+                        break
 
             self.game.sleep(interval)
         return True
@@ -1718,20 +2166,6 @@ class DungeonRunner:
                 self.log("疲劳 < -阈值 → 切到打BOSS（结束挂机）")
                 return True
         return True
-
-    # -- 兼容旧接口：固定时长打 BOSS 点 --
-    def farm_at_boss(self, seconds: Optional[float] = None) -> bool:
-        farm = self._farm()
-        loop = self.p.get("loop") or {}
-        if not self._goto(farm.get("boss_pt"),
-                          float(farm.get("travel_wait", 30.0)), "BOSS 点"):
-            return False
-        self.gap("到 BOSS 点后缓冲")
-        return self.combat(
-            min(1000.0, seconds if seconds is not None
-                else float(loop.get("boss_seconds", 120.0) or 120.0)),
-            desc="BOSS 点挂机",
-        )
 
     def combat(self, seconds: float, desc: str = "挂机",
                action: Optional[str] = None) -> bool:
@@ -1864,20 +2298,6 @@ class DungeonRunner:
         except Exception as exc:
             return None, None, f"疲劳识别异常：{type(exc).__name__}: {exc}"
 
-    def after_exit_fatigue(self) -> None:
-        """退出副本后读一次疲劳，只更新下一次该走哪个分支，不再定时挂机。"""
-        cfg = self.p.get("fatigue") or {}
-        if not cfg.get("enabled", True):
-            return
-        current, maximum, msg = self.fatigue_check()
-        if current is None:
-            self.log(f"疲劳检测失败（{msg}），按当前分支继续")
-            return
-        threshold = abs(int(cfg.get("threshold", 600) or 0))
-        self._mode = self.action_for_fatigue(current)
-        self.log(f"当前疲劳 {current}/{maximum}（±{threshold}）→ "
-                 f"下一轮走 {'打BOSS' if self._mode == 'boss' else '打怪点挂机'}")
-
     # -- ③ 退出副本 --
     def loot_before_exit(self) -> None:
         """打完 BOSS 再捡一轮，然后缓冲 1~2 秒（按 action_gap）。"""
@@ -2008,6 +2428,8 @@ class DungeonRunner:
         if self.nav_macro_enabled():
             self.log("用引路宏导航（鼠标宏）：进本/跑向 BOSS 不再点地图")
             if not self.play_nav_macro():
+                self.log("引路宏中途失败：角色可能停在副本里，"
+                         "下一轮开始前请先确认回到打怪点")
                 return self._failed("引路宏回放失败")
             spec = self._anchor_of("boss_present")
             if (spec or {}).get("roi"):
@@ -2028,9 +2450,15 @@ class DungeonRunner:
                     if not self.run_loops():
                         return self._failed("BOSS 点打怪失败")
                 else:
-                    return self._failed(
-                        "引路宏没到 BOSS（可勾「宏失败回退地图点位」）"
-                    )
+                    # 宏跑完人已经在副本里：先兜底退出去，
+                    # 否则下一轮又会从打怪点开始放宏，全程点错。
+                    self.log("引路宏没到 BOSS → 先兜底退出副本，"
+                             "避免下一轮卡在副本里（可勾「宏失败回退地图点位」）")
+                    self.loot_before_exit()
+                    if not self.exit_dungeon():
+                        self.log("兜底退出副本也失败，下一轮可能需要手动处理")
+                    self.gap("兜底退出后缓冲")
+                    return self._failed("引路宏没到 BOSS（已尝试退出副本）")
             else:
                 self.log("没框 BOSS 身形 → 引路宏跑完直接开打")
                 if not self.fight_until_finish():
@@ -2155,6 +2583,9 @@ def snapshot_dir() -> str:
 def probe(hwnd: int, profile: dict, seconds: float = 0.0) -> int:
     game = WinGame(hwnd, profile, dry=True)
     runner = DungeonRunner(game, profile, verbose=True)
+    if ((profile.get("farm") or {}).get("boss_hp") or {}).get("roi"):
+        # 先拿当前画面当基准，这样下面能显示「图标相似度」
+        runner.capture_boss_icon(samples=1, gap=0.0)
     cap = game.grab()
     if cap is None:
         print(f"后台截图失败：{game.last_error}")

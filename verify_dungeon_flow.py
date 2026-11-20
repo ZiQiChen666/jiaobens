@@ -168,7 +168,8 @@ def build_profile(**over):
             "boss_retry": 2,
             "boss_present": {"roi": ROI_BOSS_BODY, "sig": body_sig,
                              "grid": 12, "sim": 0.88},
-            "boss_hp": {"roi": ROI_BOSS_HP, "min_fill": 0.15, "miss": 2},
+            "boss_hp": {"roi": ROI_BOSS_HP, "mode": "bright",
+                        "min_fill": 0.15, "miss": 2},
         },
         "exit": {
             "exit_pt": list(PT_EXIT),
@@ -182,7 +183,7 @@ def build_profile(**over):
         },
         "fatigue": {"enabled": False, "threshold": 800,
                     "pt": [0.10, 0.90], "roi": [0.4, 0.05, 0.2, 0.05]},
-        "loop": {"boss_seconds": 60.0, "fatigue_every": 0, "max_switch": 0,
+        "loop": {"boss_seconds": 60.0, "fatigue_every": 0,
                  "default_action": "boss"},
         "detect": {"poll": 0.3},
         "retry": {"rounds": 1, "gap": 1.0, "max_fail": 2},
@@ -260,6 +261,7 @@ check("识别到 BOSS 身形 → 可以打", r5.goto_boss_point() is True)
 
 # ---- 5) 血条消失 = 打完；每次平A都拾取 -------------------------------
 game6 = FakeGame(hp_dead_after_a=8)
+game6.state["body"] = True      # 真实现场：打的时候图标/血条在，打完才消失
 logs6 = []
 r6 = df.DungeonRunner(game6, build_profile(), log=logs6.append)
 r6.hp_now = lambda: 5000
@@ -569,6 +571,160 @@ check("血条基准对比：血条没了 → 判死",
       f"ratio={getattr(r_hp, '_last_hp_ratio', None)} "
       f"need={getattr(r_hp, '_last_hp_need', None)}")
 
+# ---- 7i3) 血条判死三种 mode 都能跑（bar / bright / ink） -------------
+for _mode in ("bar", "bright", "ink"):
+    g_m = FakeGame()
+    g_m.state["body"] = True
+    p_m = build_profile()
+    hp_spec = dict(p_m["farm"]["boss_hp"], mode=_mode)
+    if _mode == "ink":
+        # ink 模式靠「外圈当背景」拿参考色，ROI 要留一圈背景
+        hp_spec["roi"] = [0.55, 0.02, 0.42, 0.14]
+    p_m["farm"]["boss_hp"] = hp_spec
+    r_m = df.DungeonRunner(g_m, p_m, log=lambda _s: None)
+    alive = r_m.boss_hp_visible()
+    g_m.a_count = 10 ** 9        # 血条消失
+    dead = r_m.boss_hp_visible()
+    check(f"血条判死 mode={_mode}：活着=True / 没了=False",
+          alive is True and dead is False, f"alive={alive} dead={dead}")
+
+# ---- 7i4) 默认判死：盯「图标/血条」还在不在（不靠颜色） -------------
+check("默认判死方式 = OCR 读血量（主程序同款）",
+      df.DEFAULT_PROFILE["farm"]["boss_hp"].get("mode") == "ocr",
+      str(df.DEFAULT_PROFILE["farm"]["boss_hp"]))
+_p_old = {"farm": {"boss_hp": {"roi": [0.6, 0.06, 0.34, 0.06],
+                              "mode": "bar", "min_bar": 0.1, "miss": 3}}}
+_p_new = df._normalize_profile(_p_old)
+check("旧标定 mode=bar → 回退成 ocr",
+      _p_new["farm"]["boss_hp"]["mode"] == "ocr",
+      str(_p_new["farm"]["boss_hp"]))
+_p_icon = {"farm": {"boss_hp": {"roi": [0.6, 0.06, 0.34, 0.06],
+                               "mode": "icon", "use_icon": True}}}
+check("写 use_icon=true 才保留 icon 模式",
+      df._normalize_profile(_p_icon)["farm"]["boss_hp"]["mode"] == "icon")
+check("只写 mode=icon（没 use_icon）也回退 ocr",
+      df._normalize_profile(
+          {"farm": {"boss_hp": {"roi": [0, 0, 1, 1], "mode": "icon"}}}
+      )["farm"]["boss_hp"]["mode"] == "ocr")
+
+p_icon4 = build_profile()
+p_icon4["farm"]["boss_hp"] = dict(p_icon4["farm"]["boss_hp"],
+                                 mode="icon", use_icon=True)
+g_icon = FakeGame()
+g_icon.state["body"] = True
+r_icon = df.DungeonRunner(g_icon, p_icon4, log=lambda _s: None)
+sigs_icon = r_icon.capture_boss_icon(samples=2, gap=0.0)
+check("开打时拍到了图标基准", len(sigs_icon) >= 1, str(len(sigs_icon)))
+check("图标还在 → 没死", r_icon.boss_hp_visible() is True)
+g_icon.a_count = 10 ** 9      # BOSS 死了，图标/血条消失
+dead_icon = r_icon.boss_hp_visible()
+check("图标没了 → 判死", dead_icon is False,
+      f"相似度={getattr(r_icon, '_last_hp_ratio', None)}")
+
+# 打一局：图标消失后要提前结束，而不是硬打满上限
+g_fs = FakeGame(hp_dead_after_a=6)
+g_fs.state["body"] = True
+p_fs = build_profile()
+p_fs["loop"] = dict(p_fs["loop"], boss_seconds=60.0)
+logs_fs = []
+r_fs = df.DungeonRunner(g_fs, p_fs, log=logs_fs.append)
+r_fs.hp_now = lambda: 5000
+_t0 = g_fs.t
+r_fs.fight_until_finish()
+check("图标消失 → 提前结束（没等到 60s 上限）",
+      g_fs.t - _t0 < 30.0, f"{g_fs.t - _t0:.1f}s")
+check("日志里写了「判定打完」",
+      any("判定打完" in l for l in logs_fs), str(logs_fs[-3:]))
+
+# ---- 7i5) 真实数据的坑：打斗中形状在变，不能因此判死 -----------------
+class IconGame(FakeGame):
+    """复刻 23:53 那次的现场（参数取自程序自己存的 base/miss/dead 截图）：
+
+    · 开打：一片暖色 224,207,177（同色 98%）；
+    · 打斗中 1 秒后：颜色还在，但形状被特效/掉血改掉（同色 64% / 相似 69%）；
+    · 真死：整块变成冷色 163,178,185（同色 2%）。
+    """
+
+    def __init__(self, mode="alive"):
+        super().__init__()
+        self.mode = mode
+
+    def grab(self):
+        arr = np.full((H, W, 4), 40, np.uint8)
+        arr[..., 3] = 255
+        y0, y1, x0, x1 = 7, 14, 120, 188
+        if self.mode == "alive":
+            arr[y0:y1, x0:x1] = [224, 207, 177, 255]
+        elif self.mode == "fight":
+            arr[y0:y1, x0:x1] = [224, 207, 177, 255]
+            arr[y0:y1, x0:x0 + 20] = [60, 70, 90, 255]
+            arr[y0 + 2:y0 + 5, x0 + 24:x1 - 4] = [190, 175, 150, 255]
+        else:                      # dead
+            arr[y0:y1, x0:x1] = [163, 178, 185, 255]
+        return (W, H, arr.tobytes())
+
+
+p_ic5 = build_profile()
+p_ic5["farm"]["boss_hp"] = dict(p_ic5["farm"]["boss_hp"],
+                               mode="icon", use_icon=True)
+g_ic = IconGame("alive")
+logs_ic = []
+r_ic = df.DungeonRunner(g_ic, p_ic5, log=logs_ic.append)
+r_ic.capture_boss_icon(samples=2, gap=0.0)
+check("图标基准：主色记下来了", r_ic._boss_icon_color is not None)
+check("开打时判活着", r_ic.boss_hp_visible() is True)
+g_ic.mode = "fight"
+logs_ic.clear()
+check("打斗中形状变了也算活着（不误判）",
+      r_ic.boss_hp_visible() is True, str(logs_ic))
+g_ic.mode = "dead"
+logs_ic.clear()
+check("真死了才判死", r_ic.boss_hp_visible() is False, str(logs_ic))
+check("判死日志写清同色/相似两个数",
+      any("同色" in l and "相似" in l for l in logs_ic), str(logs_ic))
+
+# ---- 7i6) OCR 判死（主程序 BossWatcher 同款）------------------------
+p_ocr = build_profile()
+p_ocr["farm"]["boss_hp"] = {"roi": ROI_BOSS_HP, "mode": "ocr", "kill_hp": 0,
+                            "miss": 2, "ocr_every": 0.5, "grace": 0.0}
+p_ocr["loop"] = dict(p_ocr["loop"], boss_seconds=60.0)
+_texts = {"i": 0,
+          "seq": (["冰牙鲨 18000/18000 10"] * 4
+                  + ["冰牙鲨 16000/18000"] * 2
+                  + [""] * 8)}
+_real_ocr = df.app.ocr_text_from_bgra
+
+
+def _fake_ocr(data, w, h, rect):
+    i = min(_texts["i"], len(_texts["seq"]) - 1)
+    _texts["i"] += 1
+    return _texts["seq"][i]
+
+
+df.app.ocr_text_from_bgra = _fake_ocr
+try:
+    g_ocr = FakeGame(hp_dead_after_a=10 ** 9)
+    g_ocr.state["body"] = True
+    logs_ocr = []
+    r_ocr = df.DungeonRunner(g_ocr, p_ocr, log=logs_ocr.append)
+    r_ocr.hp_now = lambda: 5000
+    _t_ocr = g_ocr.t
+    r_ocr.fight_until_finish()
+    check("OCR 判死：读到血量时判活着",
+          any("OCR 已生效：血量 18000" in l for l in logs_ocr),
+          str(logs_ocr[:4]))
+    check("OCR 判死：读不到血量连续 N 次 → 打完",
+          g_ocr.t - _t_ocr < 30.0, f"{g_ocr.t - _t_ocr:.1f}s")
+    check("OCR 判死：日志写了「判定打完」",
+          any("判定打完" in l for l in logs_ocr), str(logs_ocr[-3:]))
+    _texts["i"] = 0
+    _texts["seq"] = ["冰牙鲨 0/18000 10"]
+    r_ocr._hp_seen = False
+    r_ocr._hp_ocr_at = -1.0
+    check("OCR 读到 0 血 → 立刻判死", r_ocr.boss_hp_visible() is False)
+finally:
+    df.app.ocr_text_from_bgra = _real_ocr
+
 # ---- 7j) 引路宏：回放录制的点击/按键 -------------------------------
 p_nav = build_profile()
 p_nav["nav_macro"] = {
@@ -593,6 +749,70 @@ check("引路宏点到了地图点",
       len(clicks_near(g_nav.actions, PT_DUNGEON, 0.02)) == 1,
       str(g_nav.actions[:4]))
 
+# ---- 7k) 引路宏没到 BOSS 且不回退 → 先兜底退本 --------------------
+p_navfail = build_profile()
+p_navfail["nav_macro"] = {
+    "enabled": True,
+    "fallback": False,
+    "speed": 1.0,
+    "events": [{"type": "key_down", "t": 0.0, "name": "m"}],
+}
+g_navfail = FakeGame(body_appears=False)
+logs_navfail = []
+r_navfail = df.DungeonRunner(g_navfail, p_navfail, log=logs_navfail.append)
+r_navfail.hp_now = lambda: 5000
+ok_navfail = r_navfail.boss_round()
+clicks_navfail = [a[1] for a in g_navfail.actions if a[0] == "click"]
+check("引路宏没到 BOSS → 本轮算失败", ok_navfail is False)
+check("引路宏没到 BOSS → 兜底点了「退出副本」",
+      PT_EXIT in clicks_navfail, str(clicks_navfail))
+check("兜底退本也点了「确认」", PT_EXIT_OK in clicks_navfail, str(clicks_navfail))
+check("日志写清了为什么要兜底退本",
+      any("兜底退出副本" in l for l in logs_navfail),
+      str([l for l in logs_navfail if "兜底" in l][-2:]))
+
+# ---- 7l) 打BOSS途中疲劳 >+阈值 → 这轮收尾（而不是硬打满上限）---------
+p_mid = build_profile()
+p_mid["loop"] = dict(p_mid["loop"], boss_seconds=300.0, fatigue_every=1.0,
+                     link_fatigue=True)
+p_mid["fatigue"] = {"enabled": True, "threshold": 600,
+                    "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
+g_mid = FakeGame(hp_dead_after_a=10 ** 9)
+g_mid.state["body"] = True      # 血条一直在，只能靠疲劳结束
+logs_mid = []
+r_mid = df.DungeonRunner(g_mid, p_mid, log=logs_mid.append)
+r_mid.hp_now = lambda: 5000
+r_mid.fatigue_check = lambda: (700, 1000, "")
+t0 = g_mid.t
+r_mid.fight_until_finish()
+check("打BOSS途中疲劳 >+阈值 → 提前收尾（不到上限 300s）",
+      g_mid.t - t0 < 60.0, f"{g_mid.t - t0:.1f}s")
+check("日志写了「收尾」",
+      any("收尾" in l for l in logs_mid), str(logs_mid[-3:]))
+
+# 关掉联动时不在 BOSS 战里查疲劳（查了也没地方可切）
+p_mid2 = build_profile()
+p_mid2["loop"] = dict(p_mid2["loop"], boss_seconds=2.0, fatigue_every=0.5,
+                      link_fatigue=False)
+p_mid2["fatigue"] = {"enabled": True, "threshold": 600,
+                     "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
+g_mid2 = FakeGame(hp_dead_after_a=10 ** 9)
+g_mid2.state["body"] = True
+calls = {"n": 0}
+logs_mid2 = []
+r_mid2 = df.DungeonRunner(g_mid2, p_mid2, log=logs_mid2.append)
+r_mid2.hp_now = lambda: 5000
+
+
+def _fat_count():
+    calls["n"] += 1
+    return 700, 1000, ""
+
+
+r_mid2.fatigue_check = _fat_count
+r_mid2.fight_until_finish()
+check("关掉联动 → BOSS 战里不查疲劳", calls["n"] == 0, f"查了 {calls['n']} 次")
+
 # ---- 8) 配置检查 ----------------------------------------------------
 check("配置里有 BOSS 身形 / BOSS 血条",
       "boss_present" in df.DEFAULT_PROFILE["farm"]
@@ -608,6 +828,11 @@ check("联动配置在默认里",
       df.DEFAULT_PROFILE["loop"].get("link_fatigue") is True
       and "farm_seconds" not in df.DEFAULT_PROFILE["loop"]
       and 5.0 <= df.DEFAULT_PROFILE["loop"]["boss_seconds"] <= 1000.0)
+check("旧键已清掉（max_switch / finish）",
+      "max_switch" not in df.DEFAULT_PROFILE["loop"]
+      and "finish" not in df.DEFAULT_PROFILE["farm"])
+check("打完 BOSS 的补拾取次数写进默认配置",
+      df.DEFAULT_PROFILE["farm"].get("pickup_times") == 3)
 check("疲劳阈值默认 600", df.DEFAULT_PROFILE["fatigue"]["threshold"] == 600)
 check("识别阈值可配（sim / sim_loose / poll）",
       all(k in df.DEFAULT_PROFILE["detect"]

@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(3, 25, 2, 0),
-    prodvers=(3, 25, 2, 0),
+    filevers=(3, 25, 6, 0),
+    prodvers=(3, 25, 6, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -13,12 +13,12 @@ VSVersionInfo(
     StringFileInfo([
       StringTable('080404B0', [
         StringStruct('CompanyName', 'CreatureCurios'),
-        StringStruct('FileDescription', 'CreatureCurios 后台按键器 v3.25.2（恢复 v3.24.0 tag 的 BOSS 死亡判定）'),
-        StringStruct('FileVersion', '3.25.2.0'),
+        StringStruct('FileDescription', 'CreatureCurios 后台按键器 v3.25.6（BOSS 判死改成 OCR 读血量，和主程序 BossWatcher 同款）'),
+        StringStruct('FileVersion', '3.25.6.0'),
         StringStruct('InternalName', 'CreatureCuriosKeyer'),
         StringStruct('OriginalFilename', 'CreatureCuriosKeyer.exe'),
         StringStruct('ProductName', 'CreatureCurios 后台按键器'),
-        StringStruct('ProductVersion', '3.25.2.0')
+        StringStruct('ProductVersion', '3.25.6.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
