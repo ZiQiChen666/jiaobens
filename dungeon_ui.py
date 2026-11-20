@@ -765,6 +765,26 @@ class DungeonTab(QWidget):
         self.lbl_hp.setObjectName("muted")
         g.addWidget(self.lbl_hp, 7, 1, 1, 3)
 
+        row_pt = QHBoxLayout()
+        self.chk_potion_timer = QCheckBox("定时喝药")
+        self.chk_potion_timer.setChecked(False)
+        self.chk_potion_timer.setToolTip(
+            "不管血量，开打先按一次，之后固定间隔再按（适合 60 秒的 buff 药）"
+        )
+        self.chk_potion_timer.toggled.connect(self._save_from_ui)
+        row_pt.addWidget(self.chk_potion_timer)
+        row_pt.addWidget(QLabel("按键"))
+        self.edit_potion_timer_key = QLineEdit("q")
+        self.edit_potion_timer_key.setFixedWidth(50)
+        self.edit_potion_timer_key.editingFinished.connect(self._save_from_ui)
+        row_pt.addWidget(self.edit_potion_timer_key)
+        row_pt.addWidget(QLabel("每"))
+        self.spin_potion_timer = self._dspin(5.0, 600.0, 60.0, None, 0, 0)
+        row_pt.addWidget(self.spin_potion_timer)
+        row_pt.addWidget(_hint("秒按一次（和上面「低于血量阈值喝药」互不影响）"), 1)
+        row_pt.addStretch(1)
+        g.addLayout(row_pt, 8, 0, 1, 4)
+
         # ---------- BOSS / 打怪 循环 ----------
         self.chk_link = QCheckBox("打怪点挂机 ↔ 打BOSS 联动（按疲劳切换）")
         self.chk_link.setChecked(True)
@@ -1323,6 +1343,12 @@ class DungeonTab(QWidget):
                 float(loop.get("boss_seconds", farm.get("seconds", 120.0)) or 120.0)
             )
             self.spin_hp.setValue(int(farm.get("hp_threshold", 0) or 0))
+            self.chk_potion_timer.setChecked(
+                bool(farm.get("potion_timer_enabled", False)))
+            self.edit_potion_timer_key.setText(
+                str(farm.get("potion_timer_key") or "q"))
+            self.spin_potion_timer.setValue(
+                float(farm.get("potion_timer_every", 60.0) or 60.0))
             self.spin_potion.setValue(float(farm.get("potion_every", 6.0)))
             self.spin_pickup.setValue(float(farm.get("pickup_every", 8.0)))
             self.chk_skills.setChecked(bool(farm.get("use_skills", True)))
@@ -1461,6 +1487,9 @@ class DungeonTab(QWidget):
             "potion_every": float(self.spin_potion.value()),
             "pickup_every": float(self.spin_pickup.value()),
             "use_skills": bool(self.chk_skills.isChecked()),
+            "potion_timer_enabled": bool(self.chk_potion_timer.isChecked()),
+            "potion_timer_key": self.edit_potion_timer_key.text().strip() or "q",
+            "potion_timer_every": float(self.spin_potion_timer.value()),
         })
         p.setdefault("keys", {}).update({
             "open_map": self.edit_map_key.text().strip() or "m",

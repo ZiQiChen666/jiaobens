@@ -34,6 +34,8 @@ answers = {
     "seconds": 45.0,
     "hp_threshold": 2000,
     "potion_every": 6.0,
+    "potion_timer_enabled": True,
+    "potion_timer_every": 45.0,
     "pickup_every": 9.0,
     "use_skills": True,
     "fatigue_enabled": True,
@@ -59,6 +61,12 @@ check("进本加载 10s", profile["enter"]["load_wait"] == 10.0)
 check("跑向 BOSS 30s", profile["farm"]["travel_wait"] == 30.0)
 check("BOSS 战上限", profile["loop"]["boss_seconds"] == 45.0)
 check("喝药间隔 6s", profile["farm"]["potion_every"] == 6.0)
+check("定时喝药 45s（按键默认 q）",
+      profile["farm"]["potion_timer_enabled"] is True
+      and profile["farm"]["potion_timer_every"] == 45.0
+      and profile["farm"]["potion_timer_key"] == "q",
+      str({k: profile["farm"].get(k) for k in
+           ("potion_timer_enabled", "potion_timer_every", "potion_timer_key")}))
 check("拾取间隔", profile["farm"]["pickup_every"] == 9.0)
 check("退出后加载 10s", profile["exit"]["settle"] == 10.0)
 check("退出两个点", profile["exit"]["exit_pt"] == [0.94, 0.05]

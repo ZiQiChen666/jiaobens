@@ -922,6 +922,69 @@ check("真实点击前后有屏蔽/恢复输入",
       "block_user_input(True)" in _grab_src
       and "block_user_input(False)" in _grab_src)
 
+# ---- 定时喝药（不管血量，每 N 秒按一次）---------------------------
+p_tim = build_profile()
+p_tim["farm"].update({"hp_threshold": 0, "potion_every": 0.0,
+                      "potion_timer_enabled": True,
+                      "potion_timer_key": "q", "potion_timer_every": 10.0})
+g_tim = FakeGame()
+logs_tim = []
+r_tim = df.DungeonRunner(g_tim, p_tim, log=logs_tim.append)
+r_tim.hp_now = lambda: None
+r_tim.combat(25.0, desc="定时喝药验证")
+q_tim = [a for a in g_tim.actions if a == ("tap", "q")]
+check("打怪 25 秒 → 定时喝药按 3 次（0/10/20s）", len(q_tim) == 3,
+      str(len(q_tim)))
+check("日志写明定时喝药", any("定时喝药" in l for l in logs_tim), str(logs_tim[:3]))
+
+p_tim2 = build_profile()
+p_tim2["farm"].update({"hp_threshold": 0, "potion_every": 0.0,
+                       "potion_timer_enabled": True,
+                       "potion_timer_key": "q", "potion_timer_every": 10.0})
+p_tim2["loop"] = dict(p_tim2["loop"], boss_seconds=25.0)
+g_tim2 = FakeGame(hp_dead_after_a=10 ** 9)
+g_tim2.state["body"] = True
+r_tim2 = df.DungeonRunner(g_tim2, p_tim2, log=lambda _s: None)
+r_tim2.hp_now = lambda: 5000
+r_tim2.fight_until_finish()
+q_tim2 = [a for a in g_tim2.actions if a == ("tap", "q")]
+check("打BOSS 也定时喝药（25s → 3 次）", len(q_tim2) == 3, str(len(q_tim2)))
+
+# 没开定时喝药就不该按 q
+p_notim = build_profile()
+p_notim["farm"].update({"hp_threshold": 0, "potion_every": 0.0,
+                        "potion_timer_enabled": False})
+g_notim = FakeGame()
+r_notim = df.DungeonRunner(g_notim, p_notim, log=lambda _s: None)
+r_notim.hp_now = lambda: None
+r_notim.combat(12.0, desc="不喝药验证")
+check("没勾定时喝药 → 一次 q 都不按",
+      not any(a == ("tap", "q") for a in g_notim.actions),
+      str([a for a in g_notim.actions if a[0] == "tap"][:8]))
+
+# hp_now 必须现拍（以前复用旧帧 → 血满的旧图 → 永远不喝药）
+g_fresh = FakeGame()
+r_fresh = df.DungeonRunner(g_fresh, build_profile(), log=lambda _s: None)
+_grabs = {"n": 0}
+_real_grab = r_fresh.grab
+
+
+def _count_grab():
+    _grabs["n"] += 1
+    return _real_grab()
+
+
+r_fresh.grab = _count_grab
+r_fresh._last_frame = (2, 2, bytes(16))
+_real_hp_ocr = df.app.ocr_hp_from_bgra
+df.app.ocr_hp_from_bgra = lambda data, w, h, rect: (100, 200, "")
+try:
+    check("hp_now 会现拍一张（不复用进本前的旧帧）",
+          r_fresh.hp_now() == 100 and _grabs["n"] == 1,
+          f"grab={_grabs['n']}")
+finally:
+    df.app.ocr_hp_from_bgra = _real_hp_ocr
+
 # ---- 多开不互相卡节奏：OCR 抢不到锁就跳过，不挡攻击 ----
 check("能识别「多开的兄弟窗口」标题",
       df.is_game_title("CreatureCurios - 冰牙鲨鱼") is True
