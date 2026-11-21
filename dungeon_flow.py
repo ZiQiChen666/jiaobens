@@ -157,8 +157,10 @@ DEFAULT_PROFILE: dict = {
         "hp_roi": None,            # 血量数字区域（框了才按血量喝药）
         "hp_threshold": 1600,
         "hp_check_every": 2.0,
-        "potion_keys": ["q"],      # 血量低于阈值时只按 Q
-        "potion_every": 6.0,       # 喝药间隔（低于阈值时每 6 秒喝一次）
+        "potion_keys": ["q", "w", "e"],  # 低于阈值时依次按 Q、W、E
+        "potion_every": 6.0,             # 低于阈值时，每 6 秒喝一次
+        "potion_timer_enabled": False,   # 定时喝药（不管血量，每 N 秒按一次）
+        "potion_timer_every": 60.0,      # 定时喝药间隔（默认 60 秒）
         "pickup_every": 8.0,       # 挂机期间每隔几秒按一次拾取
         "pickup_times": 3,         # 打完 BOSS、退出前再拾取几次
     },
@@ -194,6 +196,9 @@ DEFAULT_PROFILE: dict = {
         "roi": None,               # 疲劳提示文字区域；空则用主界面已框的
         "low": -600,               # 疲劳下限：< 下限 → 去打BOSS
         "high": 600,               # 疲劳上限：> 上限 → 回打怪点打小怪
+        "hold_seconds": 3.0,       # 点住疲劳图标等提示框的时间（太短读不到）
+        "poll": 0.3,               # 期间每隔多久截一次图
+        "retry": 2,                # 读不到就再点几次
     },
     "detect": {
         "poll": 0.2,        # 轮询间隔（越小越灵敏）
@@ -607,6 +612,8 @@ class WinGame:
         self._user_fg = 0
         self._logged_target = False
         self._block_input_ok: Optional[bool] = None   # None=还没试过
+        self._hold_saved_cursor = None
+        self._hold_saved_focus = 0
 
     # -- 基础 --
     def now(self) -> float:
@@ -842,7 +849,7 @@ class WinGame:
             self.last_error = f"PostMessage 失败：{exc}"
             return False
 
-    def click_norm(self, point) -> bool:
+    def click_norm(self, point, keep_cursor: bool = False) -> bool:
         if not point:
             return False
         try:
@@ -859,7 +866,7 @@ class WinGame:
             self.log(f"[DRY] click ({x},{y})")
             return True
         if self.foreground_mode() and self.allow_grab():
-            return self._grab_click(x, y)
+            return self._grab_click(x, y, keep_cursor=keep_cursor)
         if self.profile.get("prime_activate", True):
             app.prime_background_input(self.hwnd, activate=True)
         ok = app.post_click_client(self.hwnd, x, y)
@@ -867,7 +874,7 @@ class WinGame:
             self.last_error = "后台点击发送失败"
         return ok
 
-    def _grab_click(self, x: int, y: int) -> bool:
+    def _grab_click(self, x: int, y: int, keep_cursor: bool = False) -> bool:
         """真实鼠标点击：整段拿全局输入锁，点完光标/前台都还原。
 
         多开时 4 个窗口共用 _INPUT_LOCK，所以不会出现 A 窗口把光标移到
@@ -887,7 +894,7 @@ class WinGame:
                     else:
                         self.log("点击时屏蔽外部鼠标键盘失败（需要以管理员运行）"
                                  "→ 不屏蔽，继续点击")
-            if hybrid:
+            if hybrid or keep_cursor:
                 try:
                     saved_cursor = win32api.GetCursorPos()
                 except Exception:
@@ -909,22 +916,49 @@ class WinGame:
                     self.sleep(0.04)
                     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
                     self.sleep(0.08)
+                    if keep_cursor:
+                        # 「按住不放」：光标/前台先别还原，让游戏把提示框弹出来
+                        self._hold_saved_cursor = saved_cursor
+                        self._hold_saved_focus = self._focus_saved
+                        self._focus_saved = 0
                     return True
                 except Exception as exc:
                     self.last_error = f"真实鼠标点击失败：{exc}"
                     self.log(self.last_error)
                     return False
             finally:
-                if hybrid and saved_cursor is not None:
-                    try:
-                        win32api.SetCursorPos(saved_cursor)
-                    except Exception:
-                        pass
-                # 用户要求：抢完鼠标键盘要回到原来的界面。
-                if hybrid:
-                    self.release_focus(quiet=True)
+                if not keep_cursor:
+                    if hybrid and saved_cursor is not None:
+                        try:
+                            win32api.SetCursorPos(saved_cursor)
+                        except Exception:
+                            pass
+                    # 用户要求：抢完鼠标键盘要回到原来的界面。
+                    if hybrid:
+                        self.release_focus(quiet=True)
                 if blocked:
                     block_user_input(False)
+
+    def release_hold(self) -> None:
+        """结束「按住不放」（疲劳提示那种）：把光标/前台还原。"""
+        saved = getattr(self, "_hold_saved_cursor", None)
+        focus = int(getattr(self, "_hold_saved_focus", 0) or 0)
+        self._hold_saved_cursor = None
+        self._hold_saved_focus = 0
+        if saved is None and not focus:
+            return
+        with _INPUT_LOCK:
+            if saved is not None:
+                try:
+                    win32api.SetCursorPos(saved)
+                except Exception:
+                    pass
+            if focus:
+                try:
+                    if int(win32gui.GetForegroundWindow() or 0) == self.hwnd:
+                        app._force_foreground_window(focus)
+                except Exception:
+                    pass
 
     def tap(self, name: str, hold: float = 0.05) -> bool:
         """后台投递按键（前台模式下也用投递，避免输入法把按键吃掉）。"""
@@ -1188,15 +1222,28 @@ class DungeonRunner:
         return False
 
     def hp_now(self):
-        """OCR 当前血量；没配区域返回 None。"""
-        frame = self._last_frame or self.grab()
+        """OCR 当前血量；没配区域返回 None。
+
+        必须**现拍一张**：_last_frame 在打怪阶段还是进本前的旧图（血是满的），
+        用它判断会永远"血够"、一直不喝药。
+        """
         roi = self._farm().get("hp_roi")
-        if frame is None or not roi:
+        if not roi:
+            return None
+        frame = self.grab()
+        if frame is None:
             return None
         w, h, data = frame
         try:
             rect = app.roi_from_norm(tuple(float(v) for v in roi), w, h)
-            current, _maximum, _text = app.ocr_hp_from_bgra(data, w, h, rect)
+            if _OCR_LOCK.acquire(timeout=1.5):
+                try:
+                    current, _maximum, _text = app.ocr_hp_from_bgra(
+                        data, w, h, rect)
+                finally:
+                    _OCR_LOCK.release()
+            else:
+                return None          # 别的窗口在 OCR，这次先跳过
             return current
         except Exception as exc:
             self.log(f"血量识别异常：{type(exc).__name__}: {exc}")
@@ -2148,6 +2195,8 @@ class DungeonRunner:
         hp_threshold = int(farm.get("hp_threshold", 0) or 0)
         hp_every = float(farm.get("hp_check_every", 2.0) or 2.0)
         use_skills = bool(farm.get("use_skills", True))
+        timer_on = bool(farm.get("potion_timer_enabled", False))
+        timer_every = float(farm.get("potion_timer_every", 60.0) or 0.0)
         hp_spec = self._anchor_of("boss_hp")
         need_miss = max(1, int((hp_spec or {}).get("miss", 3) or 3))
         poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
@@ -2173,6 +2222,9 @@ class DungeonRunner:
         self.restore_user_foreground()
         self.log("打BOSS：A/技能/拾取全部后台 PostMessage 发送"
                  "（窗口不用在前台）")
+        if timer_on and timer_every > 0:
+            self.log(f"定时喝药：开打先按一次「{'、'.join(potion_keys)}」，之后每 "
+                     f"{timer_every:.0f}s 一次")
         if (hp_spec or {}).get("roi"):
             if hp_mode == "icon":
                 self.capture_boss_icon()
@@ -2189,7 +2241,9 @@ class DungeonRunner:
         next_potion = next_hp = next_fatigue = next_check = 0.0
         next_beat = 0.0
         next_pickup = pickup_every
+        next_timer_potion = 0.0
         hp_low = False
+        hp_low_logged = False
         misses = 0
         while not self._stopping():
             elapsed = self.game.now() - start
@@ -2213,12 +2267,27 @@ class DungeonRunner:
                     next_hp = elapsed + hp_every
                     if current is not None:
                         hp_low = current < hp_threshold
+                        if hp_low and not hp_low_logged:
+                            hp_low_logged = True
+                            self.log(f"血量 {current} < {hp_threshold} → 喝药"
+                                     f"「{'、'.join(potion_keys)}」"
+                                     f"（每 {potion_every:.0f}s 一次，"
+                                     "血够了就停）")
+                        elif not hp_low:
+                            hp_low_logged = False
             else:
                 hp_low = True
             if hp_low and potion_every > 0 and elapsed >= next_potion:
                 for key in potion_keys:
                     self.game.tap(key)
                 next_potion = elapsed + potion_every
+
+            # 定时喝药（不管血量）：每 N 秒按一次
+            if (timer_on and timer_every > 0 and potion_keys
+                    and elapsed >= next_timer_potion):
+                for key in potion_keys:
+                    self.game.tap(key)
+                next_timer_potion = elapsed + timer_every
 
             if not pickup_on_a and pickup_every > 0 and elapsed >= next_pickup:
                 self.game.tap(pickup_key)
@@ -2353,16 +2422,23 @@ class DungeonRunner:
         hp_threshold = int(farm.get("hp_threshold", 0) or 0)
         hp_every = float(farm.get("hp_check_every", 2.0) or 2.0)
         use_skills = bool(farm.get("use_skills", True))
+        timer_on = bool(farm.get("potion_timer_enabled", False))
+        timer_every = float(farm.get("potion_timer_every", 60.0) or 0.0)
 
         self.release_focus()
         self.log(f"{desc}：{seconds:.0f}s（喝药 {potion_every:.0f}s / "
                  f"拾取 {pickup_every:.0f}s）")
+        if timer_on and timer_every > 0:
+            self.log(f"定时喝药：开打先按一次「{'、'.join(potion_keys)}」，之后每 "
+                     f"{timer_every:.0f}s 一次")
         start = self.game.now()
         next_s1 = next_s2 = 0.0
         next_potion = 0.0
         next_pickup = pickup_every
         next_hp_check = 0.0
+        next_timer_potion = 0.0
         hp_low = False
+        hp_low_logged = False
 
         pickup_on_a = bool(farm.get("pickup_on_a", True))
         bg_warned = False
@@ -2408,8 +2484,14 @@ class DungeonRunner:
                     next_hp_check = elapsed + hp_every
                     if current is not None:
                         hp_low = current < hp_threshold
-                        if self.verbose and hp_low:
-                            self.log(f"血量 {current} < {hp_threshold}，喝药")
+                        if hp_low and not hp_low_logged:
+                            hp_low_logged = True
+                            self.log(f"血量 {current} < {hp_threshold} → 喝药"
+                                     f"「{'、'.join(potion_keys)}」"
+                                     f"（每 {potion_every:.0f}s 一次，"
+                                     "血够了就停）")
+                        elif not hp_low:
+                            hp_low_logged = False
             else:
                 hp_low = True  # 没框血量就按固定间隔喝
 
@@ -2417,6 +2499,13 @@ class DungeonRunner:
                 for key in potion_keys:
                     self.game.tap(key)
                 next_potion = elapsed + potion_every
+
+            # 定时喝药（不管血量）：每 N 秒按一次
+            if (timer_on and timer_every > 0 and potion_keys
+                    and elapsed >= next_timer_potion):
+                for key in potion_keys:
+                    self.game.tap(key)
+                next_timer_potion = elapsed + timer_every
 
             if pickup_every > 0 and elapsed >= next_pickup:
                 self.game.tap(pickup_key)
@@ -2439,7 +2528,14 @@ class DungeonRunner:
             return None
 
     def fatigue_check(self):
-        """点一下疲劳图标 → OCR 读「当前疲劳值」；返回 (当前, 最大, 说明)。"""
+        """点住疲劳图标 → 等提示框弹出来 → OCR 读「当前疲劳值」。
+
+        返回 (当前, 最大, 说明)。要点：
+          · 点完**光标停在图标上不还原**（hold_seconds，默认 3 秒），
+            否则鼠标一移开游戏就把提示框收起来，OCR 永远读到空的；
+          · 这 3 秒里每 poll 秒截一次图，读到就提前结束；
+          · 还是读不到就再点一次（retry，默认 2 次）。
+        """
         roi = self.fatigue_roi()
         if not roi:
             return None, None, "没有疲劳区域（主界面也没框过）"
@@ -2450,17 +2546,60 @@ class DungeonRunner:
                 float(roi[0]) + float(roi[2]) / 2.0,
                 float(roi[1]) + float(roi[3]) / 2.0,
             ]
-        self.game.click_norm(pt)
-        self.game.sleep(1.0)
-        frame = self.grab()
-        if frame is None:
-            return None, None, "截图失败"
-        w, h, data = frame
-        try:
-            rect = app.roi_from_norm(tuple(float(v) for v in roi), w, h)
-            return app.ocr_fatigue_from_bgra(data, w, h, rect)
-        except Exception as exc:
-            return None, None, f"疲劳识别异常：{type(exc).__name__}: {exc}"
+        hold = max(0.5, float(cfg.get("hold_seconds", 3.0) or 3.0))
+        poll = max(0.1, float(cfg.get("poll", 0.3) or 0.3))
+        tries = max(1, int(cfg.get("retry", 2) or 2))
+        last_msg = "没读到疲劳"
+        for attempt in range(1, tries + 1):
+            if self._stopping():
+                break
+            try:
+                clicked = self.game.click_norm(pt, keep_cursor=True)
+            except TypeError:          # 兼容没有 keep_cursor 的假窗口/旧实现
+                clicked = self.game.click_norm(pt)
+            if not clicked:
+                last_msg = "点疲劳图标失败"
+            end = self.game.now() + hold
+            got = None
+            while not self._stopping() and self.game.now() < end:
+                self.game.sleep(poll)
+                frame = self.grab()
+                if frame is None:
+                    last_msg = "截图失败"
+                    continue
+                w, h, data = frame
+                try:
+                    rect = app.roi_from_norm(tuple(float(v) for v in roi), w, h)
+                    if _OCR_LOCK.acquire(timeout=2.0):
+                        try:
+                            cur, mx, msg = app.ocr_fatigue_from_bgra(
+                                data, w, h, rect)
+                        finally:
+                            _OCR_LOCK.release()
+                    else:
+                        cur, mx, msg = None, None, "OCR 正忙（别的窗口）"
+                except Exception as exc:
+                    cur, mx, msg = (None, None,
+                                    f"疲劳识别异常：{type(exc).__name__}: {exc}")
+                last_msg = msg
+                if cur is not None:
+                    got = (cur, mx, msg)
+                    break
+            # 松开：光标/前台还给你
+            fn = getattr(self.game, "release_hold", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+            if got:
+                if attempt > 1 or self.verbose:
+                    self.log(f"疲劳：第 {attempt} 次点击读到了 {got[0]}/{got[1]}")
+                return got
+            if attempt < tries:
+                self.log(f"疲劳：点住 {hold:.0f}s 没读到（{last_msg}）→ 再点一次")
+                self.game.sleep(0.4)
+        return None, None, last_msg
 
     # -- ③ 退出副本 --
     def loot_before_exit(self) -> None:

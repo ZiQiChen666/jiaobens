@@ -765,6 +765,22 @@ class DungeonTab(QWidget):
         self.lbl_hp.setObjectName("muted")
         g.addWidget(self.lbl_hp, 7, 1, 1, 3)
 
+        row_pt = QHBoxLayout()
+        self.chk_potion_timer = QCheckBox("定时喝药（不管血量）")
+        self.chk_potion_timer.setChecked(False)
+        self.chk_potion_timer.setToolTip(
+            "开打先按一次，之后每 N 秒按一次（适合 60 秒的 buff 药）；"
+            "和「血量低于阈值喝药」互不影响"
+        )
+        self.chk_potion_timer.toggled.connect(self._save_from_ui)
+        row_pt.addWidget(self.chk_potion_timer)
+        row_pt.addWidget(QLabel("每"))
+        self.spin_potion_timer = self._dspin(5.0, 600.0, 60.0, None, 0, 0)
+        row_pt.addWidget(self.spin_potion_timer)
+        row_pt.addWidget(_hint("秒按一次（按键用下面那栏的「喝药键」）"), 1)
+        row_pt.addStretch(1)
+        g.addLayout(row_pt, 8, 0, 1, 4)
+
         # ---------- BOSS / 打怪 循环 ----------
         self.chk_link = QCheckBox("打怪点挂机 ↔ 打BOSS 联动（按疲劳切换）")
         self.chk_link.setChecked(True)
@@ -874,7 +890,8 @@ class DungeonTab(QWidget):
         row_keys.addWidget(self.edit_pickup_key)
         row_keys.addWidget(QLabel("喝药键"))
         self.edit_potion_key = QLineEdit()
-        self.edit_potion_key.setFixedWidth(44)
+        self.edit_potion_key.setFixedWidth(90)
+        self.edit_potion_key.setToolTip("可以写多个，用逗号隔开：q,w,e（依次按）")
         self.edit_potion_key.editingFinished.connect(self._save_from_ui)
         row_keys.addWidget(self.edit_potion_key)
         self.chk_skills = QCheckBox("放技能 1/2")
@@ -1323,6 +1340,10 @@ class DungeonTab(QWidget):
                 float(loop.get("boss_seconds", farm.get("seconds", 120.0)) or 120.0)
             )
             self.spin_hp.setValue(int(farm.get("hp_threshold", 0) or 0))
+            self.chk_potion_timer.setChecked(
+                bool(farm.get("potion_timer_enabled", False)))
+            self.spin_potion_timer.setValue(
+                float(farm.get("potion_timer_every", 60.0) or 60.0))
             self.spin_potion.setValue(float(farm.get("potion_every", 6.0)))
             self.spin_pickup.setValue(float(farm.get("pickup_every", 8.0)))
             self.chk_skills.setChecked(bool(farm.get("use_skills", True)))
@@ -1369,7 +1390,8 @@ class DungeonTab(QWidget):
             self.edit_map_key.setText(str(keys.get("open_map", "m")))
             self.edit_pickup_key.setText(str(keys.get("pickup", "space")))
             self.edit_potion_key.setText(
-                str((farm.get("potion_keys") or ["q"])[0])
+                ",".join(str(k) for k in
+                         (farm.get("potion_keys") or ["q", "w", "e"]))
             )
             wh = p.get("warehouse") or {}
             self.chk_warehouse.setChecked(bool(wh.get("enabled", True)))
@@ -1474,9 +1496,14 @@ class DungeonTab(QWidget):
         })
         p.setdefault("farm", {})["travel_wait"] = float(self.spin_boss_wait.value())
         p.setdefault("exit", {})["settle"] = float(self.spin_exit_settle.value())
-        p.setdefault("farm", {})["potion_keys"] = [
-            self.edit_potion_key.text().strip() or "q"
-        ]
+        _raw_keys = (self.edit_potion_key.text() or "").replace("，", ",")
+        _raw_keys = _raw_keys.replace(" ", ",").replace("、", ",")
+        _keys = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+        p.setdefault("farm", {})["potion_keys"] = _keys or ["q", "w", "e"]
+        p.setdefault("farm", {}).update({
+            "potion_timer_enabled": bool(self.chk_potion_timer.isChecked()),
+            "potion_timer_every": float(self.spin_potion_timer.value()),
+        })
         p.setdefault("warehouse", {}).update({
             "enabled": bool(self.chk_warehouse.isChecked()),
             "esc_times": int(self.spin_esc_times.value()),

@@ -455,9 +455,9 @@ r_nolink.run_round()
 check("关掉联动 → 直接走 BOSS 流程",
       PT_DUNGEON in [a[1] for a in g_nolink.actions if a[0] == "click"])
 
-# ---- 7g) 自动喝药：只按 Q，血量低于阈值每 6 秒一次 ------------------
+# ---- 7g) 自动喝药：低于阈值按 Q/W/E，每 6 秒一次，血够了就停 -------
 p_pot = build_profile()
-p_pot["farm"]["potion_keys"] = ["q"]
+p_pot["farm"]["potion_keys"] = ["q", "w", "e"]
 p_pot["farm"]["potion_every"] = 6.0
 p_pot["farm"]["hp_threshold"] = 1600
 p_pot["loop"] = dict(p_pot["loop"], boss_seconds=20.0)
@@ -468,10 +468,16 @@ r_pot = df.DungeonRunner(g_pot, p_pot, log=logs_pot.append)
 r_pot.hp_now = lambda: 900          # 一直低于阈值
 r_pot.fight_until_finish()
 taps_pot = [a[1] for a in g_pot.actions if a[0] == "tap"]
-check("血量低于阈值 → 按 Q", "q" in taps_pot, str(taps_pot[:12]))
-check("不再按 W", "w" not in taps_pot, str([t for t in taps_pot if t == "w"][:3]))
+check("血量低于阈值 → 按 Q/W/E", all(k in taps_pot for k in "qwe"),
+      str(taps_pot[:12]))
+_med = [t for t in taps_pot if t in ("q", "w", "e")]
+check("Q/W/E 是依次按的（q,w,e,q,w,e…）",
+      _med[:6] == ["q", "w", "e", "q", "w", "e"], str(_med[:8]))
 q_times = taps_pot.count("q")
 check("20 秒内大概按了 3 次 Q（6 秒一次）", 2 <= q_times <= 4, f"Q×{q_times}")
+check("日志写了「喝药…每 6s 一次」",
+      any("喝药" in l and "6s" in l for l in logs_pot),
+      str([l for l in logs_pot if "喝药" in l][:2]))
 
 g_pot2 = FakeGame(hp_dead_after_a=100000)
 g_pot2.state["body"] = True
@@ -479,7 +485,29 @@ r_pot2 = df.DungeonRunner(g_pot2, p_pot, log=lambda _s: None)
 r_pot2.hp_now = lambda: 9000        # 血量充足
 r_pot2.fight_until_finish()
 check("血量充足 → 不喝药",
-      "q" not in [a[1] for a in g_pot2.actions if a[0] == "tap"])
+      not any(a[1] in ("q", "w", "e") for a in g_pot2.actions if a[0] == "tap"))
+
+# 血从低回到阈值以上 → 停止喝药
+p_rec = build_profile()
+p_rec["farm"].update({"potion_keys": ["q", "w", "e"], "potion_every": 6.0,
+                      "hp_threshold": 1600, "hp_check_every": 2.0})
+g_rec = FakeGame()
+r_rec = df.DungeonRunner(g_rec, p_rec, log=lambda _s: None)
+_hp_seq = [900] * 5 + [5000] * 20
+_hp_i = {"i": 0}
+
+
+def _hp_next():
+    v = _hp_seq[min(_hp_i["i"], len(_hp_seq) - 1)]
+    _hp_i["i"] += 1
+    return v
+
+
+r_rec.hp_now = _hp_next
+r_rec.combat(14.0, desc="喝药验证")
+_med2 = [a[1] for a in g_rec.actions if a[0] == "tap" and a[1] in ("q", "w", "e")]
+check("血量回到阈值以上 → 不再喝药（只在低血时按了 2 轮）",
+      len(_med2) == 6, str(_med2))
 
 # ---- 7h) 一键放入仓库：两个点位 + ESC 两次 + 0.5s 缓冲 ---------------
 p_wh = build_profile()
@@ -819,7 +847,8 @@ check("配置里有 BOSS 身形 / BOSS 血条",
       and "boss_hp" in df.DEFAULT_PROFILE["farm"])
 check("弹窗盲点阈值在配置里",
       "blind_confirm_after" in df.DEFAULT_PROFILE["enter"])
-check("喝药默认只按 Q", df.DEFAULT_PROFILE["farm"]["potion_keys"] == ["q"])
+check("喝药默认按 Q/W/E",
+      df.DEFAULT_PROFILE["farm"]["potion_keys"] == ["q", "w", "e"])
 check("仓库配置在默认里",
       all(k in df.DEFAULT_PROFILE["warehouse"]
           for k in ("enabled", "icon_pt", "deposit_pt", "gap", "esc_times"))
@@ -921,6 +950,104 @@ _grab_src = _inspect.getsource(df.WinGame._grab_click)
 check("真实点击前后有屏蔽/恢复输入",
       "block_user_input(True)" in _grab_src
       and "block_user_input(False)" in _grab_src)
+
+# ---- 定时喝药（不管血量，每 N 秒按一次 Q/W/E）----
+p_tim = build_profile()
+p_tim["farm"].update({"hp_threshold": 0, "potion_every": 0.0,
+                      "potion_keys": ["q", "w", "e"],
+                      "potion_timer_enabled": True,
+                      "potion_timer_every": 10.0})
+g_tim = FakeGame()
+logs_tim = []
+r_tim = df.DungeonRunner(g_tim, p_tim, log=logs_tim.append)
+r_tim.hp_now = lambda: None
+r_tim.combat(25.0, desc="定时喝药验证")
+_med3 = [a[1] for a in g_tim.actions if a[0] == "tap" and a[1] in ("q", "w", "e")]
+check("定时喝药 25s → 3 轮 Q/W/E（9 次）", len(_med3) == 9, str(len(_med3)))
+check("定时喝药日志", any("定时喝药" in l for l in logs_tim), str(logs_tim[:3]))
+
+# ---- 疲劳：点住不放 + 轮询 + 读不到就重试 ---------------------------
+class HoldGame(FakeGame):
+    def __init__(self):
+        super().__init__()
+        self.clicks = []
+        self.holds = 0
+        self.ready_at = 0.0
+
+    def click_norm(self, point, keep_cursor=False):
+        self.clicks.append((tuple(round(float(v), 3) for v in point),
+                            bool(keep_cursor)))
+        return True
+
+    def release_hold(self):
+        self.holds += 1
+
+
+_real_fat_ocr = df.app.ocr_fatigue_from_bgra
+
+
+def _make_fat_ocr(game):
+    def _ocr(data, w, h, rect):
+        if game.t >= game.ready_at:
+            return 900, 1000, ""
+        return None, None, "还没弹出来"
+    return _ocr
+
+
+p_fat = build_profile()
+p_fat["fatigue"] = {"enabled": True, "low": -600, "high": 600,
+                    "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05],
+                    "hold_seconds": 3.0, "poll": 0.3, "retry": 2}
+
+g_fat = HoldGame()
+g_fat.ready_at = 1.2          # 提示框 1.2 秒后才弹出来
+df.app.ocr_fatigue_from_bgra = _make_fat_ocr(g_fat)
+try:
+    r_fat = df.DungeonRunner(g_fat, p_fat, log=lambda _s: None)
+    got_fat = r_fat.fatigue_check()
+finally:
+    df.app.ocr_fatigue_from_bgra = _real_fat_ocr
+check("疲劳：点完光标留在图标上（keep_cursor）",
+      bool(g_fat.clicks) and g_fat.clicks[0][1] is True, str(g_fat.clicks[:2]))
+check("疲劳：提示框 1.2s 才出来也能读到", got_fat[0] == 900, str(got_fat))
+check("疲劳：读完松开光标/前台", g_fat.holds == 1, str(g_fat.holds))
+check("疲劳：读到就提前结束（没死等 3s）", g_fat.t < 2.6, f"{g_fat.t:.1f}s")
+
+g_fat2 = HoldGame()
+g_fat2.ready_at = 999         # 永远读不到
+df.app.ocr_fatigue_from_bgra = _make_fat_ocr(g_fat2)
+try:
+    r_fat2 = df.DungeonRunner(g_fat2, p_fat, log=lambda _s: None)
+    got_fat2 = r_fat2.fatigue_check()
+finally:
+    df.app.ocr_fatigue_from_bgra = _real_fat_ocr
+check("疲劳：读不到会再点（共 2 次）", len(g_fat2.clicks) == 2,
+      str(len(g_fat2.clicks)))
+check("疲劳：每次点完都松开（2 次）", g_fat2.holds == 2, str(g_fat2.holds))
+check("疲劳：最终返回读不到", got_fat2[0] is None, str(got_fat2))
+check("疲劳：每次按住 hold_seconds（≥6s）", g_fat2.t >= 6.0, f"{g_fat2.t:.1f}s")
+
+# ---- hp_now：现拍 + OCR 串行 ----------------------------------------
+g_fresh = FakeGame()
+r_fresh = df.DungeonRunner(g_fresh, build_profile(), log=lambda _s: None)
+_grabs = {"n": 0}
+_real_grab = r_fresh.grab
+
+
+def _count_grab():
+    _grabs["n"] += 1
+    return _real_grab()
+
+
+r_fresh.grab = _count_grab
+r_fresh._last_frame = (2, 2, bytes(16))
+_real_hp = df.app.ocr_hp_from_bgra
+df.app.ocr_hp_from_bgra = lambda data, w, h, rect: (100, 200, "")
+try:
+    check("hp_now 现拍一张（不用进本前的旧帧）",
+          r_fresh.hp_now() == 100 and _grabs["n"] == 1, f"grab={_grabs['n']}")
+finally:
+    df.app.ocr_hp_from_bgra = _real_hp
 
 # ---- 多开不互相卡节奏：OCR 抢不到锁就跳过，不挡攻击 ----
 check("能识别「多开的兄弟窗口」标题",
