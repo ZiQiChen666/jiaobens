@@ -166,9 +166,10 @@ DEFAULT_PROFILE: dict = {
     },
     "loop": {
         "link_fatigue": True,      # 打怪点挂机 ↔ 打BOSS 联动（按疲劳上下限切换）
-        "fatigue_every": 60.0,     # 打怪/挂机时每隔多少秒查一次疲劳（多开每个窗口独立查）
+        "fatigue_every": 90.0,     # 打怪/挂机时每隔多少秒查一次疲劳（默认 90 秒 = 1 分半）
         "boss_seconds": 120.0,     # BOSS 战上限（血条一直不消失时兜底；最大 1000s）
         "default_action": "farm",  # 疲劳在中间区间时做哪个：boss / farm
+        "boss_count": 1,           # 一只副本里要打几只 BOSS（分身怪要 3 只才算过）
     },
     "warehouse": {
         "enabled": True,
@@ -374,6 +375,16 @@ def _normalize_profile(p: dict) -> dict:
                 # v3.25.12：默认改成 Q/W/E（老标定升级）
                 farm_cfg["potion_keys"] = ["q", "w", "e"]
             p.setdefault("farm", {}).update(farm_cfg)
+        loop_cfg = (p.get("loop") or {})
+        if isinstance(loop_cfg, dict):
+            try:
+                fe = float(loop_cfg.get("fatigue_every", 90.0) or 90.0)
+            except (TypeError, ValueError):
+                fe = 90.0
+            if fe in (60.0, 64.0, 66.0):
+                # v3.25.13：默认改成 90 秒（1 分半）查一次疲劳
+                loop_cfg["fatigue_every"] = 90.0
+            p.setdefault("loop", {}).update(loop_cfg)
         fat = (p.get("fatigue") or {})
         if isinstance(fat, dict):
             if fat.get("low") is None or fat.get("high") is None:
@@ -1027,6 +1038,7 @@ class DungeonRunner:
         self._hp_ocr_skips = 0
         self._hp_skipped = False
         self._hp_ocr_logged = False
+        self._hp_ocr_busy = 0
         self._last_hp_detail = ""
         self._icon_checks = 0
         self._icon_miss_shot = False
@@ -1246,14 +1258,19 @@ class DungeonRunner:
         w, h, data = frame
         try:
             roi_norm = tuple(float(v) for v in roi)
-            if _OCR_LOCK.acquire(timeout=1.5):
-                try:
-                    current, maximum, text = app.ocr_hp_from_bgra(
-                        data, w, h, roi_norm)
-                finally:
-                    _OCR_LOCK.release()
-            else:
-                return None          # 别的窗口在 OCR，这次先跳过
+            # 多开时 OCR 引擎是共用的：先不阻塞抢一下，抢不到再等 0.6 秒，
+            # 还抢不到就这轮跳过（不让某个窗口一直霸占/一直等）。
+            got_lock = _OCR_LOCK.acquire(blocking=False)
+            if not got_lock:
+                got_lock = _OCR_LOCK.acquire(timeout=0.6)
+            if not got_lock:
+                self._hp_ocr_busy += 1
+                return None
+            try:
+                current, maximum, text = app.ocr_hp_from_bgra(
+                    data, w, h, roi_norm)
+            finally:
+                _OCR_LOCK.release()
             if not self._hp_ocr_logged:
                 self._hp_ocr_logged = True
                 if current is None:
@@ -2235,10 +2252,11 @@ class DungeonRunner:
         use_skills = bool(farm.get("use_skills", True))
         timer_on = bool(farm.get("potion_timer_enabled", False))
         timer_every = float(farm.get("potion_timer_every", 60.0) or 0.0)
+        self._hp_ocr_logged = False
         hp_spec = self._anchor_of("boss_hp")
         need_miss = max(1, int((hp_spec or {}).get("miss", 3) or 3))
         poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
-        loop_fat = float(loop.get("fatigue_every", 60.0) or 0.0)
+        loop_fat = float(loop.get("fatigue_every", 90.0) or 0.0)
         # 只有开了「打怪点 ↔ 打BOSS 联动」才在 BOSS 战里查疲劳，
         # 否则查了也没地方可切，只会白白按一次疲劳图标。
         watch_fatigue = (
@@ -2288,6 +2306,8 @@ class DungeonRunner:
         next_timer_potion = 0.0
         hp_low = False
         hp_low_logged = False
+        hp_miss = 0
+        hp_fallback_logged = False
         misses = 0
         while not self._stopping():
             elapsed = self.game.now() - start
@@ -2310,6 +2330,7 @@ class DungeonRunner:
                     current = self.hp_now()
                     next_hp = elapsed + hp_every
                     if current is not None:
+                        hp_miss = 0
                         hp_low = current < hp_threshold
                         if hp_low and not hp_low_logged:
                             hp_low_logged = True
@@ -2319,6 +2340,14 @@ class DungeonRunner:
                                      "血够了就停）")
                         elif not hp_low:
                             hp_low_logged = False
+                    else:
+                        hp_miss += 1
+                        if hp_miss >= 3:
+                            hp_low = True
+                            if not hp_fallback_logged:
+                                hp_fallback_logged = True
+                                self.log("血量连续 3 次读不到（可能别的窗口在 OCR）"
+                                         "→ 先按固定间隔喝药兜底")
             else:
                 hp_low = True
             if hp_low and potion_every > 0 and elapsed >= next_potion:
@@ -2416,7 +2445,7 @@ class DungeonRunner:
         """
         farm = self._farm()
         loop = self.p.get("loop") or {}
-        every = max(10.0, float(loop.get("fatigue_every", 60.0) or 60.0))
+        every = max(10.0, float(loop.get("fatigue_every", 90.0) or 90.0))
         if not farm.get("farm_pt"):
             self.log("没标「打怪点」，没法挂机（请到「副本流程」页标一下）")
             return False
@@ -2451,7 +2480,7 @@ class DungeonRunner:
         """
         self._switch_to = None
         loop = self.p.get("loop") or {}
-        fatigue_every = float(loop.get("fatigue_every", 60.0) or 0.0)
+        fatigue_every = float(loop.get("fatigue_every", 90.0) or 0.0)
         fatigue_cfg = self.p.get("fatigue") or {}
         watch = bool(
             action and fatigue_every > 0 and fatigue_cfg.get("enabled", True)
@@ -2469,6 +2498,7 @@ class DungeonRunner:
         timer_on = bool(farm.get("potion_timer_enabled", False))
         timer_every = float(farm.get("potion_timer_every", 60.0) or 0.0)
 
+        self._hp_ocr_logged = False
         self.release_focus()
         self.log(f"{desc}：{seconds:.0f}s（喝药 {potion_every:.0f}s / "
                  f"拾取 {pickup_every:.0f}s）")
@@ -2489,6 +2519,8 @@ class DungeonRunner:
         next_timer_potion = 0.0
         hp_low = False
         hp_low_logged = False
+        hp_miss = 0
+        hp_fallback_logged = False
 
         pickup_on_a = bool(farm.get("pickup_on_a", True))
         bg_warned = False
@@ -2533,6 +2565,7 @@ class DungeonRunner:
                     current = self.hp_now()
                     next_hp_check = elapsed + hp_every
                     if current is not None:
+                        hp_miss = 0
                         hp_low = current < hp_threshold
                         if hp_low and not hp_low_logged:
                             hp_low_logged = True
@@ -2542,6 +2575,14 @@ class DungeonRunner:
                                      "血够了就停）")
                         elif not hp_low:
                             hp_low_logged = False
+                    else:
+                        hp_miss += 1
+                        if hp_miss >= 3:
+                            hp_low = True      # 读不到就按固定间隔喝，别见死不救
+                            if not hp_fallback_logged:
+                                hp_fallback_logged = True
+                                self.log("血量连续 3 次读不到（可能别的窗口在 OCR）"
+                                         "→ 先按固定间隔喝药兜底")
             else:
                 hp_low = True  # 没框血量就按固定间隔喝
 
@@ -2790,6 +2831,10 @@ class DungeonRunner:
         勾了「引路宏」时，进本 + 跑到 BOSS 这段改播放录制的鼠标宏，
         不再依赖地图点位；宏跑完若没看到 BOSS 身形，可选择回退到地图点位。
         """
+        loop_cfg = self.p.get("loop") or {}
+        kills = max(1, min(9, int(loop_cfg.get("boss_count", 1) or 1)))
+        if kills > 1:
+            self.log(f"本副本要打 {kills} 只 BOSS（分身怪）")
         if self.nav_macro_enabled():
             self.log("用引路宏导航（鼠标宏）：进本/跑向 BOSS 不再点地图")
             if not self.play_nav_macro():
@@ -2806,13 +2851,13 @@ class DungeonRunner:
                 self.wait_scene_still(still_s, still_t, still_d)
                 self.gap("到 BOSS 点后缓冲")
                 if self.wait_until(spec, 6.0, "BOSS 身形"):
-                    if not self.fight_until_finish():
+                    if not self._fight_clones(kills, at_boss=True):
                         return self._failed("BOSS 点打怪失败")
                 elif self.nav_macro().get("fallback", False):
                     self.log("引路宏没识别到 BOSS 身形 → 回退到地图点位")
                     if not self.enter_dungeon():
                         return self._failed("进副本失败")
-                    if not self.run_loops():
+                    if not self._fight_clones(kills):
                         return self._failed("BOSS 点打怪失败")
                 else:
                     # 宏跑完人已经在副本里：先兜底退出去，
@@ -2826,12 +2871,12 @@ class DungeonRunner:
                     return self._failed("引路宏没到 BOSS（已尝试退出副本）")
             else:
                 self.log("没框 BOSS 身形 → 引路宏跑完直接开打")
-                if not self.fight_until_finish():
+                if not self._fight_clones(kills, at_boss=True):
                     return self._failed("BOSS 点打怪失败")
         else:
             if not self.enter_dungeon():
                 return self._failed("进副本失败")
-            if not self.run_loops():
+            if not self._fight_clones(kills):
                 return self._failed("BOSS 点打怪失败")
         self.loot_before_exit()
         if not self.exit_dungeon():
@@ -2843,6 +2888,22 @@ class DungeonRunner:
         if wh.get("enabled", True) and str(wh.get("after", "exit")) == "exit":
             if not self.deposit_to_warehouse():
                 return self._failed("放入仓库失败")
+        return True
+
+    def _fight_clones(self, kills: int, at_boss: bool = False) -> bool:
+        """打 kills 只 BOSS（分身怪要打完 3 只才算通过副本）。"""
+        kills = max(1, min(9, int(kills or 1)))
+        for i in range(1, kills + 1):
+            if self._stopping():
+                return False
+            if kills > 1:
+                self.log(f"—— BOSS 分身 {i}/{kills} ——")
+            if i == 1 and at_boss:
+                ok = self.fight_until_finish()
+            else:
+                ok = self.run_loops()      # 回地图重新点 BOSS 点，再打下一只
+            if not ok:
+                return False
         return True
 
     def _failed(self, reason: str) -> bool:

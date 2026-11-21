@@ -729,7 +729,7 @@ class DungeonTab(QWidget):
         pair(3, 0, "喝药间隔", "spin_potion", 1.0, 60.0, 6.0)
         pair(3, 2, "拾取间隔", "spin_pickup", 0.0, 120.0, 8.0)
         pair(4, 0, "打BOSS上限", "spin_seconds", 5.0, 1000.0, 120.0)
-        pair(4, 2, "查疲劳间隔", "spin_fatigue_every", 10.0, 600.0, 60.0)
+        pair(4, 2, "查疲劳间隔", "spin_fatigue_every", 10.0, 600.0, 90.0)
 
         g.addWidget(QLabel("没弹窗重试"), 5, 0)
         self.spin_retry = QSpinBox()
@@ -780,6 +780,25 @@ class DungeonTab(QWidget):
         row_pt.addWidget(_hint("秒按一次（按键用下面那栏的「喝药键」）"), 1)
         row_pt.addStretch(1)
         g.addLayout(row_pt, 8, 0, 1, 4)
+
+        row_clone = QHBoxLayout()
+        self.chk_boss_clone = QCheckBox("BOSS 有分身（打完继续打下一只）")
+        self.chk_boss_clone.setToolTip(
+            "有些 BOSS 是 3 个分身，打完全部才算通关；不勾就是打完一只直接退本"
+        )
+        self.chk_boss_clone.toggled.connect(self._save_from_ui)
+        row_clone.addWidget(self.chk_boss_clone)
+        row_clone.addWidget(QLabel("一共打"))
+        self.spin_boss_count = QSpinBox()
+        self.spin_boss_count.setRange(2, 9)
+        self.spin_boss_count.setValue(3)
+        self.spin_boss_count.setFixedWidth(60)
+        self.spin_boss_count.setSuffix(" 只")
+        self.spin_boss_count.valueChanged.connect(self._save_from_ui)
+        row_clone.addWidget(self.spin_boss_count)
+        row_clone.addWidget(_hint("（不勾就按普通 BOSS：打完直接退出副本）"), 1)
+        row_clone.addStretch(1)
+        g.addLayout(row_clone, 9, 0, 1, 4)
 
         # ---------- BOSS / 打怪 循环 ----------
         self.chk_link = QCheckBox("打怪点挂机 ↔ 打BOSS 联动（按疲劳切换）")
@@ -1340,6 +1359,9 @@ class DungeonTab(QWidget):
                 float(loop.get("boss_seconds", farm.get("seconds", 120.0)) or 120.0)
             )
             self.spin_hp.setValue(int(farm.get("hp_threshold", 0) or 0))
+            _boss_count = int(loop.get("boss_count", 1) or 1)
+            self.chk_boss_clone.setChecked(_boss_count > 1)
+            self.spin_boss_count.setValue(max(2, min(9, _boss_count)))
             self.chk_potion_timer.setChecked(
                 bool(farm.get("potion_timer_enabled", False)))
             self.spin_potion_timer.setValue(
@@ -1353,7 +1375,7 @@ class DungeonTab(QWidget):
             self.edit_mount_key.setText(str(mount.get("key", "s")))
 
             self.spin_fatigue_every.setValue(
-                float(loop.get("fatigue_every", 60.0) or 60.0)
+                float(loop.get("fatigue_every", 90.0) or 90.0)
             )
             self.chk_link.setChecked(bool(loop.get("link_fatigue", True)))
             detect = p.get("detect") or {}
@@ -1522,6 +1544,8 @@ class DungeonTab(QWidget):
             "rest_text": self.edit_rest_text.text().strip() or "休息",
         })
         p.setdefault("loop", {}).update({
+            "boss_count": (int(self.spin_boss_count.value())
+                           if self.chk_boss_clone.isChecked() else 1),
             "boss_seconds": float(self.spin_seconds.value()),
             "fatigue_every": float(self.spin_fatigue_every.value()),
             "link_fatigue": bool(self.chk_link.isChecked()),

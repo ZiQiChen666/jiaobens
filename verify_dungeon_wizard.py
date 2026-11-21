@@ -146,7 +146,7 @@ try:
     wiz.chk_fatigue.setChecked(True)
     wiz.spin_fatigue_low.setValue(-700)
     wiz.spin_fatigue_high.setValue(1000)
-    wiz.spin_fatigue_every.setValue(60.0)
+    wiz.spin_fatigue_every.setValue(120.0)
     wiz.spin_exit_settle.setValue(10.0)
     wiz.spin_gap.setValue(8.0)
     wiz.chk_mount.setChecked(True)
@@ -174,7 +174,8 @@ try:
           and saved["fatigue"]["pt"] == [0.1, 0.9])
     check("保存了打怪点", saved["farm"]["farm_pt"] == [0.6, 0.6])
     check("保存了疲劳检查间隔",
-          saved["loop"]["fatigue_every"] == 60.0)
+          saved["loop"]["fatigue_every"] == 120.0,
+          str(saved["loop"].get("fatigue_every")))
     check("保存了骑乘设置",
           saved["mount"]["enabled"] is True and saved["mount"]["key"] == "s")
     check("保存两个退出点", saved["exit"]["exit_pt"] == [0.94, 0.05]

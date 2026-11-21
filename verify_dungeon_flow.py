@@ -1117,6 +1117,60 @@ check("BOSS 点走歪也会 ESC 收界面",
       [a for a in g_rec2.actions if a == ("tap", "esc")].__len__() >= 2,
       str([a for a in g_rec2.actions if a == ("tap", "esc")]))
 
+# ---- 疲劳默认 90 秒（1 分半）；旧标定 60/64/66 自动升级 ----
+check("疲劳间隔默认 90 秒（1 分半）",
+      df.DEFAULT_PROFILE["loop"]["fatigue_every"] == 90.0,
+      str(df.DEFAULT_PROFILE["loop"]["fatigue_every"]))
+for _old in (60.0, 64.0, 66.0):
+    _p = df._normalize_profile({"loop": {"fatigue_every": _old}})
+    check(f"旧标定 {_old:.0f}s → 升级成 90s",
+          _p["loop"]["fatigue_every"] == 90.0, str(_p["loop"]))
+
+# ---- BOSS 分身：勾了就打 3 只，只退本一次 ----
+p_clone = build_profile()
+p_clone["loop"] = dict(p_clone["loop"], boss_count=3, boss_seconds=10.0)
+g_clone = FakeGame(fill_time=1.0, hp_dead_after_a=8)
+logs_clone = []
+r_clone = df.DungeonRunner(g_clone, p_clone, log=logs_clone.append)
+r_clone.hp_now = lambda: 5000
+ok_clone = r_clone.boss_round()
+_clicks_clone = [a[1] for a in g_clone.actions if a[0] == "click"]
+check("打 3 只分身：BOSS 点去了 3 次",
+      len(clicks_near(g_clone.actions, PT_BOSS)) == 3,
+      str(clicks_near(g_clone.actions, PT_BOSS)))
+check("打 3 只分身：只退本一次",
+      _clicks_clone.count(tuple(round(v, 3) for v in PT_EXIT)) == 1,
+      str(_clicks_clone.count(tuple(round(v, 3) for v in PT_EXIT))))
+check("打 3 只分身：日志有「BOSS 分身 1/3」",
+      any("BOSS 分身 1/3" in l for l in logs_clone),
+      str([l for l in logs_clone if "分身" in l][:3]))
+check("打 3 只分身：本轮成功", ok_clone is True)
+
+p_single = build_profile()
+p_single["loop"] = dict(p_single["loop"], boss_count=1, boss_seconds=10.0)
+g_single = FakeGame(fill_time=1.0, hp_dead_after_a=8)
+r_single = df.DungeonRunner(g_single, p_single, log=lambda _s: None)
+r_single.hp_now = lambda: 5000
+r_single.boss_round()
+check("不勾分身：BOSS 点只去 1 次",
+      len(clicks_near(g_single.actions, PT_BOSS)) == 1,
+      str(clicks_near(g_single.actions, PT_BOSS)))
+
+# ---- 多开喝药：血量一直读不到 → 兜底按固定间隔喝 ----
+p_fb = build_profile()
+p_fb["farm"].update({"potion_keys": ["q", "w", "e"], "potion_every": 6.0,
+                     "hp_threshold": 1600, "hp_check_every": 2.0})
+g_fb = FakeGame()
+logs_fb = []
+r_fb = df.DungeonRunner(g_fb, p_fb, log=logs_fb.append)
+r_fb.hp_now = lambda: None          # 模拟"多开抢不到 OCR"
+r_fb.combat(20.0, desc="喝药兜底")
+_med_fb = [a[1] for a in g_fb.actions if a[0] == "tap" and a[1] in ("q", "w", "e")]
+check("血量读不到时兜底喝药（按间隔也按 Q/W/E）", len(_med_fb) >= 3,
+      str(_med_fb[:9]))
+check("兜底有日志说明", any("兜底" in l for l in logs_fb),
+      str([l for l in logs_fb if "喝药" in l][:3]))
+
 # ---- 多开不互相卡节奏：OCR 抢不到锁就跳过，不挡攻击 ----
 check("能识别「多开的兄弟窗口」标题",
       df.is_game_title("CreatureCurios - 冰牙鲨鱼") is True

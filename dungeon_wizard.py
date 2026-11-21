@@ -70,7 +70,9 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     loop["boss_seconds"] = max(
         5.0, min(1000.0, float(answers.get("seconds") or 120.0))
     )
-    loop["fatigue_every"] = max(0.0, float(answers.get("fatigue_every") or 0.0))
+    loop["fatigue_every"] = max(10.0, float(answers.get("fatigue_every") or 90.0))
+    loop["boss_count"] = (max(2, min(9, int(answers.get("boss_count") or 3)))
+                          if answers.get("boss_clone") else 1)
 
     farm["farm_pt"] = (
         [round(float(v), 5) for v in answers["farm_pt"]]
@@ -139,6 +141,8 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
         f"打怪点按疲劳分流：疲劳 < 下限 {fatigue['low']} → 去打BOSS；"
         f"疲劳 > 上限 {fatigue['high']} → 回打怪点打小怪（后台按键，不占窗口）；"
         f"不设挂机时长，每 {loop['fatigue_every']:.0f}s 查一次疲劳"
+        + (f"；本副本要打 {loop['boss_count']} 只 BOSS（分身）"
+           if loop.get("boss_count", 1) > 1 else "")
     )
     plan.append(
         f"② 开地图2 → 点 BOSS 点 → 等 {farm['travel_wait']:.0f}s → "
@@ -230,7 +234,12 @@ class DungeonWizard(QDialog):
             "fatigue_high": int(fatigue.get("high", abs(
                 int(fatigue.get("threshold", 600) or 0)))),
             "fatigue_pt": fatigue.get("pt"),
-            "fatigue_every": float((self.profile.get("loop") or {}).get("fatigue_every", 60.0)),
+            "fatigue_every": float((self.profile.get("loop") or {}).get(
+                "fatigue_every", 90.0) or 90.0),
+            "boss_clone": int((self.profile.get("loop") or {}).get(
+                "boss_count", 1) or 1) > 1,
+            "boss_count": max(2, min(9, int((self.profile.get("loop") or {}).get(
+                "boss_count", 3) or 3))),
             "farm_pt": (self.profile.get("farm") or {}).get("farm_pt"),
             "pickup_on_a": bool((self.profile.get("farm") or {}).get("pickup_on_a", True)),
             "action_gap": float(self.profile.get("action_gap", 1.0)),
@@ -323,6 +332,8 @@ class DungeonWizard(QDialog):
         self.answers["fatigue_every"] = float(self.spin_fatigue_every.value())
         self.answers["pickup_on_a"] = bool(self.chk_pickup_on_a.isChecked())
         self.answers["action_gap"] = float(self.spin_action_gap.value())
+        self.answers["boss_clone"] = bool(self.chk_boss_clone.isChecked())
+        self.answers["boss_count"] = int(self.spin_boss_count.value())
         self.answers["potion_timer_enabled"] = bool(
             self.chk_potion_timer.isChecked())
         self.answers["potion_timer_every"] = float(
@@ -649,6 +660,19 @@ class DungeonWizard(QDialog):
             5.0, 600.0, self.answers["potion_timer_every"])
         g.addWidget(self.spin_potion_timer, 4, 3)
         g.addWidget(_hint("秒按一次（不管血量；适合 60 秒的 buff 药）"), 4, 4, 1, 3)
+
+        self.chk_boss_clone = QCheckBox("BOSS 有分身")
+        self.chk_boss_clone.setChecked(bool(self.answers["boss_clone"]))
+        g.addWidget(self.chk_boss_clone, 5, 0, 1, 2)
+        g.addWidget(QLabel("一共打"), 5, 2)
+        self.spin_boss_count = QSpinBox()
+        self.spin_boss_count.setRange(2, 9)
+        self.spin_boss_count.setValue(int(self.answers["boss_count"]))
+        self.spin_boss_count.setFixedWidth(80)
+        self.spin_boss_count.setSuffix(" 只")
+        g.addWidget(self.spin_boss_count, 5, 3)
+        g.addWidget(_hint("只（3 个分身要打 3 只才算过关；不勾就是打完一只就退本）"),
+                    5, 4, 1, 3)
         lay.addLayout(g)
 
         row = QHBoxLayout()
