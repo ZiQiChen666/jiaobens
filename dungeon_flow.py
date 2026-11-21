@@ -139,9 +139,11 @@ DEFAULT_PROFILE: dict = {
         "travel_wait": 30.0,       # 点完后等自动寻路（有「到达标记」就提前结束）
         "arrived": {"roi": None, "sig": [], "grid": 12, "sim": 0.90},  # 可选：到达标记
         "boss_present": {"roi": None, "sig": [], "sigs": [], "grid": 12,
-                         "sim": 0.60, "search": 1.6, "tol": 30.0,
-                         "still_seconds": 0.8, "still_timeout": 12.0,
-                         "still_diff": 0.015},  # BOSS 身形（多张样本 + 停下才识别）
+                         "sim": 0.60, "min_sim": 0.75, "search": 1.6,
+                         "tol": 30.0, "still_seconds": 0.8,
+                         "still_timeout": 12.0, "still_diff": 0.05},
+        # ↑ BOSS 身形：只在「画面完全不动」时比对，相似度要 ≥ max(sim, 0.75)，
+        #   防止路过的「小怪」被当成 BOSS
         "boss_hp": {"roi": None, "mode": "ocr", "kill_hp": 0, "miss": 3,
                     "ocr_every": 2.0, "grace": 6.0, "min_fill": 0.15},
         # ↑ BOSS 死亡判定（默认 mode=ocr，和主程序 BossWatcher 同一套）：
@@ -369,6 +371,11 @@ def _normalize_profile(p: dict) -> dict:
             body["sim"] = min(float(body.get("sim") or 0.60), 0.65)
             body["search"] = max(float(body.get("search") or 1.0), 1.6)
             body["tol"] = max(float(body.get("tol") or 18.0), 30.0)
+            body.setdefault("min_sim", 0.75)      # v3.25.15 严格下限，防小怪
+            body.setdefault("still_seconds", 0.8)
+            if float(body.get("still_diff", 0.05) or 0.05) < 0.03:
+                # 0.015 太严：站着时环境里的树叶/粒子都会超，永远等不到"静止"
+                body["still_diff"] = 0.05
             p.setdefault("farm", {})["boss_present"] = body
         farm_cfg = (p.get("farm") or {})
         if isinstance(farm_cfg, dict):
@@ -1461,21 +1468,34 @@ class DungeonRunner:
             self.game.sleep(0.35)
         self.gap("回收界面后缓冲")
 
-    def wait_anchor_still(self, spec: Optional[dict], timeout: float,
-                          desc: str, need: int = 2) -> bool:
-        """等画面（相对）不动了，再比对锚点；环境一直在动就退化成"最像的一帧"。
+    def wait_anchor_still(self, spec, timeout: float, desc: str,
+                          need: int = 2, matcher=None,
+                          still_seconds: float = 0.5) -> bool:
+        """先确认画面**真的没在动**，再比对锚点；在动就一直不判定。
 
-        走路/攻击时画面每帧都不一样，拿那种帧去比相似度必然偏低，
-        所以这里只在"相邻两帧几乎一样"的时候才算命中；一直有小动画
-        （树叶/粒子）导致永远不静止时，超时后用最像的一帧决定。
+        走路/攻击/旁边有小怪在动时每帧都不一样，那时候任何比对都不可信
+        （以前会拿"最像的一帧"兜底，结果把小怪认成 BOSS）。现在：
+          1) 连续 still_seconds 秒相邻帧差异都 ≤ still_diff 才算"静止"；
+          2) 静止之后才开始比对，连续 need 帧命中才算识别到；
+          3) 画面又动了 → 之前的命中清零；
+          4) 超时都没等到静止 → 直接 False（绝不拿"动的帧"下结论）。
+        matcher: 自定义判定 (spec, frame) -> bool，默认 anchor_visible。
         """
         if not (spec or {}).get("roi"):
             return False
         poll = max(0.1, float((self.p.get("detect") or {}).get("poll", 0.3)))
         still_d = float(spec.get("still_diff", 0.02) or 0.02)
-        sim_th = float(spec.get("sim") or self._detect_cfg("sim", 0.80))
+        try:
+            still_seconds = float(
+                still_seconds if still_seconds is not None
+                else spec.get("still_seconds", 0.5))
+        except (TypeError, ValueError):
+            still_seconds = 0.5
+        still_seconds = max(0.0, still_seconds)
+        match = matcher or (lambda sp, fr: self.anchor_visible(sp, fr))
         start = self.game.now()
         prev = None
+        still_since = None
         hits = 0
         best = -1.0
         next_log = 0.0
@@ -1489,26 +1509,36 @@ class DungeonRunner:
             sim, ink = self.anchor_metrics(spec, frame)
             best = max(best, sim)
             elapsed = self.game.now() - start
-            if diff is not None and diff > still_d:
-                hits = 0                      # 画面还在动，先不认
-            elif self.anchor_visible(spec, frame):
-                hits += 1
-                if hits >= max(1, int(need)):
-                    self.log(f"画面静止后识别到{desc}"
-                             f"（相似度 {sim:.2f} / 占比 {ink:.2f}）")
-                    return True
+            if diff is None or diff > still_d:
+                still_since = None
+                hits = 0                      # 画面在动：一律不认
             else:
-                hits = 0
+                if still_since is None:
+                    still_since = self.game.now()
+                still_for = self.game.now() - still_since
+                if still_for < still_seconds:
+                    hits = 0                  # 还没站够时间，先等着
+                elif match(spec, frame):
+                    hits += 1
+                    if hits >= max(1, int(need)):
+                        self.log(f"画面静止后识别到{desc}"
+                                 f"（相似度 {sim:.2f} / 占比 {ink:.2f}"
+                                 f" / 画面差异 {diff:.3f}）")
+                        return True
+                else:
+                    hits = 0
             if elapsed >= next_log:
                 next_log = elapsed + 3.0
                 self.log(f"等{desc}… 相似度 {sim:.2f} / 占比 {ink:.2f}"
-                         + ("（画面在动，暂不判定）" if hits == 0 else ""))
+                         + ("（画面还在动，先不判定）"
+                            if still_since is None else ""))
             self.game.sleep(poll)
-        if best >= sim_th:
-            self.log(f"画面一直有动画，但{desc}最像的一帧相似度 {best:.2f} "
-                     f"≥ {sim_th:.2f} → 认作命中")
-            return True
-        self.log(f"没识别到{desc}（最高相似度 {max(0.0, best):.2f}）")
+        if still_since is None:
+            self.log(f"画面一直在动，没敢判定{desc}"
+                     f"（最高相似度 {max(0.0, best):.2f}）")
+            return False
+        self.log(f"画面不动了但没识别到{desc}"
+                 f"（最高相似度 {max(0.0, best):.2f}）")
         return False
 
     def wait_until(self, spec: Optional[dict], timeout: float, desc: str,
@@ -2325,6 +2355,31 @@ class DungeonRunner:
         self._last_hp_detail = ""
         return score >= need
 
+    def boss_body_visible(self, spec=None, frame=None) -> bool:
+        """严格版「BOSS 身形」判定（防止把小怪认成 BOSS）。
+
+        只用相似度，不走 anchor_visible 里「相似度 ≥ 0.60 且区域有内容」的宽松兜底；
+        阈值取 max(标定 sim, min_sim=0.75)。调用方还要保证画面静止。
+        """
+        spec = spec if spec is not None else self._anchor_of("boss_present")
+        if not (spec or {}).get("roi"):
+            return True
+        if frame is None:
+            frame = self.grab()
+        if frame is None:
+            return False
+        sim, ink = self.anchor_metrics(spec, frame)
+        if sim < 0:
+            return False
+        try:
+            sim_th = max(float(spec.get("sim") or 0.60),
+                         float(spec.get("min_sim", 0.75) or 0.75))
+        except (TypeError, ValueError):
+            sim_th = 0.75
+        self._last_body_sim = sim
+        self._last_body_ink = ink
+        return sim >= sim_th
+
     def boss_present(self) -> bool:
         """「BOSS 身形」在不在（确认真的站到 BOSS 面前了）。"""
         spec = self._anchor_of("boss_present")
@@ -2355,7 +2410,10 @@ class DungeonRunner:
                 return True
             self.release_focus()
             self.log("等角色停下（画面不动了再识别 BOSS 身形/小鹿）")
-            if self.wait_anchor_still(spec, 8.0, "BOSS 身形"):
+            if self.wait_anchor_still(
+                    spec, 10.0, "BOSS 身形", need=3,
+                    matcher=self.boss_body_visible,
+                    still_seconds=float(spec.get("still_seconds", 0.8) or 0.8)):
                 return True
             self.log("没识别到「BOSS 身形」→ 回地图重新点 BOSS 点")
             self.recover_ui("到点后没看到 BOSS（可能走歪了）")
@@ -2972,7 +3030,11 @@ class DungeonRunner:
             if (spec or {}).get("roi"):
                 self.release_focus()
                 self.log("引路宏跑完，等角色停下再识别 BOSS")
-                if self.wait_anchor_still(spec, 10.0, "BOSS 身形"):
+                if self.wait_anchor_still(
+                        spec, 12.0, "BOSS 身形", need=3,
+                        matcher=self.boss_body_visible,
+                        still_seconds=float(
+                            spec.get("still_seconds", 0.8) or 0.8)):
                     if not self._fight_clones(kills, at_boss=True):
                         return self._failed("BOSS 点打怪失败")
                 elif self.nav_macro().get("fallback", False):

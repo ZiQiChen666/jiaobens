@@ -1183,11 +1183,36 @@ check("确实是等了几帧静止后才认（不是第一帧就认）", g_mv.t 
       f"{g_mv.t - _t_mv:.1f}s")
 
 g_mv2 = FakeGame(frames_move_first=10 ** 6)
-g_mv2.state["body"] = True         # 环境一直有动画
+g_mv2.state["body"] = True         # 画面一直在动（在走路/旁边小怪在动）
 r_mv2 = df.DungeonRunner(g_mv2, build_profile(), log=lambda _s: None)
-check("画面一直有小动画 → 用最像的一帧兜底认出 BOSS",
+check("画面一直在动 → 坚决不判定成 BOSS（防小怪误判）",
       r_mv2.wait_anchor_still(build_profile()["farm"]["boss_present"],
-                              2.0, "BOSS 身形") is True)
+                              2.0, "BOSS 身形") is False)
+
+# 严格阈值：相似度 0.70 的小怪不能算 BOSS
+p_bd = build_profile()
+_bd_spec = dict(p_bd["farm"]["boss_present"], roi=[0.0, 0.0, 0.2, 0.2],
+                sim=0.60, min_sim=0.75)
+r_bd = df.DungeonRunner(FakeGame(), p_bd, log=lambda _s: None)
+_dummy_frame = FakeGame().grab()
+r_bd.anchor_metrics = lambda sp, fr: (0.70, 0.20)
+check("相似度 0.70（像小怪）< min_sim 0.75 → 不认成 BOSS",
+      r_bd.boss_body_visible(_bd_spec, _dummy_frame) is False,
+      str(getattr(r_bd, "_last_body_sim", None)))
+r_bd.anchor_metrics = lambda sp, fr: (0.88, 0.22)
+check("相似度 0.88（真 BOSS）→ 认",
+      r_bd.boss_body_visible(_bd_spec, _dummy_frame) is True)
+check("默认 min_sim 0.75 写进标定",
+      df.DEFAULT_PROFILE["farm"]["boss_present"].get("min_sim") == 0.75)
+
+# 静止 + 连续 3 帧命中才认（need=3）
+g_st = FakeGame()
+g_st.state["body"] = True
+r_st = df.DungeonRunner(g_st, build_profile(), log=lambda _s: None)
+check("静止后连续 3 帧命中 → 认作到 BOSS",
+      r_st.wait_anchor_still(p_bd["farm"]["boss_present"], 10.0, "BOSS 身形",
+                             need=3, matcher=r_st.boss_body_visible,
+                             still_seconds=0.8) is True)
 
 # ---- 进度条：就算框得只剩条子（没有背景），和第一帧比也能量出来 ----
 p_pr = build_profile()
