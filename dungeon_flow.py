@@ -367,6 +367,13 @@ def _normalize_profile(p: dict) -> dict:
             body["search"] = max(float(body.get("search") or 1.0), 1.6)
             body["tol"] = max(float(body.get("tol") or 18.0), 30.0)
             p.setdefault("farm", {})["boss_present"] = body
+        farm_cfg = (p.get("farm") or {})
+        if isinstance(farm_cfg, dict):
+            keys = farm_cfg.get("potion_keys")
+            if keys == ["q"]:
+                # v3.25.12：默认改成 Q/W/E（老标定升级）
+                farm_cfg["potion_keys"] = ["q", "w", "e"]
+            p.setdefault("farm", {}).update(farm_cfg)
         fat = (p.get("fatigue") or {})
         if isinstance(fat, dict):
             if fat.get("low") is None or fat.get("high") is None:
@@ -1019,6 +1026,7 @@ class DungeonRunner:
         self._hp_ocr_visible = True
         self._hp_ocr_skips = 0
         self._hp_skipped = False
+        self._hp_ocr_logged = False
         self._last_hp_detail = ""
         self._icon_checks = 0
         self._icon_miss_shot = False
@@ -1224,8 +1232,10 @@ class DungeonRunner:
     def hp_now(self):
         """OCR 当前血量；没配区域返回 None。
 
-        必须**现拍一张**：_last_frame 在打怪阶段还是进本前的旧图（血是满的），
-        用它判断会永远"血够"、一直不喝药。
+        两个坑（都会导致"永远不喝药"）已修：
+          · 必须**现拍一张**：_last_frame 在打怪阶段还是进本前的旧图（血是满的）；
+          · ocr_hp_from_bgra 要的是**归一化**区域，以前又换算成像素 rect 传进去，
+            等于把 (139,96,196,54) 当成 0.139/0.096/... 去裁图 → 永远读不到数字。
         """
         roi = self._farm().get("hp_roi")
         if not roi:
@@ -1235,15 +1245,23 @@ class DungeonRunner:
             return None
         w, h, data = frame
         try:
-            rect = app.roi_from_norm(tuple(float(v) for v in roi), w, h)
+            roi_norm = tuple(float(v) for v in roi)
             if _OCR_LOCK.acquire(timeout=1.5):
                 try:
-                    current, _maximum, _text = app.ocr_hp_from_bgra(
-                        data, w, h, rect)
+                    current, maximum, text = app.ocr_hp_from_bgra(
+                        data, w, h, roi_norm)
                 finally:
                     _OCR_LOCK.release()
             else:
                 return None          # 别的窗口在 OCR，这次先跳过
+            if not self._hp_ocr_logged:
+                self._hp_ocr_logged = True
+                if current is None:
+                    self.log(f"血量识别失败：{text}（区域 {roi}）")
+                else:
+                    self.log(f"血量识别 OK：{current}"
+                             + (f"/{maximum}" if maximum else "")
+                             + f"（阈值 {self._farm().get('hp_threshold') or 0}）")
             return current
         except Exception as exc:
             self.log(f"血量识别异常：{type(exc).__name__}: {exc}")
@@ -1405,6 +1423,23 @@ class DungeonRunner:
         self.log(f"按「{key}」开地图")
         self.game.tap(key)
         self.game.sleep(0.8)
+
+    def recover_ui(self, reason: str = "") -> None:
+        """点歪了 / 超时没等到弹窗：先把可能开着的界面关掉，让「开地图」是干净的。
+
+        不这么做的话，上一次地图还开着时再按 M 等于**把地图关掉**，
+        接着那一下点击就点到游戏世界里 → 角色乱走（这就是"走偏"）。
+        """
+        enter = self.p.get("enter") or {}
+        esc_times = max(0, int(enter.get("recover_esc", 1) or 0))
+        if reason:
+            self.log(f"回收界面：{reason}")
+        for _ in range(esc_times):
+            if self._stopping():
+                return
+            self.game.tap(self._key("close_ui", "esc"))
+            self.game.sleep(0.35)
+        self.gap("回收界面后缓冲")
 
     def wait_until(self, spec: Optional[dict], timeout: float, desc: str,
                    need: int = 2) -> bool:
@@ -1723,7 +1758,9 @@ class DungeonRunner:
                         break
                 self.game.sleep(poll)
             else:
-                self.log(f"{timeout:.0f}s 没进本 → 重新寻路（{attempt}/{attempts}）")
+                self.log(f"{timeout:.0f}s 没等到「进入弹窗」→ 回地图重新点副本入口"
+                         f"（{attempt}/{attempts}）")
+                self.recover_ui("进本超时（可能点歪了，或者地图没开）")
                 continue
 
             # 用进度条验证到底进没进
@@ -2176,7 +2213,8 @@ class DungeonRunner:
             self.gap("到 BOSS 点后缓冲")
             if self.wait_until(spec, 6.0, "BOSS 身形"):
                 return True
-            self.log("没识别到「BOSS 身形」→ 回到上一步重新寻路")
+            self.log("没识别到「BOSS 身形」→ 回地图重新点 BOSS 点")
+            self.recover_ui("到点后没看到 BOSS（可能走歪了）")
         self.log(f"BOSS 点确认失败：{tries} 次都没识别到 BOSS 身形")
         return False
 
@@ -2222,6 +2260,12 @@ class DungeonRunner:
         self.restore_user_foreground()
         self.log("打BOSS：A/技能/拾取全部后台 PostMessage 发送"
                  "（窗口不用在前台）")
+        if hp_threshold > 0 and farm.get("hp_roi"):
+            self.log(f"自动喝药：血量 < {hp_threshold} → 每 {potion_every:.0f}s 按"
+                     f"「{'、'.join(potion_keys)}」，血够了就停")
+        elif hp_threshold > 0:
+            self.log("自动喝药：填了「血量阈值」但没点「框血量区域」→ "
+                     "不会按血量喝，只能按固定间隔")
         if timer_on and timer_every > 0:
             self.log(f"定时喝药：开打先按一次「{'、'.join(potion_keys)}」，之后每 "
                      f"{timer_every:.0f}s 一次")
@@ -2344,7 +2388,7 @@ class DungeonRunner:
 
             if watch_fatigue and elapsed >= next_fatigue:
                 next_fatigue = elapsed + loop_fat
-                current, maximum, _msg = self.fatigue_check()
+                current, maximum, _msg = self.fatigue_check(keep_attacking=True)
                 if current is not None:
                     low, high = self.fatigue_limits()
                     self.log(f"打怪中查疲劳 {current}/{maximum}"
@@ -2428,6 +2472,12 @@ class DungeonRunner:
         self.release_focus()
         self.log(f"{desc}：{seconds:.0f}s（喝药 {potion_every:.0f}s / "
                  f"拾取 {pickup_every:.0f}s）")
+        if hp_threshold > 0 and farm.get("hp_roi"):
+            self.log(f"自动喝药：血量 < {hp_threshold} → 每 {potion_every:.0f}s 按"
+                     f"「{'、'.join(potion_keys)}」，血够了就停")
+        elif hp_threshold > 0:
+            self.log("自动喝药：填了「血量阈值」但没点「框血量区域」→ "
+                     "不会按血量喝，只能按固定间隔")
         if timer_on and timer_every > 0:
             self.log(f"定时喝药：开打先按一次「{'、'.join(potion_keys)}」，之后每 "
                      f"{timer_every:.0f}s 一次")
@@ -2448,7 +2498,7 @@ class DungeonRunner:
             # 如果先判断「到点结束」就永远查不到疲劳，会死在挂机循环里。
             if watch and elapsed >= next_fatigue:
                 next_fatigue = elapsed + fatigue_every
-                current, maximum, msg = self.fatigue_check()
+                current, maximum, msg = self.fatigue_check(keep_attacking=True)
                 if current is None:
                     self.log(f"疲劳读不到（{msg}），继续{desc}")
                 else:
@@ -2527,7 +2577,7 @@ class DungeonRunner:
         except Exception:
             return None
 
-    def fatigue_check(self):
+    def fatigue_check(self, keep_attacking: bool = False):
         """点住疲劳图标 → 等提示框弹出来 → OCR 读「当前疲劳值」。
 
         返回 (当前, 最大, 说明)。要点：
@@ -2549,6 +2599,9 @@ class DungeonRunner:
         hold = max(0.5, float(cfg.get("hold_seconds", 3.0) or 3.0))
         poll = max(0.1, float(cfg.get("poll", 0.3) or 0.3))
         tries = max(1, int(cfg.get("retry", 2) or 2))
+        farm = self._farm()
+        pickup_key = str(farm.get("pickup_key") or self._key("pickup", "space"))
+        pickup_on_a = bool(farm.get("pickup_on_a", True))
         last_msg = "没读到疲劳"
         for attempt in range(1, tries + 1):
             if self._stopping():
@@ -2563,6 +2616,11 @@ class DungeonRunner:
             got = None
             while not self._stopping() and self.game.now() < end:
                 self.game.sleep(poll)
+                # 读疲劳的这几秒别站着发呆：继续后台平A（+拾取）
+                if keep_attacking:
+                    self.game.tap("a")
+                    if pickup_on_a:
+                        self.game.tap(pickup_key)
                 frame = self.grab()
                 if frame is None:
                     last_msg = "截图失败"

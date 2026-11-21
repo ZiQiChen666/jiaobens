@@ -406,7 +406,7 @@ p_link["farm"]["farm_pt"] = [0.20, 0.30]
 _seq = {"values": [800, 800, -700, -700, 700, 700, -700, -700], "i": 0}
 
 
-def _next_fatigue():
+def _next_fatigue(**_kw):
     vals = _seq["values"]
     v = vals[min(_seq["i"], len(vals) - 1)]
     _seq["i"] += 1
@@ -450,7 +450,7 @@ p_nolink["loop"] = dict(p_nolink["loop"], link_fatigue=False)
 g_nolink = FakeGame(fill_time=1.0, hp_dead_after_a=5)
 r_nolink = df.DungeonRunner(g_nolink, p_nolink, log=lambda _s: None)
 r_nolink.hp_now = lambda: 5000
-r_nolink.fatigue_check = lambda: (900, 1000, "")
+r_nolink.fatigue_check = lambda **_kw: (900, 1000, "")
 r_nolink.run_round()
 check("关掉联动 → 直接走 BOSS 流程",
       PT_DUNGEON in [a[1] for a in g_nolink.actions if a[0] == "click"])
@@ -566,7 +566,7 @@ p_farm["farm"]["hp_threshold"] = 0
 _seq2 = {"vals": [500, 200, -700], "i": 0}
 
 
-def _fat():
+def _fat(**_kw):
     v = _seq2["vals"][min(_seq2["i"], 2)]
     _seq2["i"] += 1
     return v, 1000, ""
@@ -810,7 +810,7 @@ g_mid.state["body"] = True      # 血条一直在，只能靠疲劳结束
 logs_mid = []
 r_mid = df.DungeonRunner(g_mid, p_mid, log=logs_mid.append)
 r_mid.hp_now = lambda: 5000
-r_mid.fatigue_check = lambda: (700, 1000, "")
+r_mid.fatigue_check = lambda **_kw: (700, 1000, "")
 t0 = g_mid.t
 r_mid.fight_until_finish()
 check("打BOSS途中疲劳 >+阈值 → 提前收尾（不到上限 300s）",
@@ -832,7 +832,7 @@ r_mid2 = df.DungeonRunner(g_mid2, p_mid2, log=logs_mid2.append)
 r_mid2.hp_now = lambda: 5000
 
 
-def _fat_count():
+def _fat_count(**_kw):
     calls["n"] += 1
     return 700, 1000, ""
 
@@ -916,7 +916,7 @@ def _run_combat(vals, action):
     r_h = df.DungeonRunner(g_h, p_h, log=logs_h.append)
     seq_h = {"i": 0}
 
-    def _fc():
+    def _fc(**_kw):
         v = vals[min(seq_h["i"], len(vals) - 1)]
         seq_h["i"] += 1
         return v, 1000, ""
@@ -1049,6 +1049,74 @@ try:
 finally:
     df.app.ocr_hp_from_bgra = _real_hp
 
+# ---- hp_now：ocr_hp_from_bgra 要的是「归一化」区域（以前传像素 rect → 永远读不到）
+_rec_roi = {"roi": None}
+_real_hp_ocr3 = df.app.ocr_hp_from_bgra
+
+
+def _fake_hp_ocr(data, w, h, roi_norm):
+    _rec_roi["roi"] = tuple(roi_norm)
+    return 900, 1800, "900/1800"
+
+
+df.app.ocr_hp_from_bgra = _fake_hp_ocr
+try:
+    g_hp = FakeGame()
+    p_hp = build_profile()
+    p_hp["farm"]["hp_roi"] = [0.10, 0.12, 0.14, 0.07]
+    r_hp = df.DungeonRunner(g_hp, p_hp, log=lambda _s: None)
+    got_hp = r_hp.hp_now()
+finally:
+    df.app.ocr_hp_from_bgra = _real_hp_ocr3
+check("hp_now 把「归一化区域」传给 OCR（不是像素 rect）",
+      got_hp == 900 and _rec_roi["roi"] == (0.10, 0.12, 0.14, 0.07),
+      str(_rec_roi["roi"]))
+
+# ---- 读疲劳的时候继续平A（不能站着发呆）----
+g_fatk = HoldGame()
+g_fatk.ready_at = 1.2
+df.app.ocr_fatigue_from_bgra = _make_fat_ocr(g_fatk)
+try:
+    r_fatk = df.DungeonRunner(g_fatk, p_fat, log=lambda _s: None)
+    r_fatk.fatigue_check(keep_attacking=True)
+finally:
+    df.app.ocr_fatigue_from_bgra = _real_fat_ocr
+_fat_taps = [a[1] for a in g_fatk.actions if a[0] == "tap"]
+check("读疲劳期间还在平A（发了 a）", _fat_taps.count("a") >= 2, str(_fat_taps))
+check("读疲劳期间也在拾取", "space" in _fat_taps, str(_fat_taps))
+
+# ---- 进本超时 → 关界面 + 回地图重新点（修"走歪"）----
+p_rec = build_profile()
+p_rec["enter"].update({"travel_wait": 1.0, "dialog_timeout": 1.0,
+                       "blind_confirm_after": 10.0, "retry": 2})
+p_rec["farm"]["travel_wait"] = 1.0
+p_rec["farm"]["boss_retry"] = 2
+g_rec = FakeGame(enter_appears=False)
+logs_rec = []
+r_rec = df.DungeonRunner(g_rec, p_rec, log=logs_rec.append)
+ok_rec = r_rec.enter_dungeon()
+_clicks_rec = [a[1] for a in g_rec.actions if a[0] == "click"]
+_esc_rec = [a for a in g_rec.actions if a == ("tap", "esc")]
+check("进本超时 → 这一轮算失败", ok_rec is False)
+check("进本超时 → 回地图重点了 2 次副本入口",
+      len(clicks_near(g_rec.actions, PT_DUNGEON)) == 2,
+      str(clicks_near(g_rec.actions, PT_DUNGEON)))
+check("进本超时 → 先按 ESC 收掉旧界面（防点歪）", len(_esc_rec) >= 2,
+      str(len(_esc_rec)))
+check("日志说明白了「回地图重新点」",
+      any("回地图重新点副本入口" in l for l in logs_rec), str(logs_rec[-3:]))
+
+g_rec2 = FakeGame(body_appears=False)
+r_rec2 = df.DungeonRunner(g_rec2, p_rec, log=lambda _s: None)
+ok_rec2 = r_rec2.goto_boss_point()
+check("BOSS 点没看到 BOSS → 回地图重点（2 次）",
+      ok_rec2 is False
+      and len(clicks_near(g_rec2.actions, PT_BOSS)) == 2,
+      str(clicks_near(g_rec2.actions, PT_BOSS)))
+check("BOSS 点走歪也会 ESC 收界面",
+      [a for a in g_rec2.actions if a == ("tap", "esc")].__len__() >= 2,
+      str([a for a in g_rec2.actions if a == ("tap", "esc")]))
+
 # ---- 多开不互相卡节奏：OCR 抢不到锁就跳过，不挡攻击 ----
 check("能识别「多开的兄弟窗口」标题",
       df.is_game_title("CreatureCurios - 冰牙鲨鱼") is True
@@ -1159,7 +1227,7 @@ _bg_vals = [0, -700]
 _bg_i = {"i": 0}
 
 
-def _bg_fatigue():
+def _bg_fatigue(**_kw):
     v = _bg_vals[min(_bg_i["i"], len(_bg_vals) - 1)]
     _bg_i["i"] += 1
     return v, 1000, ""
