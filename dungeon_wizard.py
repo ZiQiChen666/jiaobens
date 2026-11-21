@@ -58,11 +58,6 @@ def compose_profile(base: dict, answers: dict) -> tuple[dict, list[str]]:
     farm["seconds"] = max(5.0, float(answers.get("seconds") or 30.0))
     farm["hp_threshold"] = max(0, int(answers.get("hp_threshold") or 0))
     farm["potion_every"] = max(1.0, float(answers.get("potion_every") or 6.0))
-    farm["potion_timer_enabled"] = bool(answers.get("potion_timer_enabled", False))
-    farm["potion_timer_every"] = max(
-        5.0, float(answers.get("potion_timer_every") or 60.0))
-    farm["potion_timer_key"] = (answers.get("potion_key")
-                                or farm.get("potion_timer_key") or "q").strip()
     farm["pickup_every"] = max(0.0, float(answers.get("pickup_every") or 8.0))
     farm["use_skills"] = bool(answers.get("use_skills", True))
     farm["pickup_on_a"] = bool(answers.get("pickup_on_a", True))
@@ -220,10 +215,6 @@ class DungeonWizard(QDialog):
                 "boss_seconds", farm.get("seconds", 120.0)) or 120.0),
             "hp_threshold": int(farm.get("hp_threshold", 0) or 0),
             "potion_every": float(farm.get("potion_every", 6.0)),
-            "potion_timer_enabled": bool(
-                farm.get("potion_timer_enabled", False)),
-            "potion_timer_every": float(
-                farm.get("potion_timer_every", 60.0) or 60.0),
             "pickup_every": float(farm.get("pickup_every", 8.0)),
             "use_skills": bool(farm.get("use_skills", True)),
             "fatigue_enabled": bool(fatigue.get("enabled", True)),
@@ -325,10 +316,6 @@ class DungeonWizard(QDialog):
         self.answers["fatigue_every"] = float(self.spin_fatigue_every.value())
         self.answers["pickup_on_a"] = bool(self.chk_pickup_on_a.isChecked())
         self.answers["action_gap"] = float(self.spin_action_gap.value())
-        self.answers["potion_timer_enabled"] = bool(
-            self.chk_potion_timer.isChecked())
-        self.answers["potion_timer_every"] = float(
-            self.spin_potion_timer.value())
         self.answers["mount_enabled"] = bool(self.chk_mount.isChecked())
         self.answers["mount_key"] = self.edit_mount_key.text().strip() or "s"
         self.answers["mount_text"] = self.edit_mount_text.text().strip() or "骑乘"
@@ -641,16 +628,6 @@ class DungeonWizard(QDialog):
                                               self.answers["fatigue_every"])
         g.addWidget(self.spin_fatigue_every, 3, 1)
         g.addWidget(_hint("秒查一次疲劳（默认 60 秒；不设挂机时长）"), 3, 2, 1, 3)
-
-        self.chk_potion_timer = QCheckBox("定时喝药")
-        self.chk_potion_timer.setChecked(
-            bool(self.answers["potion_timer_enabled"]))
-        g.addWidget(self.chk_potion_timer, 4, 0, 1, 2)
-        g.addWidget(QLabel("每"), 4, 2)
-        self.spin_potion_timer = self._dspin(
-            5.0, 600.0, self.answers["potion_timer_every"])
-        g.addWidget(self.spin_potion_timer, 4, 3)
-        g.addWidget(_hint("秒按一次（不管血量；适合 60 秒的 buff 药）"), 4, 4, 1, 3)
         lay.addLayout(g)
 
         row = QHBoxLayout()

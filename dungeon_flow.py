@@ -158,10 +158,7 @@ DEFAULT_PROFILE: dict = {
         "hp_threshold": 1600,
         "hp_check_every": 2.0,
         "potion_keys": ["q"],      # 血量低于阈值时只按 Q
-        "potion_every": 6.0,       # 低于阈值时，每 6 秒喝一次
-        "potion_timer_enabled": False,  # 定时喝药（不管血量，每 N 秒按一次）
-        "potion_timer_key": "q",
-        "potion_timer_every": 60.0,     # 定时喝药间隔（默认 60 秒）
+        "potion_every": 6.0,       # 喝药间隔（低于阈值时每 6 秒喝一次）
         "pickup_every": 8.0,       # 挂机期间每隔几秒按一次拾取
         "pickup_times": 3,         # 打完 BOSS、退出前再拾取几次
     },
@@ -1191,16 +1188,10 @@ class DungeonRunner:
         return False
 
     def hp_now(self):
-        """OCR 当前血量；没配区域返回 None。
-
-        注意：这里必须**现拍一张**。以前复用 _last_frame，挂机时那个帧还是
-        进本前的旧图（血是满的），结果一直判成"血够"，永远不喝药。
-        """
+        """OCR 当前血量；没配区域返回 None。"""
+        frame = self._last_frame or self.grab()
         roi = self._farm().get("hp_roi")
-        if not roi:
-            return None
-        frame = self.grab()
-        if frame is None:
+        if frame is None or not roi:
             return None
         w, h, data = frame
         try:
@@ -2157,9 +2148,6 @@ class DungeonRunner:
         hp_threshold = int(farm.get("hp_threshold", 0) or 0)
         hp_every = float(farm.get("hp_check_every", 2.0) or 2.0)
         use_skills = bool(farm.get("use_skills", True))
-        timer_on = bool(farm.get("potion_timer_enabled", False))
-        timer_key = str(farm.get("potion_timer_key") or "q")
-        timer_every = float(farm.get("potion_timer_every", 60.0) or 0.0)
         hp_spec = self._anchor_of("boss_hp")
         need_miss = max(1, int((hp_spec or {}).get("miss", 3) or 3))
         poll = max(0.2, float((self.p.get("detect") or {}).get("poll", 0.5)))
@@ -2185,9 +2173,6 @@ class DungeonRunner:
         self.restore_user_foreground()
         self.log("打BOSS：A/技能/拾取全部后台 PostMessage 发送"
                  "（窗口不用在前台）")
-        if timer_on and timer_every > 0:
-            self.log(f"定时喝药：开打先按一次「{timer_key}」，之后每 "
-                     f"{timer_every:.0f}s 一次")
         if (hp_spec or {}).get("roi"):
             if hp_mode == "icon":
                 self.capture_boss_icon()
@@ -2204,9 +2189,7 @@ class DungeonRunner:
         next_potion = next_hp = next_fatigue = next_check = 0.0
         next_beat = 0.0
         next_pickup = pickup_every
-        next_timer_potion = 0.0
         hp_low = False
-        hp_low_logged = False
         misses = 0
         while not self._stopping():
             elapsed = self.game.now() - start
@@ -2230,24 +2213,12 @@ class DungeonRunner:
                     next_hp = elapsed + hp_every
                     if current is not None:
                         hp_low = current < hp_threshold
-                        if hp_low and not hp_low_logged:
-                            hp_low_logged = True
-                            self.log(f"血量 {current} < {hp_threshold} → 喝药"
-                                     f"（之后每 {potion_every:.0f}s 一次）")
-                        elif not hp_low:
-                            hp_low_logged = False
             else:
                 hp_low = True
             if hp_low and potion_every > 0 and elapsed >= next_potion:
                 for key in potion_keys:
                     self.game.tap(key)
                 next_potion = elapsed + potion_every
-
-            # 定时喝药（不管血量）：每 N 秒按一次
-            if (timer_on and timer_every > 0 and timer_key
-                    and elapsed >= next_timer_potion):
-                self.game.tap(timer_key)
-                next_timer_potion = elapsed + timer_every
 
             if not pickup_on_a and pickup_every > 0 and elapsed >= next_pickup:
                 self.game.tap(pickup_key)
@@ -2382,24 +2353,16 @@ class DungeonRunner:
         hp_threshold = int(farm.get("hp_threshold", 0) or 0)
         hp_every = float(farm.get("hp_check_every", 2.0) or 2.0)
         use_skills = bool(farm.get("use_skills", True))
-        timer_on = bool(farm.get("potion_timer_enabled", False))
-        timer_key = str(farm.get("potion_timer_key") or "q")
-        timer_every = float(farm.get("potion_timer_every", 60.0) or 0.0)
 
         self.release_focus()
         self.log(f"{desc}：{seconds:.0f}s（喝药 {potion_every:.0f}s / "
                  f"拾取 {pickup_every:.0f}s）")
-        if timer_on and timer_every > 0:
-            self.log(f"定时喝药：开打先按一次「{timer_key}」，之后每 "
-                     f"{timer_every:.0f}s 一次")
         start = self.game.now()
         next_s1 = next_s2 = 0.0
         next_potion = 0.0
         next_pickup = pickup_every
         next_hp_check = 0.0
-        next_timer_potion = 0.0
         hp_low = False
-        hp_low_logged = False
 
         pickup_on_a = bool(farm.get("pickup_on_a", True))
         bg_warned = False
@@ -2445,12 +2408,8 @@ class DungeonRunner:
                     next_hp_check = elapsed + hp_every
                     if current is not None:
                         hp_low = current < hp_threshold
-                        if hp_low and not hp_low_logged:
-                            hp_low_logged = True
-                            self.log(f"血量 {current} < {hp_threshold} → 喝药"
-                                     f"（之后每 {potion_every:.0f}s 一次）")
-                        elif not hp_low:
-                            hp_low_logged = False
+                        if self.verbose and hp_low:
+                            self.log(f"血量 {current} < {hp_threshold}，喝药")
             else:
                 hp_low = True  # 没框血量就按固定间隔喝
 
@@ -2458,12 +2417,6 @@ class DungeonRunner:
                 for key in potion_keys:
                     self.game.tap(key)
                 next_potion = elapsed + potion_every
-
-            # 定时喝药（不管血量）：每 N 秒按一次
-            if (timer_on and timer_every > 0 and timer_key
-                    and elapsed >= next_timer_potion):
-                self.game.tap(timer_key)
-                next_timer_potion = elapsed + timer_every
 
             if pickup_every > 0 and elapsed >= next_pickup:
                 self.game.tap(pickup_key)
