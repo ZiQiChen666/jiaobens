@@ -1171,6 +1171,59 @@ check("血量读不到时兜底喝药（按间隔也按 Q/W/E）", len(_med_fb) 
 check("兜底有日志说明", any("兜底" in l for l in logs_fb),
       str([l for l in logs_fb if "喝药" in l][:3]))
 
+# ---- 画面不动了才识别（走路的帧不算）----
+g_mv = FakeGame(frames_move_first=8)
+g_mv.state["body"] = True          # 停下后能看到 BOSS 身形
+r_mv = df.DungeonRunner(g_mv, build_profile(), log=lambda _s: None)
+_t_mv = g_mv.t
+ok_mv = r_mv.wait_anchor_still(build_profile()["farm"]["boss_present"],
+                              8.0, "BOSS 身形")
+check("画面在动的帧不判定，停下后才识别到 BOSS", ok_mv is True)
+check("确实是等了几帧静止后才认（不是第一帧就认）", g_mv.t - _t_mv >= 0.9,
+      f"{g_mv.t - _t_mv:.1f}s")
+
+g_mv2 = FakeGame(frames_move_first=10 ** 6)
+g_mv2.state["body"] = True         # 环境一直有动画
+r_mv2 = df.DungeonRunner(g_mv2, build_profile(), log=lambda _s: None)
+check("画面一直有小动画 → 用最像的一帧兜底认出 BOSS",
+      r_mv2.wait_anchor_still(build_profile()["farm"]["boss_present"],
+                              2.0, "BOSS 身形") is True)
+
+# ---- 进度条：就算框得只剩条子（没有背景），和第一帧比也能量出来 ----
+p_pr = build_profile()
+p_pr["enter"]["progress"] = {"roi": [0.30, 0.508, 0.40, 0.07],
+                             "min_fill": 0.90, "samples": 2,
+                             "interval": 0.05}
+g_pr = FakeGame(fill_time=0.5, fill_max=1.0)
+g_pr.load_start = 0.0
+r_pr = df.DungeonRunner(g_pr, p_pr, log=lambda _s: None)
+check("进度条（框得只剩条子）也能一路量到完成",
+      r_pr.wait_progress(5.0) is True)
+
+g_pr2 = FakeGame(fill_time=0.5, fill_max=0.5)
+g_pr2.load_start = 0.0
+r_pr2 = df.DungeonRunner(g_pr2, p_pr, log=lambda _s: None)
+check("进度条只到一半 → 不算加载完成", r_pr2.wait_progress(3.0) is False)
+check("看得到条子就记下来（不会当成「没测到进度条」）",
+      r_pr2._last_progress_seen is True, str(r_pr2._last_progress_seen))
+
+# ---- 测不到进度条时：点过「进入游戏」就先按已进本继续（不再回地图重进）----
+p_ae = build_profile()
+p_ae["enter"].update({"travel_wait": 1.0, "dialog_timeout": 3.0,
+                      "blind_confirm_after": 1.0, "retry": 2,
+                      "assume_entered": True})
+g_ae = FakeGame(fill_time=0.01, fill_max=0.0, enter_appears=True)
+logs_ae = []
+r_ae = df.DungeonRunner(g_ae, p_ae, log=logs_ae.append)
+ok_ae = r_ae.enter_dungeon()
+_clicks_ae = [a[1] for a in g_ae.actions if a[0] == "click"]
+check("测不到进度条 → 仍然算进本（不回去重复进本）", ok_ae is True)
+check("只点了一次「进入游戏」", g_ae.confirm_count == 1,
+      str(g_ae.confirm_count))
+check("日志写明了为什么继续",
+      any("先按已进本继续" in l for l in logs_ae),
+      str([l for l in logs_ae if "进度条" in l][:2]))
+
 # ---- 多开不互相卡节奏：OCR 抢不到锁就跳过，不挡攻击 ----
 check("能识别「多开的兄弟窗口」标题",
       df.is_game_title("CreatureCurios - 冰牙鲨鱼") is True

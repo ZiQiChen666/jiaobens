@@ -114,6 +114,8 @@ DEFAULT_PROFILE: dict = {
         "progress": {"roi": None, "min_fill": 0.90, "samples": 3,
                      "interval": 0.25},  # 加载进度条区域 + 满多少算加载完
         "blind_confirm_after": 3.0,  # 这么久还没识别到弹窗 → 先盲点一次确认
+        "still_diff": 0.02,        # 相邻两帧差异小于它才算"画面静止"（静止了才比对弹窗）
+        "assume_entered": True,    # 测不到进度条时，点过「进入游戏」就先当已进本
         "load_wait": 10.0,         # 点完确认后的加载时间
         "retry": 3,                # 没识别到弹窗 → 重新开图重点，最多几次
         "map_radius": 0.02,        # 重试时在副本入口周围绕圈微调（归一化半径）
@@ -1039,6 +1041,7 @@ class DungeonRunner:
         self._hp_skipped = False
         self._hp_ocr_logged = False
         self._hp_ocr_busy = 0
+        self._last_progress_seen = False
         self._last_hp_detail = ""
         self._icon_checks = 0
         self._icon_miss_shot = False
@@ -1458,6 +1461,56 @@ class DungeonRunner:
             self.game.sleep(0.35)
         self.gap("回收界面后缓冲")
 
+    def wait_anchor_still(self, spec: Optional[dict], timeout: float,
+                          desc: str, need: int = 2) -> bool:
+        """等画面（相对）不动了，再比对锚点；环境一直在动就退化成"最像的一帧"。
+
+        走路/攻击时画面每帧都不一样，拿那种帧去比相似度必然偏低，
+        所以这里只在"相邻两帧几乎一样"的时候才算命中；一直有小动画
+        （树叶/粒子）导致永远不静止时，超时后用最像的一帧决定。
+        """
+        if not (spec or {}).get("roi"):
+            return False
+        poll = max(0.1, float((self.p.get("detect") or {}).get("poll", 0.3)))
+        still_d = float(spec.get("still_diff", 0.02) or 0.02)
+        sim_th = float(spec.get("sim") or self._detect_cfg("sim", 0.80))
+        start = self.game.now()
+        prev = None
+        hits = 0
+        best = -1.0
+        next_log = 0.0
+        while not self._stopping() and self.game.now() - start < timeout:
+            frame = self.grab()
+            if frame is None:
+                self.game.sleep(poll)
+                continue
+            diff = None if prev is None else self.frame_diff(prev, frame)
+            prev = frame
+            sim, ink = self.anchor_metrics(spec, frame)
+            best = max(best, sim)
+            elapsed = self.game.now() - start
+            if diff is not None and diff > still_d:
+                hits = 0                      # 画面还在动，先不认
+            elif self.anchor_visible(spec, frame):
+                hits += 1
+                if hits >= max(1, int(need)):
+                    self.log(f"画面静止后识别到{desc}"
+                             f"（相似度 {sim:.2f} / 占比 {ink:.2f}）")
+                    return True
+            else:
+                hits = 0
+            if elapsed >= next_log:
+                next_log = elapsed + 3.0
+                self.log(f"等{desc}… 相似度 {sim:.2f} / 占比 {ink:.2f}"
+                         + ("（画面在动，暂不判定）" if hits == 0 else ""))
+            self.game.sleep(poll)
+        if best >= sim_th:
+            self.log(f"画面一直有动画，但{desc}最像的一帧相似度 {best:.2f} "
+                     f"≥ {sim_th:.2f} → 认作命中")
+            return True
+        self.log(f"没识别到{desc}（最高相似度 {max(0.0, best):.2f}）")
+        return False
+
     def wait_until(self, spec: Optional[dict], timeout: float, desc: str,
                    need: int = 2) -> bool:
         """边等边看：区域内连续 need 次命中就立刻返回 True；超时返回 False。"""
@@ -1542,7 +1595,7 @@ class DungeonRunner:
         name = watch_desc or (f"{desc}到达标记" if watch is arrived_spec else f"{desc}目标")
         start = self.game.now()
         if (watch or {}).get("roi"):
-            if self.wait_until(watch, wait, name):
+            if self.wait_anchor_still(watch, wait, name):
                 return True
         if sleep_after:
             left = wait - (self.game.now() - start)
@@ -1659,17 +1712,61 @@ class DungeonRunner:
         roi = spec.get("roi")
         if not roi:
             return None
+        patch = self._progress_patch()
+        if patch is None:
+            return 0.0
+        return self._fill_from_patch(patch)
+
+    def _progress_patch(self):
+        """抓一张进度条区域（像素）。"""
+        roi = (self._progress_spec() or {}).get("roi")
+        if not roi:
+            return None
         frame = self.grab()
         if frame is None:
-            return 0.0
+            return None
         try:
             patch = crop_norm(frame, roi)
             if patch.size == 0:
+                return None
+            return patch.astype(np.int16)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _fill_from_patch(patch) -> float:
+        """静态量法：和「四条边的中位色」比，看有多少列和背景不一样。
+
+        （框里带一点背景/空槽时最准；如果框得正好只有条子，就得靠
+        _fill_vs_ref 那种「和第一帧比」的办法。）
+        """
+        try:
+            # 背景参考只取「上/下两行」：进度条是横条，上下通常是背景/空槽；
+            # 左右两列会有一半是条子，取进来反而把背景算错。
+            border = np.concatenate([patch[0], patch[-1]])
+            # 背景取「出现次数最多的颜色」（众数），比中位数稳：
+            # 条子占一半时中位数会落在条子和空槽中间，结果把两色都算成“有内容”。
+            q = (border // 24) * 24
+            uniq, counts = np.unique(q, axis=0, return_counts=True)
+            bg = uniq[counts.argmax()].astype(np.int16)
+            dev = np.abs(patch - bg).max(axis=2)          # H×W
+            col_lit = (dev > 36).mean(axis=0) > 0.30
+            fill_dev = float(col_lit.mean())
+            bright_th = max(90, int(bg.max()) + 20)
+            col_bright = (patch.max(axis=2) > bright_th).mean(axis=0) > 0.30
+            return max(fill_dev, float(col_bright.mean()))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _fill_vs_ref(patch, ref) -> float:
+        """和「加载刚开始那一帧」比：有多少列变了（框得只剩条子时的唯一办法）。"""
+        try:
+            if patch is None or ref is None or patch.shape != ref.shape:
                 return 0.0
-            bg = patch[0, 0].astype(np.int16)
-            dev = np.abs(patch.astype(np.int16) - bg).max(axis=2)  # H×W
-            col_lit = (dev > 36).mean(axis=0) > 0.30               # 每列是否亮
-            return float(col_lit.mean())
+            dev = np.abs(patch - ref).max(axis=2)
+            col = (dev > 36).mean(axis=0) > 0.30
+            return float(col.mean())
         except Exception:
             return 0.0
 
@@ -1685,23 +1782,33 @@ class DungeonRunner:
         start = self.game.now()
         seen_bar = False
         best = 0.0
+        ref_patch = None
         while not self._stopping() and self.game.now() - start < timeout:
-            fill = self.progress_fill()
-            if fill is not None:
-                if fill > 0.05:
+            patch = self._progress_patch()
+            fill = 0.0
+            if patch is not None:
+                if ref_patch is None:
+                    ref_patch = patch
+                static_fill = self._fill_from_patch(patch)
+                grow_fill = self._fill_vs_ref(patch, ref_patch)
+                fill = max(static_fill, grow_fill)
+                if fill > 0.02:
                     seen_bar = True
                 # 连采几帧取最大，避免刚好截到半截进度条
-                for _ in range(samples - 1):
+                for _ in range(max(0, samples - 1)):
                     self.game.sleep(interval)
-                    more = self.progress_fill()
-                    if more is not None:
-                        fill = max(fill, more)
+                    more_patch = self._progress_patch()
+                    if more_patch is not None:
+                        fill = max(fill, self._fill_from_patch(more_patch),
+                                   self._fill_vs_ref(more_patch, ref_patch))
                 best = max(best, fill)
                 if fill >= min_fill:
+                    self._last_progress_seen = True
                     self.log(f"进度条 {fill * 100:.0f}% ≥ {min_fill * 100:.0f}% → 加载完成")
                     return True
                 self.log(f"进度条 {fill * 100:.0f}%…（等加载）")
             self.game.sleep(poll)
+        self._last_progress_seen = seen_bar
         if not seen_bar:
             self.log("没看到加载进度条 → 认为没有进入副本")
         else:
@@ -1751,15 +1858,35 @@ class DungeonRunner:
                 return False
             blind_done = False
             start = self.game.now()
+            prev = None
+            hits = 0
+            best = -1.0
+            still_d = float(enter.get("still_diff", 0.02) or 0.02)
+            next_log = 0.0
             while not self._stopping() and self.game.now() - start < timeout:
-                # 弹窗一出现就点
+                # 弹窗一出现就点（只在画面相对不动时认，避免走路/动画帧误判）
                 if (spec or {}).get("roi"):
                     frame = self.grab()
-                    if frame is not None and self.anchor_visible(spec, frame):
-                        self.log(f"识别到进入弹窗（{self.game.now() - start:.1f}s）→ 点「进入游戏」")
-                        self.game.click_norm(confirm_pt)
-                        self.release_focus()
-                        break
+                    if frame is not None:
+                        diff = None if prev is None else self.frame_diff(prev, frame)
+                        prev = frame
+                        sim, ink = self.anchor_metrics(spec, frame)
+                        best = max(best, sim)
+                        if diff is not None and diff > still_d:
+                            hits = 0
+                        elif self.anchor_visible(spec, frame):
+                            hits += 1
+                            if hits >= 2:
+                                self.log(f"识别到进入弹窗（{self.game.now() - start:.1f}s"
+                                         f"，相似度 {sim:.2f}）→ 点「进入游戏」")
+                                self.game.click_norm(confirm_pt)
+                                self.release_focus()
+                                break
+                        else:
+                            hits = 0
+                        if self.game.now() - start >= next_log:
+                            next_log = self.game.now() - start + 3.0
+                            self.log(f"等进入弹窗… 相似度 {sim:.2f} / 占比 {ink:.2f}")
                 # 识别不到就早点盲点一次（不傻等 24s）
                 if (not blind_done
                         and self.game.now() - start >= blind_after):
@@ -1790,6 +1917,11 @@ class DungeonRunner:
             if (loaded or {}).get("roi") and self.wait_until(loaded, 3.0, "副本内特征"):
                 self.gap("进本完成后缓冲")
                 self.release_focus()
+                return True
+            if (bool(enter.get("assume_entered", True))
+                    and not getattr(self, "_last_progress_seen", False)):
+                self.log("没测到加载进度条 → 但已经点过「进入游戏」，"
+                         "先按已进本继续（到 BOSS 点再看结果）")
                 return True
             self.log("没看到加载进度条 → 认为没进副本，重新寻路")
         self.log(f"进本失败：{attempts} 次都没能进副本")
@@ -2221,14 +2353,9 @@ class DungeonRunner:
             if not (spec or {}).get("roi"):
                 self.game.sleep(travel)
                 return True
-            still_s = float(spec.get("still_seconds", 0.8) or 0.8)
-            still_t = float(spec.get("still_timeout", 12.0) or 12.0)
-            still_d = float(spec.get("still_diff", 0.015) or 0.015)
             self.release_focus()
-            self.log("等角色停下（画面不动了再识别 BOSS）")
-            self.wait_scene_still(still_s, still_t, still_d)
-            self.gap("到 BOSS 点后缓冲")
-            if self.wait_until(spec, 6.0, "BOSS 身形"):
+            self.log("等角色停下（画面不动了再识别 BOSS 身形/小鹿）")
+            if self.wait_anchor_still(spec, 8.0, "BOSS 身形"):
                 return True
             self.log("没识别到「BOSS 身形」→ 回地图重新点 BOSS 点")
             self.recover_ui("到点后没看到 BOSS（可能走歪了）")
@@ -2843,14 +2970,9 @@ class DungeonRunner:
                 return self._failed("引路宏回放失败")
             spec = self._anchor_of("boss_present")
             if (spec or {}).get("roi"):
-                still_s = float(spec.get("still_seconds", 0.8) or 0.8)
-                still_t = float(spec.get("still_timeout", 12.0) or 12.0)
-                still_d = float(spec.get("still_diff", 0.015) or 0.015)
                 self.release_focus()
                 self.log("引路宏跑完，等角色停下再识别 BOSS")
-                self.wait_scene_still(still_s, still_t, still_d)
-                self.gap("到 BOSS 点后缓冲")
-                if self.wait_until(spec, 6.0, "BOSS 身形"):
+                if self.wait_anchor_still(spec, 10.0, "BOSS 身形"):
                     if not self._fight_clones(kills, at_boss=True):
                         return self._failed("BOSS 点打怪失败")
                 elif self.nav_macro().get("fallback", False):
