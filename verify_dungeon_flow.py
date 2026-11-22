@@ -14,6 +14,13 @@ import numpy as np
 
 import dungeon_flow as df
 
+# 测试里用的都是假窗口（合成画面），真跑 ONNX 没意义还慢：
+# 统一给个便宜的桩，个别用例会自己再覆盖。
+_REAL_HP_OCR_ = df.app.ocr_hp_from_bgra
+_REAL_FAT_OCR_ = df.app.ocr_fatigue_from_bgra
+df.app.ocr_hp_from_bgra = lambda data, w, h, roi: (2000, 3000, "2000/3000")
+df.app.ocr_fatigue_from_bgra = lambda data, w, h, roi: (None, None, "未识别到疲劳")
+
 W, H = 200, 120
 PT_DUNGEON = (0.30, 0.55)   # 副本入口（地图1）
 PT_CONFIRM = (0.50, 0.55)   # 弹窗「进入游戏」
@@ -735,6 +742,9 @@ try:
     g_ocr.state["body"] = True
     logs_ocr = []
     r_ocr = df.DungeonRunner(g_ocr, p_ocr, log=logs_ocr.append)
+    # 这个用例要手动喂 OCR 结果：关掉后台线程，走同步路径
+    r_ocr.start_ocr_worker = lambda jobs: None
+    r_ocr.stop_ocr_worker = lambda: None
     r_ocr.hp_now = lambda: 5000
     _t_ocr = g_ocr.t
     r_ocr.fight_until_finish()
@@ -1248,6 +1258,42 @@ check("只点了一次「进入游戏」", g_ae.confirm_count == 1,
 check("日志写明了为什么继续",
       any("先按已进本继续" in l for l in logs_ae),
       str([l for l in logs_ae if "进度条" in l][:2]))
+
+# ---- 血量 OCR 放后台：攻击循环不再被截图/OCR 卡住 ----
+import time as _time
+
+g_w = FakeGame()
+p_w = build_profile()          # 带 hp_roi + 阈值
+r_w = df.DungeonRunner(g_w, p_w, log=lambda _s: None)
+r_w.start_ocr_worker([("hp", 0.5)])
+for _ in range(80):
+    if r_w._ocr_value("hp") is not None:
+        break
+    _time.sleep(0.02)
+check("后台线程读到了血量", r_w._ocr_value("hp") == 2000,
+      str(r_w._ocr_value("hp")))
+check("主循环 hp_now() 直接读缓存（不再同步 OCR）", r_w.hp_now() == 2000)
+r_w.stop_ocr_worker()
+
+
+def _slow_hp_ocr(data, w, h, roi):
+    _time.sleep(0.30)
+    return 2000, 3000, ""
+
+
+df.app.ocr_hp_from_bgra = _slow_hp_ocr
+try:
+    g_slow = FakeGame()
+    r_slow = df.DungeonRunner(g_slow, build_profile(), log=lambda _s: None)
+    _t0 = _time.time()
+    r_slow.combat(3.0, desc="慢OCR挂机")
+    _dt = _time.time() - _t0
+finally:
+    df.app.ocr_hp_from_bgra = lambda data, w, h, roi: (2000, 3000, "2000/3000")
+check("OCR 慢 0.3s 也不拖累挂机（3 秒挂机 < 1.5 秒真实耗时）",
+      _dt < 1.5, f"{_dt:.2f}s")
+check("挂机中途照样在按 A",
+      any(a == ("tap", "a") for a in g_slow.actions))
 
 # ---- 多开不互相卡节奏：OCR 抢不到锁就跳过，不挡攻击 ----
 check("能识别「多开的兄弟窗口」标题",

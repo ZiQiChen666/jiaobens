@@ -641,6 +641,7 @@ class WinGame:
         self._block_input_ok: Optional[bool] = None   # None=还没试过
         self._hold_saved_cursor = None
         self._hold_saved_focus = 0
+        self._grab_lock = threading.RLock()
 
     # -- 基础 --
     def now(self) -> float:
@@ -669,9 +670,10 @@ class WinGame:
 
     # -- 截图 --
     def grab(self):
-        cap, err = app.capture_client_bgra(self.hwnd)
-        self.last_error = err or ""
-        return cap
+        with self._grab_lock:          # 后台 OCR 线程也会截图，串起来
+            cap, err = app.capture_client_bgra(self.hwnd)
+            self.last_error = err or ""
+            return cap
 
     def snapshot(self, tag: str) -> None:
         if not self.snapshot_dir:
@@ -1022,6 +1024,45 @@ class WinGame:
 # ---------------------------------------------------------------------------
 
 
+class _OcrWorker(threading.Thread):
+    """后台读血量（玩家 / BOSS 血量）：攻击循环只读缓存，不会被 OCR 卡住。
+
+    以前 hp_now()/BOSS 血量 OCR 是在攻击循环里同步做的（截图 ~0.1-0.3s +
+    OCR ~0.5s），所以每 2 秒就停一下，手感就是"平A一顿一顿的"。
+    """
+
+    def __init__(self, runner: "DungeonRunner"):
+        super().__init__(daemon=True)
+        self.runner = runner
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        r = self.runner
+        while not self._stop.wait(0.1):
+            jobs = list(getattr(r, "_ocr_jobs", []))
+            now = time.monotonic()
+            for key, every in jobs:
+                if self._stop.is_set():
+                    return
+                if now < r._ocr_next.get(key, 0.0):
+                    continue
+                r._ocr_next[key] = now + max(0.5, float(every))
+                try:
+                    if key == "hp":
+                        val = r._read_hp_sync()
+                    elif key == "boss_hp":
+                        val = r._read_boss_hp_text_sync()
+                    else:
+                        continue
+                except Exception:
+                    val = None
+                with r._ocr_res_lock:
+                    r._ocr_results[key] = (val, time.monotonic())
+
+
 class DungeonRunner:
     """三步流程：进本 → BOSS 点挂机 → 退出。"""
 
@@ -1049,6 +1090,11 @@ class DungeonRunner:
         self._hp_ocr_logged = False
         self._hp_ocr_busy = 0
         self._last_progress_seen = False
+        self._ocr_worker = None
+        self._ocr_jobs: list = []
+        self._ocr_next: dict = {}
+        self._ocr_results: dict = {}
+        self._ocr_res_lock = threading.Lock()
         self._last_hp_detail = ""
         self._icon_checks = 0
         self._icon_miss_shot = False
@@ -1251,8 +1297,50 @@ class DungeonRunner:
             self.game.sleep(poll)
         return False
 
-    def hp_now(self):
+    # ---- 后台 OCR（血量）----
+    def start_ocr_worker(self, jobs) -> None:
+        """启动后台 OCR；jobs = [(key, every_seconds), ...]。"""
+        self.stop_ocr_worker()
+        self._ocr_jobs = list(jobs or [])
+        self._ocr_next = {}
+        self._ocr_results = {}
+        if not self._ocr_jobs:
+            return
+        worker = _OcrWorker(self)
+        self._ocr_worker = worker
+        worker.start()
+
+    def stop_ocr_worker(self) -> None:
+        worker = getattr(self, "_ocr_worker", None)
+        self._ocr_worker = None
+        if worker is not None:
+            worker.stop()
+            try:
+                worker.join(1.0)
+            except Exception:
+                pass
+
+    def _ocr_value(self, key):
+        with self._ocr_res_lock:
+            item = self._ocr_results.get(key)
+        return item[0] if item else None
+
+    def _read_hp_sync(self):
+        """同步读一次玩家血量（后台 OCR 线程用）。"""
+        fn = self.hp_now
+        try:
+            return fn(from_worker=True)
+        except TypeError:          # 单测里可能把 hp_now 换成无参 lambda
+            return fn()
+
+    def _read_boss_hp_text_sync(self) -> str:
+        return self.boss_hp_ocr_text()
+
+    def hp_now(self, from_worker: bool = False):
         """OCR 当前血量；没配区域返回 None。
+
+        有后台 OCR 线程时**直接读缓存**（不阻塞攻击循环）；没有线程时
+        （probe / 单测 / CLI）才现场截图 + OCR。
 
         两个坑（都会导致"永远不喝药"）已修：
           · 必须**现拍一张**：_last_frame 在打怪阶段还是进本前的旧图（血是满的）；
@@ -1262,6 +1350,8 @@ class DungeonRunner:
         roi = self._farm().get("hp_roi")
         if not roi:
             return None
+        if self._ocr_worker is not None and not from_worker:
+            return self._ocr_value("hp")
         frame = self.grab()
         if frame is None:
             return None
@@ -2251,7 +2341,12 @@ class DungeonRunner:
         w, h, data = frame
         try:
             rect = app.roi_from_norm(tuple(float(v) for v in roi), w, h)
-            return app.ocr_text_from_bgra(data, w, h, rect)
+            if not _OCR_LOCK.acquire(timeout=1.5):
+                return ""             # 别的窗口在 OCR，这次算了
+            try:
+                return app.ocr_text_from_bgra(data, w, h, rect)
+            finally:
+                _OCR_LOCK.release()
         except Exception as exc:
             self.log(f"血量 OCR 失败：{type(exc).__name__}: {exc}")
             return ""
@@ -2267,8 +2362,16 @@ class DungeonRunner:
         now = self.game.now()
         if now < self._hp_ocr_at:
             return self._hp_ocr_visible
-        # 多开时 OCR 引擎是共用的：拿不到锁就跳过这一轮，绝不让别的窗口
-        # 把本窗口的攻击节奏卡住（跳过不算漏读，不会误判死亡）。
+        if self._ocr_worker is not None:
+            # 后台线程在读：只读缓存，绝不在这里阻塞（攻击节奏优先）
+            text = self._ocr_value("boss_hp")
+            if text is None:
+                self._hp_skipped = True
+                return self._hp_ocr_visible
+            self._hp_ocr_at = now + every
+            self._hp_skipped = False
+            return self._apply_boss_hp_text(text)
+        # 没有后台线程（probe / CLI）：同步读，但抢不到锁就跳过
         if not _OCR_LOCK.acquire(blocking=False):
             self._hp_ocr_skips += 1
             self._hp_skipped = True
@@ -2281,6 +2384,11 @@ class DungeonRunner:
             text = self.boss_hp_ocr_text()
         finally:
             _OCR_LOCK.release()
+        return self._apply_boss_hp_text(text)
+
+    def _apply_boss_hp_text(self, text: str) -> bool:
+        """把 OCR 到的一行文字变成「BOSS 还在不在」。"""
+        spec = self._anchor_of("boss_hp")
         current, maximum = app.parse_hp_text(text)
         if maximum is not None and (current is None
                                     or maximum < current
@@ -2463,6 +2571,14 @@ class DungeonRunner:
         self.restore_user_foreground()
         self.log("打BOSS：A/技能/拾取全部后台 PostMessage 发送"
                  "（窗口不用在前台）")
+        # 血量 OCR 全部丢到后台线程：攻击循环只读缓存，不会被截图/OCR 卡住
+        _jobs = []
+        if hp_threshold > 0 and farm.get("hp_roi"):
+            _jobs.append(("hp", hp_every))
+        if (hp_spec or {}).get("roi") and hp_mode == "ocr":
+            _jobs.append(("boss_hp", float((hp_spec or {}).get("ocr_every", 2.0)
+                                          or 2.0)))
+        self.start_ocr_worker(_jobs)
         if hp_threshold > 0 and farm.get("hp_roi"):
             self.log(f"自动喝药：血量 < {hp_threshold} → 每 {potion_every:.0f}s 按"
                      f"「{'、'.join(potion_keys)}」，血够了就停")
@@ -2614,6 +2730,7 @@ class DungeonRunner:
                         break
 
             self.game.sleep(interval)
+        self.stop_ocr_worker()
         return True
 
     def run_loops(self) -> bool:
@@ -2696,6 +2813,10 @@ class DungeonRunner:
         if timer_on and timer_every > 0:
             self.log(f"定时喝药：开打先按一次「{'、'.join(potion_keys)}」，之后每 "
                      f"{timer_every:.0f}s 一次")
+        _jobs = []
+        if hp_threshold > 0 and farm.get("hp_roi"):
+            _jobs.append(("hp", hp_every))
+        self.start_ocr_worker(_jobs)
         start = self.game.now()
         next_s1 = next_s2 = 0.0
         next_potion = 0.0
@@ -2789,6 +2910,7 @@ class DungeonRunner:
 
             self.game.sleep(interval)
 
+        self.stop_ocr_worker()
         self.log(f"{desc}：结束（{self.game.now() - start:.0f}s）")
         return True
 
