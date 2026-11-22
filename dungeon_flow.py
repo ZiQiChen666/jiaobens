@@ -51,6 +51,7 @@ except ImportError:  # pragma: no cover
 
 PROFILE_NAME = "dungeon_profile.json"
 SNAPSHOT_DIR_NAME = "runs"
+SNAPSHOT_KEEP = 200          # runs 里最多留多少张 png（不然跑一晚上几个 G）
 DUNGEON_DIR_NAME = "dungeons"
 ACTIVE_NAME_FILE = "dungeon_active.txt"
 
@@ -145,7 +146,7 @@ DEFAULT_PROFILE: dict = {
         # ↑ BOSS 身形：只在「画面完全不动」时比对，相似度要 ≥ max(sim, 0.75)，
         #   防止路过的「小怪」被当成 BOSS
         "boss_hp": {"roi": None, "mode": "ocr", "kill_hp": 0, "miss": 3,
-                    "ocr_every": 2.0, "grace": 6.0, "min_fill": 0.15},
+                    "ocr_every": 3.0, "grace": 6.0, "min_fill": 0.15},
         # ↑ BOSS 死亡判定（默认 mode=ocr，和主程序 BossWatcher 同一套）：
         #   对框住的区域 OCR 读「名字 + 当前/最大血量」；
         #   读到 0（或 ≤kill_hp）→ 死；连续 miss 次读不到（血条/名字消失）→ 死。
@@ -160,7 +161,7 @@ DEFAULT_PROFILE: dict = {
         "skill2": "2", "skill2_every": 6.0,
         "hp_roi": None,            # 血量数字区域（框了才按血量喝药）
         "hp_threshold": 1600,
-        "hp_check_every": 2.0,
+        "hp_check_every": 3.0,
         "potion_keys": ["q", "w", "e"],  # 低于阈值时依次按 Q、W、E
         "potion_every": 6.0,             # 低于阈值时，每 6 秒喝一次
         "potion_timer_enabled": False,   # 定时喝药（不管血量，每 N 秒按一次）
@@ -394,6 +395,11 @@ def _normalize_profile(p: dict) -> dict:
                 # v3.25.13：默认改成 90 秒（1 分半）查一次疲劳
                 loop_cfg["fatigue_every"] = 90.0
             p.setdefault("loop", {}).update(loop_cfg)
+        farm_cfg2 = (p.get("farm") or {})
+        if isinstance(farm_cfg2, dict):
+            if float(farm_cfg2.get("hp_check_every", 3.0) or 3.0) <= 2.0:
+                farm_cfg2["hp_check_every"] = 3.0
+            p.setdefault("farm", {}).update(farm_cfg2)
         fat = (p.get("fatigue") or {})
         if isinstance(fat, dict):
             if fat.get("low") is None or fat.get("high") is None:
@@ -415,7 +421,9 @@ def _normalize_profile(p: dict) -> dict:
                 # 之前自动写进去的 icon / bar / ink 统统回到 OCR（最可靠那个）
                 hp["mode"] = "ocr"
             hp.setdefault("kill_hp", 0)
-            hp.setdefault("ocr_every", 2.0)
+            if float(hp.get("ocr_every", 3.0) or 3.0) <= 2.0:
+                hp["ocr_every"] = 3.0     # v3.25.17：多开时别 2 秒读一次
+            hp.setdefault("ocr_every", 3.0)
             hp.setdefault("grace", 6.0)
             hp.setdefault("sim", 0.75)
             hp.setdefault("grid", 12)
@@ -642,6 +650,7 @@ class WinGame:
         self._hold_saved_cursor = None
         self._hold_saved_focus = 0
         self._grab_lock = threading.RLock()
+        self._snapshot_count = 0
 
     # -- 基础 --
     def now(self) -> float:
@@ -691,6 +700,9 @@ class WinGame:
             stamp = datetime.datetime.now().strftime("%H%M%S")
             safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in tag)[:40]
             img.save(os.path.join(self.snapshot_dir, f"{stamp}_{safe}.png"))
+            self._snapshot_count += 1
+            if self._snapshot_count % 20 == 0:
+                _prune_snapshots(self.snapshot_dir)
         except Exception:
             pass
 
@@ -1299,9 +1311,15 @@ class DungeonRunner:
 
     # ---- 后台 OCR（血量）----
     def start_ocr_worker(self, jobs) -> None:
-        """启动后台 OCR；jobs = [(key, every_seconds), ...]。"""
+        """启动后台 OCR；jobs = [(key, every_seconds), ...]。
+
+        任务没变就复用现有线程（farm_round 会反复调 combat，别反复起停线程）。
+        """
+        jobs = [(str(k), float(e)) for k, e in (jobs or [])]
+        if self._ocr_worker is not None and list(self._ocr_jobs) == jobs:
+            return
         self.stop_ocr_worker()
-        self._ocr_jobs = list(jobs or [])
+        self._ocr_jobs = list(jobs)
         self._ocr_next = {}
         self._ocr_results = {}
         if not self._ocr_jobs:
@@ -2198,6 +2216,9 @@ class DungeonRunner:
             path = os.path.join(folder, f"{stamp}_{safe}.png")
             img = np.ascontiguousarray(patch[:, :, :3]).astype(np.uint8)
             Image.fromarray(img).save(path)
+            self._patch_saved = int(getattr(self, "_patch_saved", 0)) + 1
+            if self._patch_saved % 20 == 0:
+                _prune_snapshots(folder)
             return path
         except Exception as exc:
             self.log(f"区域截图保存失败：{exc}")
@@ -3305,6 +3326,23 @@ def find_window(keyword: str) -> Optional[int]:
         return None
     wins.sort(key=lambda item: len(item[1]))
     return wins[0][0]
+
+
+def _prune_snapshots(folder: str, keep: int = SNAPSHOT_KEEP) -> None:
+    """runs 目录只保留最近 keep 张 png。"""
+    try:
+        names = [n for n in os.listdir(folder) if n.lower().endswith(".png")]
+        if len(names) <= keep:
+            return
+        paths = [os.path.join(folder, n) for n in names]
+        paths.sort(key=lambda p: os.path.getmtime(p))
+        for path in paths[:len(paths) - keep]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 def snapshot_dir() -> str:

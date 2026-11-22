@@ -1259,6 +1259,54 @@ check("日志写明了为什么继续",
       any("先按已进本继续" in l for l in logs_ae),
       str([l for l in logs_ae if "进度条" in l][:2]))
 
+# ---- 快照目录只留最近 N 张（跑一晚上不会把磁盘塞满）----
+import tempfile as _tempfile
+
+_prune_dir = _tempfile.mkdtemp(prefix="runs_prune_")
+try:
+    import os as _os
+    import time as _t2
+    for i in range(12):
+        path = _os.path.join(_prune_dir, f"f{i:02d}.png")
+        with open(path, "wb") as fh:
+            fh.write(b"x")
+        _os.utime(path, (_t2.time() - 100 + i, _t2.time() - 100 + i))
+    df._prune_snapshots(_prune_dir, keep=5)
+    _left = sorted(_os.listdir(_prune_dir))
+    check("快照清理只保留最新 5 张", len(_left) == 5, str(_left))
+    check("留下的是最新的", _left == ["f07.png", "f08.png", "f09.png",
+                                      "f10.png", "f11.png"], str(_left))
+finally:
+    import shutil as _shutil
+    _shutil.rmtree(_prune_dir, ignore_errors=True)
+
+# ---- OCR 线程复用：任务不变就不再起停 ----
+g_reuse = FakeGame()
+r_reuse = df.DungeonRunner(g_reuse, build_profile(), log=lambda _s: None)
+r_reuse.start_ocr_worker([("hp", 2.0)])
+_w1 = r_reuse._ocr_worker
+r_reuse.start_ocr_worker([("hp", 2.0)])
+check("同样的 OCR 任务 → 复用同一个线程", r_reuse._ocr_worker is _w1)
+r_reuse.stop_ocr_worker()
+
+# ---- 省 CPU：血量/BOSS 血量默认 3 秒读一次（4 开时 OCR 是大头）----
+check("玩家血量默认 3 秒读一次",
+      df.DEFAULT_PROFILE["farm"]["hp_check_every"] == 3.0,
+      str(df.DEFAULT_PROFILE["farm"]["hp_check_every"]))
+check("BOSS 血量默认 3 秒读一次",
+      df.DEFAULT_PROFILE["farm"]["boss_hp"]["ocr_every"] == 3.0,
+      str(df.DEFAULT_PROFILE["farm"]["boss_hp"]["ocr_every"]))
+_p_cpu = df._normalize_profile({
+    "farm": {"hp_check_every": 2.0, "boss_hp": {"roi": [0, 0, 1, 1],
+                                                "ocr_every": 2.0}},
+    "loop": {}, "fatigue": {},
+})
+check("旧标定 2 秒 → 自动升到 3 秒",
+      _p_cpu["farm"]["hp_check_every"] == 3.0
+      and _p_cpu["farm"]["boss_hp"]["ocr_every"] == 3.0,
+      str((_p_cpu["farm"]["hp_check_every"],
+           _p_cpu["farm"]["boss_hp"]["ocr_every"])))
+
 # ---- 血量 OCR 放后台：攻击循环不再被截图/OCR 卡住 ----
 import time as _time
 

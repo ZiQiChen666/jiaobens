@@ -401,6 +401,10 @@ class DungeonTab(QWidget):
         self._nav_recorder = None
         self._nav_pending = False
         self._multi_warned = False
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self._save_now)
         self._loading = True
         self.setStyleSheet(LIGHT_QSS)
 
@@ -1241,11 +1245,12 @@ class DungeonTab(QWidget):
             label.setText("角色: 窗口最小化")
             return
         old = self._name_readers.get(index)
-        if old is not None and getattr(old, "isRunning", lambda: False)():
+        if old is not None:
             try:
-                old.stop()
+                if old.isRunning():
+                    old.stop()
             except Exception:
-                pass
+                pass          # 已经被 deleteLater 回收了，忽略
         label.setText("角色: 读取中…")
         try:
             reader = app.NameReader(int(hwnd), roi, parent=self)
@@ -1269,6 +1274,7 @@ class DungeonTab(QWidget):
                 self.multi_names[idx].setToolTip(str(message))
 
         reader.result.connect(on_result)
+        reader.finished.connect(reader.deleteLater)
         reader.start()
 
     def _read_all_names(self) -> None:
@@ -1303,6 +1309,11 @@ class DungeonTab(QWidget):
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(170)
         self.log.setPlaceholderText("运行日志")
+        # 只保留最近 1500 行 + 关掉 undo 栈：不然跑一晚上日志越堆越多，
+        # 每次 append 都要重排整篇 + undo 栈吃内存，界面会越来越卡。
+        self.log.setMaximumBlockCount(1500)
+        self.log.setUndoRedoEnabled(False)
+        self.log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         lay.addWidget(self.log)
         return box
 
@@ -1319,6 +1330,14 @@ class DungeonTab(QWidget):
         self.log.appendPlainText(f"[{datetime.datetime.now():%H:%M:%S}] {text}")
 
     def _save(self) -> None:
+        """攒 0.5 秒再写盘：界面上拖数值会连发 valueChanged，
+        每个都写一次 JSON 会让界面卡顿。"""
+        try:
+            self._save_timer.start()
+        except Exception:
+            self._save_now()
+
+    def _save_now(self) -> None:
         """有命名的副本方案就存进那个方案（这样“默认就是那个副本”），
         否则写默认标定文件。"""
         try:

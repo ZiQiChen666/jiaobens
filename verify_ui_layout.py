@@ -155,6 +155,12 @@ check_widgets_are_saved()
 
 if tab is not None:
     check("副本页实例已创建", True)
+    # 日志控件必须限行 + 关 undo：否则跑久了 append 越来越慢、内存一直涨
+    check("运行日志最多留 1500 行",
+          tab.log.maximumBlockCount() == 1500,
+          str(tab.log.maximumBlockCount()))
+    check("运行日志关掉 undo 栈", tab.log.isUndoRedoEnabled() is False)
+    check("存盘有防抖定时器", tab._save_timer.interval() == 500)
 
 
 def check_missing_items(tab) -> None:
