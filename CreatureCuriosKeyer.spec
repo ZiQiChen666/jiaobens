@@ -16,6 +16,8 @@ a = Analysis(
         'dungeon_flow',
         'dungeon_ui',
         'dungeon_wizard',
+        'dungeon_cross',
+        'dungeon_cross_ui',
         'keyboard._winkeyboard',
         'keyboard._winmouse',
         'keyboard._generic',

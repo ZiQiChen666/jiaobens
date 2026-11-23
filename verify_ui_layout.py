@@ -104,7 +104,9 @@ if tab is not None:
     scan(tab, "副本流程页")
 
 
-def check_widgets_are_saved(path: str = "dungeon_ui.py") -> None:
+def check_widgets_are_saved(path: str = "dungeon_ui.py",
+                            class_name: str = "DungeonTab",
+                            allowed=()) -> None:
     """静态检查：每个输入控件都必须被 _save_from_ui 读到（防“死控件”）。
 
     上一版就出过这种坑：界面里多了一个“打怪时每”=spin_fatigue_every，
@@ -117,7 +119,7 @@ def check_widgets_are_saved(path: str = "dungeon_ui.py") -> None:
     target = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
     tree = ast.parse(open(target, encoding="utf-8").read())
     cls = next(n for n in tree.body
-               if isinstance(n, ast.ClassDef) and n.name == "DungeonTab")
+               if isinstance(n, ast.ClassDef) and n.name == class_name)
     prefixes = ("spin_", "chk_", "edit_")
     created = set()
     save_reads = set()
@@ -146,7 +148,7 @@ def check_widgets_are_saved(path: str = "dungeon_ui.py") -> None:
                             and t.value.id == "self"
                             and t.attr.startswith(prefixes)):
                         created.add(t.attr)
-    dead = sorted(created - save_reads)
+    dead = sorted(set(created) - save_reads - set(allowed or ()))
     check(f"{path}：{len(created)} 个输入控件都接进了保存（无死控件）",
           not dead, "没被 _save_from_ui 读到：" + "、".join(dead))
 
@@ -208,7 +210,6 @@ def check_missing_items(tab) -> None:
 if tab is not None:
     check_missing_items(tab)
 
-
 def check_group_overlaps(widget, path: str):
     """把每个 QGroupBox 里直接子控件两两比几何，找“真叠在一起”。"""
     from PySide6.QtWidgets import QGroupBox
@@ -244,6 +245,24 @@ def check_group_overlaps(widget, path: str):
 
 if tab is not None:
     check_group_overlaps(tab, "副本流程页")
+
+cross_tab = getattr(w, "cross_tab", None)
+check("跨图打BOSS页存在", cross_tab is not None)
+if cross_tab is not None:
+    w.tabs.setCurrentWidget(cross_tab)
+    for _ in range(8):
+        qa.processEvents()
+    scan(cross_tab, "跨图打BOSS页")
+    check_group_overlaps(cross_tab, "跨图打BOSS页")
+    check("跨图日志最多留 1200 行",
+          cross_tab.log.maximumBlockCount() == 1200,
+          str(cross_tab.log.maximumBlockCount()))
+    check("跨图日志关掉 undo 栈",
+          cross_tab.log.isUndoRedoEnabled() is False)
+    check_widgets_are_saved("dungeon_cross_ui.py", "CrossTab",
+                            allowed={"spin_farm_travel"})
+
+
 
 # 向导每页也扫一遍
 from dungeon_wizard import DungeonWizard  # noqa: E402

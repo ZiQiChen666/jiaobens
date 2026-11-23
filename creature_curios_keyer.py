@@ -4503,6 +4503,23 @@ class MainWindow(QMainWindow):
                 f"副本流程页加载失败：{type(exc).__name__}: {exc}"
                 + chr(10) + detail
             )
+
+        try:
+            from dungeon_cross_ui import CrossTab
+
+            self.cross_tab = CrossTab(self)
+            self.tabs.addTab(self.cross_tab, "跨图打BOSS")
+            self._log_startup(
+                f"跨图打BOSS页已加载（tab 序号 {self.tabs.indexOf(self.cross_tab)}）"
+            )
+        except Exception as exc:  # 跨图页加载失败不影响主流程
+            self.cross_tab = None
+            import traceback
+
+            self._log_startup(
+                f"跨图打BOSS页加载失败：{type(exc).__name__}: {exc}"
+                + chr(10) + traceback.format_exc()
+            )
             print(f"[警告] 副本流程页加载失败：{type(exc).__name__}: {exc}")
         root.addWidget(self.tabs, 1)
 
