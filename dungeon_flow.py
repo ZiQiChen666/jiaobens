@@ -1728,6 +1728,7 @@ class DungeonRunner:
             self.log(f"点击「{desc}」失败")
             return False
         self.release_focus()
+        self.after_map_click()
 
         watch = watch_spec if (watch_spec or {}).get("roi") else arrived_spec
         name = watch_desc or (f"{desc}到达标记" if watch is arrived_spec else f"{desc}目标")
@@ -1740,6 +1741,10 @@ class DungeonRunner:
             if left > 0:
                 self.game.sleep(left)
         return True
+
+    def after_map_click(self) -> None:
+        """点完地图点位之后的钩子（副本流程不用，跨图流程会拿它关地图）。"""
+        return None
 
     def _arrived_spec(self) -> dict:
         return (self._farm().get("arrived") or {})

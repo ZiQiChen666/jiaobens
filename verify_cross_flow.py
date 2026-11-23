@@ -107,6 +107,8 @@ def build_profile():
     p["loop"]["fatigue_every"] = 10.0
     p["fatigue"] = {"enabled": True, "low": -600, "high": 600,
                     "pt": [0.1, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]}
+    p["cross"]["close_map_after_click"] = True
+    p["cross"]["close_key"] = "esc"
     p["cross"]["auto_enter"] = False      # 这一份先只测路径本身
     p["cross"]["auto_exit"] = False
     p["retry"] = {"rounds": 1, "gap": 1.0, "max_fail": 1}
@@ -120,8 +122,19 @@ check("默认有 1 个打怪点", len(p_def["cross"]["farm_points"]) == 1,
 check("默认路径为空", p_def["cross"]["go_steps"] == []
       and p_def["cross"]["back_steps"] == [])
 miss = dc.missing_items(p_def)
-check("空标定时列出 8 项缺失（含进本/退本 4 个点位）",
-      len(miss) == 8, str(miss))
+check("空标定时列出 9~10 项缺失（本机若主界面框过疲劳区域会少一项）",
+      len(miss) in (9, 10), str(miss))
+check("缺失里点名了疲劳图标", any("疲劳图标" in m for m in miss), str(miss))
+
+# 本机没框过疲劳区域时，也要提醒去框
+_real_roi_loader = dc.df.app.load_fatigue_roi_norm
+dc.df.app.load_fatigue_roi_norm = lambda: None
+try:
+    _miss_roi = dc.missing_items(p_def)
+finally:
+    dc.df.app.load_fatigue_roi_norm = _real_roi_loader
+check("没有疲劳区域时会提醒去框",
+      any("疲劳提示区域" in m for m in _miss_roi), str(_miss_roi))
 check("缺失里点名了副本入口 / 进入游戏 / 退出副本 / 确认",
       any("副本入口" in m for m in miss)
       and any("进入游戏" in m for m in miss)
@@ -285,6 +298,63 @@ r5.fatigue_check = lambda **_kw: (-700, 1000, "")
 r5.enter_dungeon = lambda: False
 r5.exit_dungeon = lambda: True
 check("进本失败 → 本轮失败", r5.run_round() is False)
+
+# ---- 2c) 点完地图点位要关地图 -------------------------------------
+g6 = FakeGame()
+p6 = build_profile()
+r6 = dc.CrossRunner(g6, p6, log=lambda _s: None)
+r6.run_steps([{"type": "click", "pt": [0.3, 0.4], "wait": 0.0,
+               "open_map": True, "close_map": True}], "去程")
+_taps6 = [a[1] for a in g6.actions if a[0] == "tap"]
+check("点完点位会按关图键（esc）", _taps6 == ["m", "esc"], str(_taps6))
+
+g7 = FakeGame()
+p7 = build_profile()
+p7["cross"]["close_map_after_click"] = False
+r7 = dc.CrossRunner(g7, p7, log=lambda _s: None)
+r7.run_steps([{"type": "click", "pt": [0.3, 0.4], "wait": 0.0,
+               "open_map": True, "close_map": True}], "去程")
+check("关掉「点完关地图」后不再按 esc",
+      [a[1] for a in g7.actions if a[0] == "tap"] == ["m"],
+      str([a[1] for a in g7.actions if a[0] == "tap"]))
+
+# 走打怪点 / 打 BOSS 点（基类 _goto）也会关地图
+g8 = FakeGame()
+r8 = dc.CrossRunner(g8, build_profile(), log=lambda _s: None)
+r8._goto([0.3, 0.4], 0.2, "测试点")
+_taps8 = [a[1] for a in g8.actions if a[0] == "tap"]
+check("走地图点位（_goto）后也会关地图", _taps8 == ["m", "esc"], str(_taps8))
+
+# ---- 2d) 去程 / 回程 试运行 ----------------------------------------
+p_tg = _profile_with_dungeon()
+g_tg = FakeGame()
+logs_tg = []
+r_tg = dc.CrossRunner(g_tg, p_tg, log=logs_tg.append)
+steps_tg = []
+r_tg.enter_dungeon = lambda: steps_tg.append("enter") or True
+r_tg.fatigue_check = lambda **_kw: (-700, 1000, "")
+ok_tg = r_tg.test_path("go")
+_clicks_tg = [a[1] for a in g_tg.actions if a[0] == "click"]
+check("试跑去程成功", ok_tg is True)
+check("试跑去程：走了去程点 + 自动进本，但没打 BOSS",
+      PT_GO in _clicks_tg and PT_BOSS not in _clicks_tg
+      and steps_tg == ["enter"], str(_clicks_tg))
+check("试跑去程日志写明不打怪",
+      any("不自动打怪" in l for l in logs_tg), str(logs_tg[-3:]))
+
+g_tb = FakeGame()
+logs_tb = []
+r_tb = dc.CrossRunner(g_tb, p_tg, log=logs_tb.append)
+steps_tb = []
+r_tb.exit_dungeon = lambda: steps_tb.append("exit") or True
+ok_tb = r_tb.test_path("back")
+_clicks_tb = [a[1] for a in g_tb.actions if a[0] == "click"]
+check("试跑回程成功", ok_tb is True)
+check("试跑回程：先自动退本，再走回程点，最后回打怪点",
+      steps_tb == ["exit"] and PT_BACK in _clicks_tb
+      and PT_FARM in _clicks_tb, str(_clicks_tb))
+check("试跑回程日志写明回到打怪点",
+      any("试跑回程完成" in l for l in logs_tb), str(logs_tb[-3:]))
 
 # ---- 3) 没标 BOSS 点时给出明确失败 --------------------------------
 g2 = FakeGame()

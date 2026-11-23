@@ -59,12 +59,13 @@ class CrossThread(QThread):
     finished_ok = Signal(int, int)
 
     def __init__(self, hwnd: int, profile: dict, rounds: Optional[int],
-                 dry: bool = False, parent=None):
+                 dry: bool = False, mode: str = "run", parent=None):
         super().__init__(parent)
         self.hwnd = int(hwnd)
         self.profile = profile
         self.rounds = rounds
         self.dry = bool(dry)
+        self.mode = mode          # run / go / back / fatigue
         self._stop = threading.Event()
 
     def stop(self) -> None:
@@ -81,8 +82,19 @@ class CrossThread(QThread):
                 game, self.profile, log=self.line.emit,
                 stop_event=self._stop, verbose=True,
             )
-            runner.run(self.rounds)
-            self.finished_ok.emit(runner.stats["ok"], runner.stats["fail"])
+            if self.mode in ("go", "back"):
+                ok = runner.test_path(self.mode)
+                self.finished_ok.emit(1 if ok else 0, 0 if ok else 1)
+            elif self.mode == "fatigue":
+                cur, mx, msg = runner.fatigue_check()
+                if cur is None:
+                    self.line.emit(f"疲劳读不到：{msg}")
+                else:
+                    self.line.emit(f"疲劳读到：{cur}" + (f"/{mx}" if mx else ""))
+                self.finished_ok.emit(0, 0)
+            else:
+                runner.run(self.rounds)
+                self.finished_ok.emit(runner.stats["ok"], runner.stats["fail"])
         except Exception as exc:  # pragma: no cover
             self.line.emit(f"[错误] {type(exc).__name__}: {exc}")
             self.finished_ok.emit(0, 0)
@@ -105,6 +117,7 @@ class CrossTab(QWidget):
         self.step_widgets: dict = {}
         self.step_wait: dict = {}
         self.step_open_map: dict = {}
+        self.step_close_map: dict = {}
 
         self.setStyleSheet(dui.LIGHT_QSS)
         outer = QVBoxLayout(self)
@@ -228,6 +241,12 @@ class CrossTab(QWidget):
         chk.toggled.connect(lambda val, k=key: self._on_step_open_map(k, bool(val)))
         self.step_open_map[key] = chk
         row2.addWidget(chk)
+        chk_close = QCheckBox("点完关地图")
+        chk_close.setEnabled(False)
+        chk_close.toggled.connect(
+            lambda val, k=key: self._on_step_close_map(k, bool(val)))
+        self.step_close_map[key] = chk_close
+        row2.addWidget(chk_close)
         row2.addWidget(_hint("按顺序执行；「加点击」时程序会先按开图键再截图"), 1)
         v.addLayout(row2)
         return box
@@ -435,9 +454,56 @@ class CrossTab(QWidget):
         row.addStretch(1)
         g.addLayout(row, 3, 0, 1, 6)
 
+        # 疲劳：图标位置 + 提示区域（不标就会沿用主界面框过的区域）
+        self.lbl_fatigue_pt = QLabel("未设置")
+        self.lbl_fatigue_pt.setObjectName("muted")
+        g.addWidget(QLabel("疲劳图标"), 4, 0)
+        g.addWidget(self.lbl_fatigue_pt, 4, 1, 1, 2)
+        btn_fat_pt = QPushButton("标定")
+        btn_fat_pt.setFixedWidth(80)
+        btn_fat_pt.clicked.connect(self._pick_fatigue_pt)
+        g.addWidget(btn_fat_pt, 4, 3)
+
+        self.lbl_fatigue_roi = QLabel("未设置")
+        self.lbl_fatigue_roi.setObjectName("muted")
+        g.addWidget(QLabel("疲劳区域"), 5, 0)
+        g.addWidget(self.lbl_fatigue_roi, 5, 1, 1, 2)
+        row_fat = QHBoxLayout()
+        btn_fat_roi = QPushButton("框选")
+        btn_fat_roi.setFixedWidth(80)
+        btn_fat_roi.clicked.connect(lambda: self._pick_spec("fatigue_roi"))
+        btn_fat_test = QPushButton("读一次疲劳")
+        btn_fat_test.setToolTip("点一下疲劳图标并 OCR 读一次，日志里能看到读到多少")
+        btn_fat_test.clicked.connect(self._test_fatigue)
+        row_fat.addWidget(btn_fat_roi)
+        row_fat.addWidget(btn_fat_test)
+        row_fat.addStretch(1)
+        g.addLayout(row_fat, 5, 3)
+
+        row_map = QHBoxLayout()
+        self.chk_close_map = QCheckBox("点完地图点位就关地图")
+        self.chk_close_map.setChecked(True)
+        self.chk_close_map.setToolTip(
+            "点完地图上的点以后，按一下关图键（有些游戏不点一下就一直是地图，人物不走）")
+        self.chk_close_map.toggled.connect(self._save_from_ui)
+        row_map.addWidget(self.chk_close_map)
+        row_map.addWidget(QLabel("关图键"))
+        self.edit_close_key = QLineEdit("esc")
+        self.edit_close_key.setFixedWidth(70)
+        self.edit_close_key.editingFinished.connect(self._save_from_ui)
+        row_map.addWidget(self.edit_close_key)
+        row_map.addWidget(QLabel("开图键"))
+        self.edit_map_key = QLineEdit("m")
+        self.edit_map_key.setFixedWidth(70)
+        self.edit_map_key.editingFinished.connect(self._save_from_ui)
+        row_map.addWidget(self.edit_map_key)
+        row_map.addStretch(1)
+        g.addLayout(row_map, 6, 0, 1, 6)
+
         g.addWidget(_hint(
-            "疲劳图标位置/识别区域不用在这页标：没标会自动沿用主界面「疲劳检测」框过的区域。"
-        ), 4, 0, 1, 6)
+            "疲劳图标/区域不标也能跑：会自动沿用主界面「疲劳检测」框过的区域；"
+            "但这页标了更准。点「读一次疲劳」可以先确认能不能读到。"
+        ), 7, 0, 1, 6)
         return box
 
     def _build_run(self) -> QWidget:
@@ -449,6 +515,10 @@ class CrossTab(QWidget):
         self.btn_start.clicked.connect(lambda: self._start(dry=False))
         self.btn_dry = QPushButton("试跑一轮（不按键）")
         self.btn_dry.clicked.connect(lambda: self._start(dry=True))
+        self.btn_test_go = QPushButton("试跑去程（图2→图1）")
+        self.btn_test_go.clicked.connect(lambda: self._test_path("go"))
+        self.btn_test_back = QPushButton("试跑回程（图1→打怪点）")
+        self.btn_test_back.clicked.connect(lambda: self._test_path("back"))
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
@@ -456,6 +526,8 @@ class CrossTab(QWidget):
         self.lbl_state.setObjectName("muted")
         row.addWidget(self.btn_start)
         row.addWidget(self.btn_dry)
+        row.addWidget(self.btn_test_go)
+        row.addWidget(self.btn_test_back)
         row.addWidget(self.btn_stop)
         row.addWidget(self.lbl_state, 1)
         v.addLayout(row)
@@ -596,6 +668,27 @@ class CrossTab(QWidget):
             self.chk_skills.setChecked(bool(farm.get("use_skills", True)))
             self.chk_pickup_a.setChecked(bool(farm.get("pickup_on_a", True)))
             self.spin_gap.setValue(float((p.get("retry") or {}).get("gap", 5.0) or 5.0))
+
+            # 疲劳 / 关地图
+            fat_pt = fatigue.get("pt")
+            if fat_pt:
+                self.lbl_fatigue_pt.setText(
+                    f"已设置 ({fat_pt[0]:.3f}, {fat_pt[1]:.3f})")
+                self.lbl_fatigue_pt.setStyleSheet(
+                    "color: #15803d; font-weight: 600;")
+            else:
+                self.lbl_fatigue_pt.setText("未设置")
+                self.lbl_fatigue_pt.setStyleSheet("color: #444444;")
+            fat_roi = fatigue.get("roi")
+            self.lbl_fatigue_roi.setText(
+                "已设置 ✓" if fat_roi else "未设置（会沿用主界面框过的）")
+            self.lbl_fatigue_roi.setStyleSheet(
+                "color: #15803d; font-weight: 600;" if fat_roi
+                else "color: #444444;")
+            self.chk_close_map.setChecked(
+                bool(cross.get("close_map_after_click", True)))
+            self.edit_close_key.setText(str(cross.get("close_key") or "esc"))
+            self.edit_map_key.setText(str(cross.get("map_key") or "m"))
         finally:
             self._loading = False
 
@@ -768,19 +861,25 @@ class CrossTab(QWidget):
         st = self._selected_step(key)
         spin = self.step_wait[key]
         chk = self.step_open_map[key]
+        chk_close = self.step_close_map[key]
         spin.blockSignals(True)
         chk.blockSignals(True)
+        chk_close.blockSignals(True)
         if st is None:
             spin.setEnabled(False)
             chk.setEnabled(False)
+            chk_close.setEnabled(False)
         else:
             spin.setEnabled(True)
             spin.setValue(float(st.get("wait", 0.0) or 0.0))
             is_click = str(st.get("type")) == "click"
             chk.setEnabled(is_click)
             chk.setChecked(bool(st.get("open_map", True)))
+            chk_close.setEnabled(is_click)
+            chk_close.setChecked(bool(st.get("close_map", True)))
         spin.blockSignals(False)
         chk.blockSignals(False)
+        chk_close.blockSignals(False)
 
     def _on_step_wait(self, key: str, value: float) -> None:
         if self._loading:
@@ -804,6 +903,17 @@ class CrossTab(QWidget):
         self.step_widgets[key].item(row).setText(self._step_text(row + 1, st))
         self._save()
 
+    def _on_step_close_map(self, key: str, value: bool) -> None:
+        if self._loading:
+            return
+        st = self._selected_step(key)
+        if st is None or str(st.get("type")) != "click":
+            return
+        st["close_map"] = bool(value)
+        row = self.step_widgets[key].currentRow()
+        self.step_widgets[key].item(row).setText(self._step_text(row + 1, st))
+        self._save()
+
     def _add_click_step(self, key: str) -> None:
         hwnd = self._hwnd()
         if not hwnd:
@@ -822,6 +932,7 @@ class CrossTab(QWidget):
             "pt": [round(float(pt[0]), 6), round(float(pt[1]), 6)],
             "wait": 8.0,
             "open_map": True,
+            "close_map": True,
         })
         self._save()
         self._refresh_steps(key)
@@ -929,6 +1040,69 @@ class CrossTab(QWidget):
         self._load_ui()
         self._log(f"已设置：{title}")
 
+    def _pick_fatigue_pt(self) -> None:
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有窗口", "请先到「单开挂机」页绑定游戏窗口。")
+            return
+        fatigue = self.profile.setdefault("fatigue", {})
+        pt = dui.pick_point(
+            self, hwnd, "点「疲劳图标」",
+            "点一下游戏里那个会弹出疲劳值的图标/按钮（点开能看到当前疲劳值）。",
+            None, fatigue.get("pt"),
+        )
+        if not pt:
+            return
+        fatigue["pt"] = [round(float(pt[0]), 6), round(float(pt[1]), 6)]
+        fatigue["enabled"] = True
+        self._save()
+        self._load_ui()
+        self._log(f"已标定疲劳图标：({pt[0]:.3f}, {pt[1]:.3f})")
+
+    def _test_fatigue(self) -> None:
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有窗口", "请先到「单开挂机」页绑定游戏窗口。")
+            return
+        if self.thread is not None and self.thread.isRunning():
+            self._log("正在运行，先停下再试")
+            return
+        self._save_from_ui()
+        import json as _json
+        profile = _json.loads(_json.dumps(self.profile))
+        self.thread = CrossThread(hwnd, profile, 0, dry=False,
+                                  mode="fatigue", parent=self)
+        self.thread.line.connect(self._log)
+        self.thread.finished_ok.connect(self._on_finished)
+        self.thread.finished.connect(self._on_thread_finished)
+        self._set_running(True, "读疲劳中…")
+        self._log("读一次疲劳：点住图标 → 等提示框 → OCR（最多 3 秒 × 2 次）")
+        self.thread.start()
+
+    def _test_path(self, which: str) -> None:
+        if self.thread is not None and self.thread.isRunning():
+            self._log("已经在运行了（先点「停止」）")
+            return
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有窗口", "请先到「单开挂机」页绑定游戏窗口。")
+            return
+        self._save_from_ui()
+        import json as _json
+        profile = _json.loads(_json.dumps(self.profile))
+        self.thread = CrossThread(hwnd, profile, 1, dry=False,
+                                  mode=("back" if which == "back" else "go"),
+                                  parent=self)
+        self.thread.line.connect(self._log)
+        self.thread.finished_ok.connect(self._on_finished)
+        self.thread.finished.connect(self._on_thread_finished)
+        self._set_running(
+            True, "试跑去程中…" if which != "back" else "试跑回程中…")
+        self._log("试跑" + ("去程（图2 → 图1）" if which != "back"
+                            else "回程（图1 → 打怪点）")
+                  + "：只走路径，不打怪")
+        self.thread.start()
+
     def _pick_spec(self, kind: str) -> None:
         """框一个区域：present=图1 BOSS 身形，boss_hp=图1 BOSS 血量，player_hp=玩家血量。"""
         hwnd = self._hwnd()
@@ -938,7 +1112,13 @@ class CrossTab(QWidget):
         farm = self.profile.setdefault("farm", {})
         enter = self.profile.setdefault("enter", {})
         exit_cfg = self.profile.setdefault("exit", {})
-        if kind == "enter_dialog":
+        fatigue = self.profile.setdefault("fatigue", {})
+        if kind == "fatigue_roi":
+            spec = {"roi": fatigue.get("roi")}
+            title = "框住疲劳提示区域"
+            info = ("点一下疲劳图标会弹出「当前疲劳值:xxx/xxx」，框住这段文字"
+                    "（别框到会变的东西）")
+        elif kind == "enter_dialog":
             spec = enter.get("dialog") or {}
             title = "框住「进入游戏」弹窗"
             info = "先让进本弹窗弹出来再截图，框住弹窗里固定不变的部分"
@@ -966,7 +1146,10 @@ class CrossTab(QWidget):
         roi_norm = self._pick_region(hwnd, spec.get("roi"), title, info)
         if roi_norm is None:
             return
-        if kind in ("enter_dialog", "exit_dialog"):
+        if kind == "fatigue_roi":
+            fatigue["roi"] = roi_norm
+            fatigue["enabled"] = True
+        elif kind in ("enter_dialog", "exit_dialog"):
             sig = df.signature(df.crop_norm(self._last_pick_frame, roi_norm), 12)
             holder = enter if kind == "enter_dialog" else exit_cfg
             holder["dialog"] = {
@@ -1107,7 +1290,19 @@ class CrossTab(QWidget):
         cross = p.setdefault("cross", {})
         cross["auto_enter"] = bool(self.chk_auto_enter.isChecked())
         cross["auto_exit"] = bool(self.chk_auto_exit.isChecked())
+        cross["close_map_after_click"] = bool(self.chk_close_map.isChecked())
+        cross["close_key"] = self.edit_close_key.text().strip() or "esc"
+        cross["map_key"] = self.edit_map_key.text().strip() or "m"
         self._save()
+
+    def _set_running(self, running: bool, state: str = "") -> None:
+        self.btn_start.setEnabled(not running)
+        self.btn_dry.setEnabled(not running)
+        self.btn_test_go.setEnabled(not running)
+        self.btn_test_back.setEnabled(not running)
+        self.btn_stop.setEnabled(running)
+        if state:
+            self.lbl_state.setText(state)
 
     def _start(self, dry: bool = False) -> None:
         if self.thread is not None and self.thread.isRunning():
@@ -1132,10 +1327,7 @@ class CrossTab(QWidget):
         self.thread.line.connect(self._log)
         self.thread.finished_ok.connect(self._on_finished)
         self.thread.finished.connect(self._on_thread_finished)
-        self.btn_start.setEnabled(False)
-        self.btn_dry.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.lbl_state.setText("运行中…（试跑，不按键）" if dry else "运行中…")
+        self._set_running(True, "运行中…（试跑，不按键）" if dry else "运行中…")
         point = self._current_point() or {}
         self._log(f"=== 跨图打BOSS 开始：图2「{point.get('name')}」挂机 → "
                   f"图1 打BOSS → 回图2 ===")
@@ -1158,7 +1350,4 @@ class CrossTab(QWidget):
         self.thread = None
         if thread is not None:
             thread.deleteLater()
-        self.btn_start.setEnabled(True)
-        self.btn_dry.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.lbl_state.setText("未运行")
+        self._set_running(False, "未运行")

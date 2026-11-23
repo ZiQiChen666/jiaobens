@@ -49,6 +49,8 @@ def default_profile() -> dict:
         "back_to_farm": True,
         "auto_enter": True,            # 到图1 后自动「进入副本」
         "auto_exit": True,             # 打完 BOSS 自动「退出副本」
+        "close_map_after_click": True, # 点完地图点位顺手把地图关掉
+        "close_key": "esc",            # 关地图用的键
         "map_key": "m",                # 开图键（和副本流程一致）
     }
     return p
@@ -73,6 +75,7 @@ def _norm_steps(steps) -> list:
                 "pt": [round(float(pt[0]), 6), round(float(pt[1]), 6)],
                 "wait": wait,
                 "open_map": bool(st.get("open_map", True)),
+                "close_map": bool(st.get("close_map", True)),
             })
         elif typ == "key":
             name = str(st.get("key") or "").strip()
@@ -124,6 +127,8 @@ def normalize(profile: dict) -> dict:
     crop["back_to_farm"] = bool(crop.get("back_to_farm", True))
     crop["auto_enter"] = bool(crop.get("auto_enter", True))
     crop["auto_exit"] = bool(crop.get("auto_exit", True))
+    crop["close_map_after_click"] = bool(crop.get("close_map_after_click", True))
+    crop["close_key"] = str(crop.get("close_key") or "esc").strip() or "esc"
     crop["map_key"] = str(crop.get("map_key") or "m").strip() or "m"
     return df._normalize_profile(p)
 
@@ -182,6 +187,18 @@ def missing_items(profile: dict) -> list[str]:
             miss.append("③「确认」按钮")
     if not crop.get("back_steps"):
         miss.append("⑤ 回程路径（图1 → 图2）")
+    fatigue = p.get("fatigue") or {}
+    if fatigue.get("enabled", True):
+        has_roi = bool(fatigue.get("roi"))
+        if not has_roi:
+            try:
+                has_roi = bool(df.app.load_fatigue_roi_norm())
+            except Exception:
+                has_roi = False
+        if not has_roi:
+            miss.append("⑥ 疲劳提示区域（框一下，或者主界面框过）")
+        if not fatigue.get("pt"):
+            miss.append("⑥ 疲劳图标位置（点一下那个图标）")
     return miss
 
 
@@ -225,6 +242,18 @@ class CrossRunner(df.DungeonRunner):
         self.game.tap(key)
         self.game.sleep(0.8)
 
+    def close_map(self, force: bool = False) -> None:
+        """点完点位把地图关掉（不然一直挂着地图，人物不走/点不到东西）。"""
+        crop = self.cross()
+        if not force and not bool(crop.get("close_map_after_click", True)):
+            return
+        key = str(crop.get("close_key") or "esc")
+        self.game.tap(key)
+        self.game.sleep(0.35)
+
+    def after_map_click(self) -> None:
+        self.close_map()
+
     # ---- 路径 ----
     def run_steps(self, steps, desc: str) -> bool:
         """按顺序执行路径：点击（可先开地图）或按键，每步后面等 wait 秒。"""
@@ -254,6 +283,8 @@ class CrossRunner(df.DungeonRunner):
                     self.log(f"{desc} 第 {i} 步：点击失败")
                     return False
                 self.release_focus()
+                if bool(st.get("open_map", True)) and bool(st.get("close_map", True)):
+                    self.close_map()
             elif typ == "key":
                 key = str(st.get("key") or "").strip()
                 if not key:
@@ -350,6 +381,43 @@ class CrossRunner(df.DungeonRunner):
                     return self._failed("回打怪点失败")
                 self.gap("到打怪点后缓冲")
                 self._at_farm = True
+        return True
+
+    # ---- 试跑路径（只走路径，不打怪）----
+    def test_path(self, which: str = "go") -> bool:
+        crop = self.cross()
+        which = "back" if str(which) == "back" else "go"
+        if which == "go":
+            self.log("=== 试跑去程（图2 → 图1）===")
+            steps = crop.get("go_steps") or []
+            if not self.run_steps(steps, "去程"):
+                return self._failed("试跑去程失败")
+            has_enter = any(str(s.get("type")) == "enter" for s in steps)
+            if bool(crop.get("auto_enter", True)) and not has_enter:
+                self.log("=== 自动进入副本 ===")
+                if not self.enter_dungeon():
+                    return self._failed("试跑：进入副本失败")
+            self.log("试跑去程完成（走到图1、进本完成，不自动打怪）")
+            return True
+        self.log("=== 试跑回程（图1 → 图2）===")
+        steps = crop.get("back_steps") or []
+        has_exit = any(str(s.get("type")) == "exit" for s in steps)
+        if bool(crop.get("auto_exit", True)) and not has_exit:
+            self.log("=== 自动退出副本 ===")
+            if not self.exit_dungeon():
+                return self._failed("试跑：退出副本失败")
+        if not self.run_steps(steps, "回程"):
+            return self._failed("试跑回程失败")
+        if bool(crop.get("back_to_farm", True)):
+            point = self.current_farm_point()
+            if point and point.get("pt"):
+                name = str(point.get("name") or "打怪点")
+                travel = float(point.get("travel_wait", 20.0) or 20.0)
+                self.log(f"回到打怪点「{name}」（等寻路 {travel:.0f}s）")
+                if not self._goto(point.get("pt"), travel, f"打怪点「{name}」"):
+                    return self._failed("试跑：回打怪点失败")
+                self.gap("到打怪点后缓冲")
+        self.log("试跑回程完成（回到图2 打怪点）")
         return True
 
     # ---- 一轮 ----
