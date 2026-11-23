@@ -356,6 +356,89 @@ check("试跑回程：先自动退本，再走回程点，最后回打怪点",
 check("试跑回程日志写明回到打怪点",
       any("试跑回程完成" in l for l in logs_tb), str(logs_tb[-3:]))
 
+# ---- 2e) 鼠标宏：真实鼠标回放 + 优先于步骤 --------------------------
+p_mac = build_profile()
+p_mac["cross"]["go_macro"] = {"speed": 1.0, "meta": {}, "events": [
+    {"type": "key_down", "t": 0.0, "name": "m"},
+    {"type": "down", "t": 0.2, "nx": 0.33, "ny": 0.44},
+]}
+p_mac["cross"]["back_macro"] = {"speed": 1.0, "meta": {}, "events": [
+    {"type": "down", "t": 0.0, "nx": 0.66, "ny": 0.77},
+]}
+p_mac = dc.normalize(p_mac)
+check("宏事件被 normalize 保留",
+      len(p_mac["cross"]["go_macro"]["events"]) == 2
+      and len(p_mac["cross"]["back_macro"]["events"]) == 1,
+      str(p_mac["cross"]["go_macro"]))
+check("录了宏就不算缺去程/回程路径",
+      not any("去程路径" in m for m in dc.missing_items(p_mac))
+      and not any("回程路径" in m for m in dc.missing_items(p_mac)),
+      str(dc.missing_items(p_mac)))
+
+g9 = FakeGame()
+logs9 = []
+r9 = dc.CrossRunner(g9, p_mac, log=logs9.append)
+forc = {"during": None}
+_orig_click = g9.click_norm
+
+
+def _spy_click(point, keep_cursor=False):
+    forc["during"] = getattr(g9, "force_grab", None)
+    return _orig_click(point, keep_cursor)
+
+
+g9.click_norm = _spy_click
+ok9 = r9.play_macro("go")
+check("宏回放成功", ok9 is True)
+check("宏回放时强制真实鼠标（force_grab=True）", forc["during"] is True,
+      str(forc["during"]))
+check("宏回放完恢复 force_grab", bool(getattr(g9, "force_grab", False)) is False)
+check("宏里的点击/按键都执行了",
+      ("tap", "m") in g9.actions
+      and ("click", (0.33, 0.44)) in g9.actions, str(g9.actions[:6]))
+
+# 有宏时一轮不再走步骤点位
+g10 = FakeGame()
+r10 = dc.CrossRunner(g10, p_mac, log=lambda _s: None)
+r10.fatigue_check = lambda **_kw: (-700, 1000, "")
+r10.run_round()
+_clicks10 = [a[1] for a in g10.actions if a[0] == "click"]
+check("有宏时去程走宏点（不点步骤里的 PT_GO）",
+      (0.33, 0.44) in _clicks10 and PT_GO not in _clicks10, str(_clicks10))
+
+# ---- 2f) 骑乘：去程/回程前都会检查 --------------------------------
+g11 = FakeGame()
+r11 = dc.CrossRunner(g11, _profile_with_dungeon(), log=lambda _s: None)
+r11.fatigue_check = lambda **_kw: (-700, 1000, "")
+mo = []
+r11.ensure_mount = lambda: mo.append("mount")
+r11.enter_dungeon = lambda: True
+r11.exit_dungeon = lambda: True
+r11.run_round()
+check("一轮里至少检查两次骑乘（去程前 + 回程前）", len(mo) >= 2, str(len(mo)))
+
+# 骑乘/疲劳标定自动沿用副本流程那份
+_real_load = dc.df.load_profile
+dc.df.load_profile = lambda *a, **k: {
+    "mount": {"enabled": True, "key": "s",
+              "dialog": {"roi": [0.1, 0.1, 0.2, 0.2], "sig": [1] * 144},
+              "text_roi": [0.1, 0.1, 0.2, 0.2],
+              "mount_pt": [0.3, 0.3]},
+    "fatigue": {"pt": [0.5, 0.9], "roi": [0.4, 0.05, 0.2, 0.05]},
+}
+try:
+    p_in = dc._inherit_from_dungeon(dc.default_profile())
+finally:
+    dc.df.load_profile = _real_load
+check("骑乘标定没标时沿用副本流程的",
+      bool((p_in.get("mount") or {}).get("mount_pt"))
+      and bool((p_in.get("mount") or {}).get("text_roi")),
+      str(p_in.get("mount")))
+check("疲劳图标/区域也沿用",
+      (p_in.get("fatigue") or {}).get("pt") == [0.5, 0.9]
+      and bool((p_in.get("fatigue") or {}).get("roi")),
+      str(p_in.get("fatigue")))
+
 # ---- 3) 没标 BOSS 点时给出明确失败 --------------------------------
 g2 = FakeGame()
 p2 = build_profile()

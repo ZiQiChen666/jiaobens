@@ -650,6 +650,7 @@ class WinGame:
         self._hold_saved_cursor = None
         self._hold_saved_focus = 0
         self._grab_lock = threading.RLock()
+        self.force_grab = False        # 跨图宏回放时强制真实鼠标
         self._snapshot_count = 0
 
     # -- 基础 --
@@ -852,7 +853,7 @@ class WinGame:
         """把游戏窗口切到前台（只有允许抢占时才真的切）。"""
         if not self.foreground_mode() or self.dry:
             return True
-        if not self.allow_grab():
+        if not self.allow_grab() and not getattr(self, "force_grab", False):
             return True   # 纯后台模式：不切前台，只发消息
         with _INPUT_LOCK:
             try:
@@ -906,7 +907,7 @@ class WinGame:
         if self.dry:
             self.log(f"[DRY] click ({x},{y})")
             return True
-        if self.foreground_mode() and self.allow_grab():
+        if self.force_grab or (self.foreground_mode() and self.allow_grab()):
             return self._grab_click(x, y, keep_cursor=keep_cursor)
         if self.profile.get("prime_activate", True):
             app.prime_background_input(self.hwnd, activate=True)

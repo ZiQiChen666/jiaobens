@@ -118,6 +118,11 @@ class CrossTab(QWidget):
         self.step_wait: dict = {}
         self.step_open_map: dict = {}
         self.step_close_map: dict = {}
+        self._recorders: dict = {}
+        self._rec_pending: dict = {}
+        self.macro_labels: dict = {}
+        self.macro_speeds: dict = {}
+        self.macro_buttons: dict = {}
 
         self.setStyleSheet(dui.LIGHT_QSS)
         outer = QVBoxLayout(self)
@@ -249,6 +254,42 @@ class CrossTab(QWidget):
         row2.addWidget(chk_close)
         row2.addWidget(_hint("按顺序执行；「加点击」时程序会先按开图键再截图"), 1)
         v.addLayout(row2)
+
+        # ---- 鼠标宏（推荐：录一段点击/按键，回放时用真实鼠标）----
+        row_m = QHBoxLayout()
+        btn_rec = QPushButton("● 录制鼠标宏（3 秒后开始）")
+        btn_rec.setToolTip("录的是游戏窗口里的左键点击和按键；回放用真实鼠标，不走后台")
+        btn_rec.clicked.connect(lambda _c=False, k=key: self._record_macro(k))
+        btn_stop_rec = QPushButton("■ 停止并保存")
+        btn_stop_rec.setEnabled(False)
+        btn_stop_rec.clicked.connect(lambda _c=False, k=key: self._stop_macro(k))
+        btn_clear = QPushButton("清空宏")
+        btn_clear.clicked.connect(lambda _c=False, k=key: self._clear_macro(k))
+        lbl = QLabel("未录制")
+        lbl.setObjectName("muted")
+        self.macro_labels[key] = lbl
+        self.macro_buttons[key] = (btn_rec, btn_stop_rec)
+        row_m.addWidget(btn_rec)
+        row_m.addWidget(btn_stop_rec)
+        row_m.addWidget(btn_clear)
+        row_m.addWidget(lbl, 1)
+        v.addLayout(row_m)
+
+        row_sp = QHBoxLayout()
+        row_sp.addWidget(QLabel("宏回放速度"))
+        speed = QDoubleSpinBox()
+        speed.setRange(0.25, 3.0)
+        speed.setSingleStep(0.25)
+        speed.setValue(1.0)
+        speed.setFixedWidth(90)
+        speed.valueChanged.connect(
+            lambda val, k=key: self._on_macro_speed(k, float(val)))
+        self.macro_speeds[key] = speed
+        row_sp.addWidget(speed)
+        row_sp.addWidget(_hint(
+            "录完宏就优先用宏回放（真实鼠标），下面的步骤列表作为没录宏时的备用"
+        ), 1)
+        v.addLayout(row_sp)
         return box
 
     def _build_dungeon(self) -> QWidget:
@@ -480,6 +521,19 @@ class CrossTab(QWidget):
         row_fat.addStretch(1)
         g.addLayout(row_fat, 5, 3)
 
+        row_mount = QHBoxLayout()
+        self.chk_mount = QCheckBox("寻路前检查骑乘（按 S 看宠物文本）")
+        self.chk_mount.setToolTip(
+            "和「副本流程」一样：按骑乘键 → 看宠物文本 → 没骑就点「骑乘」按钮 → 关面板；"
+            "骑乘的弹窗/宠物文本/按钮沿用「副本流程」页的标定"
+        )
+        self.chk_mount.toggled.connect(self._save_from_ui)
+        row_mount.addWidget(self.chk_mount)
+        row_mount.addWidget(_hint(
+            "骑乘标定在「副本流程」页 ⑤ 里标一次就行，这边自动沿用"
+        ), 1)
+        g.addLayout(row_mount, 7, 0, 1, 6)
+
         row_map = QHBoxLayout()
         self.chk_close_map = QCheckBox("点完地图点位就关地图")
         self.chk_close_map.setChecked(True)
@@ -498,12 +552,12 @@ class CrossTab(QWidget):
         self.edit_map_key.editingFinished.connect(self._save_from_ui)
         row_map.addWidget(self.edit_map_key)
         row_map.addStretch(1)
-        g.addLayout(row_map, 6, 0, 1, 6)
+        g.addLayout(row_map, 8, 0, 1, 6)
 
         g.addWidget(_hint(
             "疲劳图标/区域不标也能跑：会自动沿用主界面「疲劳检测」框过的区域；"
             "但这页标了更准。点「读一次疲劳」可以先确认能不能读到。"
-        ), 7, 0, 1, 6)
+        ), 9, 0, 1, 6)
         return box
 
     def _build_run(self) -> QWidget:
@@ -685,6 +739,16 @@ class CrossTab(QWidget):
             self.lbl_fatigue_roi.setStyleSheet(
                 "color: #15803d; font-weight: 600;" if fat_roi
                 else "color: #444444;")
+            for mk in ("go", "back"):
+                cfg = self._macro(mk)
+                spin = self.macro_speeds.get(mk)
+                if spin is not None:
+                    spin.blockSignals(True)
+                    spin.setValue(float(cfg.get("speed", 1.0) or 1.0))
+                    spin.blockSignals(False)
+                self._update_macro_label(mk)
+            self.chk_mount.setChecked(
+                bool((p.get("mount") or {}).get("enabled", True)))
             self.chk_close_map.setChecked(
                 bool(cross.get("close_map_after_click", True)))
             self.edit_close_key.setText(str(cross.get("close_key") or "esc"))
@@ -979,6 +1043,142 @@ class CrossTab(QWidget):
         self._refresh_steps(key)
         if steps:
             lst.setCurrentRow(min(row, len(steps) - 1))
+
+    # ------------------------------------------------------------------
+    # 鼠标宏
+    # ------------------------------------------------------------------
+    def _macro(self, kind: str) -> dict:
+        crop = self.profile.setdefault("cross", {})
+        key = "back_macro" if kind == "back" else "go_macro"
+        cfg = crop.setdefault(key, {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+            crop[key] = cfg
+        cfg.setdefault("events", [])
+        cfg.setdefault("speed", 1.0)
+        cfg.setdefault("meta", {})
+        return cfg
+
+    def _update_macro_label(self, kind: str) -> None:
+        label = self.macro_labels.get(kind)
+        if label is None:
+            return
+        events = [e for e in (self._macro(kind).get("events") or [])
+                  if isinstance(e, dict)]
+        if not events:
+            label.setText("未录制")
+            return
+        clicks = sum(1 for e in events if e.get("type") == "down")
+        keys = sum(1 for e in events if e.get("type") == "key_down")
+        label.setText(f"已录制：{clicks} 次点击 / {keys} 个按键（回放用真实鼠标）")
+        label.setStyleSheet("color: #15803d; font-weight: 600;")
+
+    def _on_macro_speed(self, kind: str, value: float) -> None:
+        if self._loading:
+            return
+        self._macro(kind)["speed"] = max(0.25, min(3.0, float(value)))
+        self._save()
+
+    def _record_macro(self, kind: str) -> None:
+        if self._recorders.get(kind) is not None or self._rec_pending.get(kind):
+            self._log("宏已经在录制/等待开始")
+            return
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有窗口", "请先到「单开挂机」页绑定游戏窗口。")
+            return
+        if self.thread is not None and self.thread.isRunning():
+            self._log("正在运行，先停下再录宏")
+            return
+        self._save_from_ui()
+        self._rec_pending[kind] = True
+        btn_rec, btn_stop = self.macro_buttons[kind]
+        btn_rec.setEnabled(False)
+        btn_stop.setEnabled(True)
+        self.macro_labels[kind].setText("3 秒后开始录制…请切到游戏")
+        self._log("鼠标宏：3 秒后开始录制，切到游戏正常操作；"
+                  "完成后切回来点「停止并保存」")
+        QTimer.singleShot(3000, lambda: self._start_macro_record(kind))
+
+    def _start_macro_record(self, kind: str) -> None:
+        if not self._rec_pending.get(kind):
+            return
+        self._rec_pending[kind] = False
+        hwnd = self._hwnd()
+        if not hwnd:
+            self._reset_macro_buttons(kind)
+            return
+        try:
+            recorder = app.MacroRecorder(int(hwnd))
+            recorder.start()
+        except Exception as exc:
+            self._log(f"宏录制启动失败：{exc}")
+            self._reset_macro_buttons(kind)
+            return
+        self._recorders[kind] = recorder
+        self.macro_labels[kind].setText("录制中…操作完切回来点「停止并保存」")
+        self._log("鼠标宏：开始录制（只录游戏窗口内的左键点击和按键）")
+
+    def _reset_macro_buttons(self, kind: str) -> None:
+        btn_rec, btn_stop = self.macro_buttons[kind]
+        btn_rec.setEnabled(True)
+        btn_stop.setEnabled(False)
+
+    def _stop_macro(self, kind: str) -> None:
+        if self._rec_pending.get(kind) and self._recorders.get(kind) is None:
+            self._rec_pending[kind] = False
+            self._reset_macro_buttons(kind)
+            self._update_macro_label(kind)
+            self._log("鼠标宏：已取消")
+            return
+        recorder = self._recorders.get(kind)
+        if recorder is None:
+            self._reset_macro_buttons(kind)
+            return
+        self._recorders[kind] = None
+        try:
+            events = recorder.stop()
+            meta = recorder.meta()
+        except Exception as exc:
+            self._log(f"宏停止失败：{exc}")
+            self._reset_macro_buttons(kind)
+            return
+        kept = []
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            typ = str(ev.get("type", ""))
+            if typ == "down" and str(ev.get("button", "left")) == "left":
+                nx, ny = ev.get("nx"), ev.get("ny")
+                if nx is None or ny is None:
+                    continue
+                kept.append({"type": "down", "t": float(ev.get("t", 0.0)),
+                             "nx": float(nx), "ny": float(ny)})
+            elif typ == "key_down":
+                name = str(ev.get("name", "")).strip()
+                low = name.lower()
+                if not name or (low.startswith("f") and low[1:].isdigit()):
+                    continue
+                kept.append({"type": "key_down",
+                             "t": float(ev.get("t", 0.0)), "name": name})
+        cfg = self._macro(kind)
+        cfg["events"] = kept
+        cfg["meta"] = meta if isinstance(meta, dict) else {}
+        self._save()
+        self._reset_macro_buttons(kind)
+        self._update_macro_label(kind)
+        if kept:
+            self._log(f"鼠标宏：已保存 {len(kept)} 个动作")
+        else:
+            self._log("鼠标宏：没录到点击/按键（要游戏在前台、鼠标在游戏窗口内）")
+
+    def _clear_macro(self, kind: str) -> None:
+        cfg = self._macro(kind)
+        cfg["events"] = []
+        cfg["meta"] = {}
+        self._save()
+        self._update_macro_label(kind)
+        self._log("鼠标宏：已清空")
 
     # ------------------------------------------------------------------
     # 点位 / 区域
@@ -1290,6 +1490,12 @@ class CrossTab(QWidget):
         cross = p.setdefault("cross", {})
         cross["auto_enter"] = bool(self.chk_auto_enter.isChecked())
         cross["auto_exit"] = bool(self.chk_auto_exit.isChecked())
+        if any(self._macro("go").get("events") or self._macro("back").get("events")):
+            # 宏回放要用真实鼠标 → 必须允许借鼠标/前台
+            p["allow_grab"] = True
+            if str(p.get("input_mode") or "") == "background":
+                p["input_mode"] = "hybrid"
+        p.setdefault("mount", {})["enabled"] = bool(self.chk_mount.isChecked())
         cross["close_map_after_click"] = bool(self.chk_close_map.isChecked())
         cross["close_key"] = self.edit_close_key.text().strip() or "esc"
         cross["map_key"] = self.edit_map_key.text().strip() or "m"

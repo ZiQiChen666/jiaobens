@@ -33,7 +33,9 @@ def default_profile() -> dict:
     """一份「副本流程」兼容的配置 + 跨图专用的 cross 段。"""
     p = json.loads(json.dumps(df.DEFAULT_PROFILE))
     p["name"] = "跨图打BOSS"
-    p["mount"]["enabled"] = False      # 跨图先不做骑乘检查（要的话可以打开）
+    p["mount"]["enabled"] = True       # 和副本流程一样：每次寻路前检查骑乘
+    p["allow_grab"] = True             # 用鼠标宏 → 必须允许借鼠标/前台
+    p["input_mode"] = "hybrid"
     p["loop"]["boss_count"] = 1
     p["retry"] = {"rounds": 0, "gap": 5.0, "max_fail": 3}
     p["cross"] = {
@@ -47,6 +49,9 @@ def default_profile() -> dict:
         # 图1 → 图2 的路径（按顺序执行，跑完自动点选中的打怪点）
         "back_steps": [],
         "back_to_farm": True,
+        # 鼠标宏（推荐：录一段点击/按键，回放时用真实鼠标）
+        "go_macro": {"events": [], "meta": {}, "speed": 1.0},
+        "back_macro": {"events": [], "meta": {}, "speed": 1.0},
         "auto_enter": True,            # 到图1 后自动「进入副本」
         "auto_exit": True,             # 打完 BOSS 自动「退出副本」
         "close_map_after_click": True, # 点完地图点位顺手把地图关掉
@@ -125,6 +130,36 @@ def normalize(profile: dict) -> dict:
     crop["go_steps"] = _norm_steps(crop.get("go_steps"))
     crop["back_steps"] = _norm_steps(crop.get("back_steps"))
     crop["back_to_farm"] = bool(crop.get("back_to_farm", True))
+    for mk in ("go_macro", "back_macro"):
+        raw = crop.get(mk) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        events = []
+        for ev in (raw.get("events") or []):
+            if not isinstance(ev, dict):
+                continue
+            typ = str(ev.get("type") or "")
+            try:
+                t = max(0.0, float(ev.get("t", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                t = 0.0
+            if typ == "down" and str(ev.get("button", "left")) == "left":
+                nx, ny = ev.get("nx"), ev.get("ny")
+                if nx is None or ny is None:
+                    continue
+                events.append({"type": "down", "t": t,
+                               "nx": float(nx), "ny": float(ny)})
+            elif typ == "key_down":
+                name = str(ev.get("name") or "").strip()
+                if name:
+                    events.append({"type": "key_down", "t": t, "name": name})
+        try:
+            speed = max(0.25, min(3.0, float(raw.get("speed", 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            speed = 1.0
+        crop[mk] = {"events": events,
+                    "meta": raw.get("meta") if isinstance(raw.get("meta"), dict) else {},
+                    "speed": speed}
     crop["auto_enter"] = bool(crop.get("auto_enter", True))
     crop["auto_exit"] = bool(crop.get("auto_exit", True))
     crop["close_map_after_click"] = bool(crop.get("close_map_after_click", True))
@@ -133,17 +168,46 @@ def normalize(profile: dict) -> dict:
     return df._normalize_profile(p)
 
 
+def _inherit_from_dungeon(p: dict) -> dict:
+    """骑乘/疲劳没在这页标过时，沿用「副本流程」那份标定（省得再标一遍）。"""
+    try:
+        dun = df.load_profile()
+    except Exception:
+        return p
+    if not isinstance(dun, dict):
+        return p
+    mount = p.get("mount") or {}
+    dun_mount = dun.get("mount") or {}
+    if not (mount.get("text_roi")
+            or (mount.get("dialog") or {}).get("roi")
+            or mount.get("mount_pt")):
+        if (dun_mount.get("text_roi")
+                or (dun_mount.get("dialog") or {}).get("roi")
+                or dun_mount.get("mount_pt")):
+            merged = json.loads(json.dumps(dun_mount))
+            merged["enabled"] = bool(mount.get("enabled", True))
+            p["mount"] = merged
+    fatigue = p.get("fatigue") or {}
+    dun_fat = dun.get("fatigue") or {}
+    if not fatigue.get("roi") and dun_fat.get("roi"):
+        fatigue["roi"] = dun_fat.get("roi")
+    if not fatigue.get("pt") and dun_fat.get("pt"):
+        fatigue["pt"] = dun_fat["pt"]
+    p["fatigue"] = fatigue
+    return p
+
+
 def load_profile(path: Optional[str] = None) -> dict:
     path = path or profile_path()
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        return normalize(default_profile())
+        return normalize(_inherit_from_dungeon(default_profile()))
     except Exception as exc:  # pragma: no cover
         print(f"[警告] 读取跨图标定失败：{type(exc).__name__}: {exc}")
-        return normalize(default_profile())
-    return normalize(df._merge(default_profile(), data))
+        return normalize(_inherit_from_dungeon(default_profile()))
+    return normalize(_inherit_from_dungeon(df._merge(default_profile(), data)))
 
 
 def save_profile(profile: dict, path: Optional[str] = None) -> str:
@@ -166,8 +230,12 @@ def missing_items(profile: dict) -> list[str]:
               if isinstance(x, dict) and x.get("pt")]
     if not points:
         miss.append("① 图2 打怪点（至少标一个）")
-    if not crop.get("go_steps"):
-        miss.append("② 去程路径（图2 → 图1）")
+    def _has_events(mk: str) -> bool:
+        cfg = crop.get(mk) or {}
+        return bool([e for e in (cfg.get("events") or [])
+                     if isinstance(e, dict)])
+    if not crop.get("go_steps") and not _has_events("go_macro"):
+        miss.append("② 去程路径（图2 → 图1）：录鼠标宏 或 加步骤")
     if not farm.get("boss_pt"):
         miss.append("④ 图1 的 BOSS 点")
     steps = list(crop.get("go_steps") or []) + list(crop.get("back_steps") or [])
@@ -185,8 +253,8 @@ def missing_items(profile: dict) -> list[str]:
             miss.append("③「退出副本」按钮")
         if not exit_cfg.get("confirm_pt"):
             miss.append("③「确认」按钮")
-    if not crop.get("back_steps"):
-        miss.append("⑤ 回程路径（图1 → 图2）")
+    if not crop.get("back_steps") and not _has_events("back_macro"):
+        miss.append("⑤ 回程路径（图1 → 图2）：录鼠标宏 或 加步骤")
     fatigue = p.get("fatigue") or {}
     if fatigue.get("enabled", True):
         has_roi = bool(fatigue.get("roi"))
@@ -308,6 +376,96 @@ class CrossRunner(df.DungeonRunner):
                 self.game.sleep(wait)
         return True
 
+    # ---- 鼠标宏（去程 / 回程）----
+    def macro_config(self, kind: str) -> dict:
+        key = "back_macro" if str(kind) == "back" else "go_macro"
+        cfg = self.cross().get(key) or {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    def has_macro(self, kind: str) -> bool:
+        return any(isinstance(e, dict)
+                   for e in (self.macro_config(kind).get("events") or []))
+
+    def play_macro(self, kind: str) -> bool:
+        """回放去程/回程鼠标宏。
+
+        这里**强制用真实鼠标**（借前台 + 移动光标点击，点完还原），
+        不走后台 PostMessage —— 和「副本流程」的引路宏一个思路。
+        """
+        cfg = self.macro_config(kind)
+        events = [e for e in (cfg.get("events") or []) if isinstance(e, dict)]
+        desc = "回程宏" if str(kind) == "back" else "去程宏"
+        if not events:
+            self.log(f"{desc}是空的")
+            return False
+        try:
+            speed = max(0.25, min(3.0, float(cfg.get("speed", 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            speed = 1.0
+        clicks = sum(1 for e in events if e.get("type") == "down")
+        keys = sum(1 for e in events if e.get("type") == "key_down")
+        self.log(f"—— {desc}：{len(events)} 个动作"
+                 f"（{clicks} 次点击 / {keys} 个按键，速度 {speed * 100:.0f}%，"
+                 "真实鼠标）——")
+        prev_force = getattr(self.game, "force_grab", False)
+        try:
+            self.game.force_grab = True
+        except Exception:
+            pass
+        try:
+            start = self.game.now()
+            last_t = 0.0
+            try:
+                base_t = min(float(e.get("t", 0.0) or 0.0) for e in events)
+            except (TypeError, ValueError):
+                base_t = 0.0
+            for ev in events:
+                if self._stopping():
+                    return False
+                try:
+                    target = max(0.0, (float(ev.get("t", 0.0) or 0.0) - base_t)
+                                 / speed)
+                except (TypeError, ValueError):
+                    target = last_t
+                wait = target - (self.game.now() - start)
+                if wait > 0:
+                    self.game.sleep(wait)
+                last_t = max(last_t, target)
+                typ = str(ev.get("type") or "")
+                if typ == "down":
+                    nx, ny = ev.get("nx"), ev.get("ny")
+                    if nx is None or ny is None:
+                        continue
+                    if not self.game.click_norm((float(nx), float(ny))):
+                        self.log(f"{desc}点击失败，停止回放")
+                        return False
+                elif typ == "key_down":
+                    name = str(ev.get("name") or "").strip()
+                    if name:
+                        self.game.tap(name)
+        finally:
+            try:
+                self.game.force_grab = bool(prev_force)
+            except Exception:
+                pass
+        self.gap(f"{desc}结束后缓冲")
+        self.release_focus()
+        self.restore_user_foreground()
+        self.log(f"{desc}回放完成")
+        return True
+
+    def run_forward_path(self) -> bool:
+        if self.has_macro("go"):
+            self.log("去程：用鼠标宏回放（不用后台）")
+            return self.play_macro("go")
+        return self.run_steps(self.cross().get("go_steps"), "去程")
+
+    def run_back_path(self) -> bool:
+        if self.has_macro("back"):
+            self.log("回程：用鼠标宏回放（不用后台）")
+            return self.play_macro("back")
+        return self.run_steps(self.cross().get("back_steps"), "回程")
+
     # ---- ① 图2 挂机 ----
     def farm_loop(self, already_there: bool = False) -> bool:
         point = self.current_farm_point()
@@ -353,7 +511,11 @@ class CrossRunner(df.DungeonRunner):
         has_exit = any(str(s.get("type")) == "exit"
                        for s in go_steps + back_steps)
         self.log("=== 图2 → 图1：走「去程路径」===")
-        if not self.run_steps(go_steps, "去程"):
+        self.ensure_mount()
+        if self.has_macro("go"):
+            if not self.run_forward_path():
+                return self._failed("去程宏回放失败")
+        elif not self.run_steps(go_steps, "去程"):
             return self._failed("去程路径失败")
         if bool(crop.get("auto_enter", True)) and not has_enter:
             self.log("=== 到图1：自动进入副本 ===")
@@ -368,7 +530,11 @@ class CrossRunner(df.DungeonRunner):
             if not self.exit_dungeon():
                 return self._failed("退出副本失败")
         self.log("=== 图1 → 图2：走「回程路径」===")
-        if not self.run_steps(back_steps, "回程"):
+        self.ensure_mount()
+        if self.has_macro("back"):
+            if not self.run_back_path():
+                return self._failed("回程宏回放失败")
+        elif not self.run_steps(back_steps, "回程"):
             return self._failed("回程路径失败")
         if bool(crop.get("back_to_farm", True)):
             point = self.current_farm_point()
@@ -390,7 +556,11 @@ class CrossRunner(df.DungeonRunner):
         if which == "go":
             self.log("=== 试跑去程（图2 → 图1）===")
             steps = crop.get("go_steps") or []
-            if not self.run_steps(steps, "去程"):
+            self.ensure_mount()
+            if self.has_macro("go"):
+                if not self.run_forward_path():
+                    return self._failed("试跑去程失败")
+            elif not self.run_steps(steps, "去程"):
                 return self._failed("试跑去程失败")
             has_enter = any(str(s.get("type")) == "enter" for s in steps)
             if bool(crop.get("auto_enter", True)) and not has_enter:
@@ -406,7 +576,11 @@ class CrossRunner(df.DungeonRunner):
             self.log("=== 自动退出副本 ===")
             if not self.exit_dungeon():
                 return self._failed("试跑：退出副本失败")
-        if not self.run_steps(steps, "回程"):
+        self.ensure_mount()
+        if self.has_macro("back"):
+            if not self.run_back_path():
+                return self._failed("试跑回程失败")
+        elif not self.run_steps(steps, "回程"):
             return self._failed("试跑回程失败")
         if bool(crop.get("back_to_farm", True)):
             point = self.current_farm_point()
