@@ -122,8 +122,9 @@ class CrossTab(QWidget):
         root.addWidget(self._build_header())
         root.addWidget(self._build_farm_points())
         root.addWidget(self._build_steps("② 去程路径（图2 → 图1）", "go_steps"))
+        root.addWidget(self._build_dungeon())
         root.addWidget(self._build_boss())
-        root.addWidget(self._build_steps("④ 回程路径（图1 → 图2）", "back_steps"))
+        root.addWidget(self._build_steps("⑤ 回程路径（图1 → 图2）", "back_steps"))
         root.addWidget(self._build_params())
         root.addWidget(self._build_run())
         root.addStretch(1)
@@ -195,13 +196,22 @@ class CrossTab(QWidget):
         btn_click.clicked.connect(lambda _c=False, k=key: self._add_click_step(k))
         btn_key = QPushButton("＋ 加按键")
         btn_key.clicked.connect(lambda _c=False, k=key: self._add_key_step(k))
+        btn_enter = QPushButton("＋ 进本")
+        btn_enter.setToolTip("在这一步执行「进入副本」（点副本入口→进本弹窗→进度条）")
+        btn_enter.clicked.connect(
+            lambda _c=False, k=key: self._add_special_step(k, "enter"))
+        btn_exit = QPushButton("＋ 退本")
+        btn_exit.setToolTip("在这一步执行「退出副本」（退出副本→确认→等加载）")
+        btn_exit.clicked.connect(
+            lambda _c=False, k=key: self._add_special_step(k, "exit"))
         btn_up = QPushButton("上移")
         btn_up.clicked.connect(lambda _c=False, k=key: self._move_step(k, -1))
         btn_down = QPushButton("下移")
         btn_down.clicked.connect(lambda _c=False, k=key: self._move_step(k, 1))
         btn_del = QPushButton("删除")
         btn_del.clicked.connect(lambda _c=False, k=key: self._del_step(k))
-        for b in (btn_click, btn_key, btn_up, btn_down, btn_del):
+        for b in (btn_click, btn_key, btn_enter, btn_exit,
+                  btn_up, btn_down, btn_del):
             row.addWidget(b)
         row.addStretch(1)
         v.addLayout(row)
@@ -222,8 +232,87 @@ class CrossTab(QWidget):
         v.addLayout(row2)
         return box
 
+    def _build_dungeon(self) -> QWidget:
+        box = QGroupBox("③ 图1 的副本（进本 / 退本）")
+        g = QGridLayout(box)
+        row_auto = QHBoxLayout()
+        self.chk_auto_enter = QCheckBox("到图1 后自动「进入副本」")
+        self.chk_auto_enter.setChecked(True)
+        self.chk_auto_enter.setToolTip(
+            "去程路径走完后：点副本入口 → 等进本弹窗 → 点「进入游戏」→ 等进度条")
+        self.chk_auto_enter.toggled.connect(self._save_from_ui)
+        row_auto.addWidget(self.chk_auto_enter)
+        self.chk_auto_exit = QCheckBox("打完 BOSS 自动「退出副本」")
+        self.chk_auto_exit.setChecked(True)
+        self.chk_auto_exit.setToolTip(
+            "打完 BOSS → 拾取 → 点「退出副本」→ 点「确认」→ 等加载，然后再走回程")
+        self.chk_auto_exit.toggled.connect(self._save_from_ui)
+        row_auto.addWidget(self.chk_auto_exit)
+        row_auto.addStretch(1)
+        g.addLayout(row_auto, 0, 0, 1, 8)
+
+        self.lbl_pt = {}
+        for i, (key, title) in enumerate((
+                ("enter.dungeon_pt", "副本入口"),
+                ("enter.confirm_pt", "进入游戏按钮"),
+                ("exit.exit_pt", "退出副本按钮"),
+                ("exit.confirm_pt", "确认按钮"))):
+            r = 1 + i // 2
+            c = (i % 2) * 4
+            g.addWidget(QLabel(title), r, c)
+            lbl = QLabel("未设置")
+            lbl.setObjectName("muted")
+            self.lbl_pt[key] = lbl
+            g.addWidget(lbl, r, c + 1, 1, 2)
+            btn = QPushButton("标定")
+            btn.setFixedWidth(80)
+            btn.clicked.connect(
+                lambda _c=False, k=key: self._pick_dungeon_point(k))
+            g.addWidget(btn, r, c + 3)
+
+        self.lbl_region = {}
+        for i, (kind, title) in enumerate((
+                ("enter_dialog", "进本弹窗区域"),
+                ("progress", "加载进度条区域"),
+                ("exit_dialog", "退本确认弹窗"))):
+            r = 3 + i // 2
+            c = (i % 2) * 4
+            g.addWidget(QLabel(title), r, c)
+            lbl = QLabel("未设置（可选）")
+            lbl.setObjectName("muted")
+            self.lbl_region[kind] = lbl
+            g.addWidget(lbl, r, c + 1, 1, 2)
+            btn = QPushButton("框选")
+            btn.setFixedWidth(80)
+            btn.clicked.connect(lambda _c=False, k=kind: self._pick_spec(k))
+            g.addWidget(btn, r, c + 3)
+
+        g.addWidget(QLabel("进本寻路"), 5, 0)
+        self.spin_entry_wait = self._dspin(1.0, 600.0, 40.0)
+        self.spin_entry_wait.valueChanged.connect(self._save_from_ui)
+        g.addWidget(self.spin_entry_wait, 5, 1)
+        g.addWidget(QLabel("等弹窗"), 5, 2)
+        self.spin_dialog_timeout = self._dspin(3.0, 300.0, 24.0)
+        self.spin_dialog_timeout.valueChanged.connect(self._save_from_ui)
+        g.addWidget(self.spin_dialog_timeout, 5, 3)
+        g.addWidget(QLabel("进本加载"), 5, 4)
+        self.spin_load_wait = self._dspin(1.0, 300.0, 15.0)
+        self.spin_load_wait.valueChanged.connect(self._save_from_ui)
+        g.addWidget(self.spin_load_wait, 5, 5)
+        g.addWidget(QLabel("退本加载"), 5, 6)
+        self.spin_exit_settle = self._dspin(1.0, 300.0, 10.0)
+        self.spin_exit_settle.valueChanged.connect(self._save_from_ui)
+        g.addWidget(self.spin_exit_settle, 5, 7)
+
+        g.addWidget(_hint(
+            "不勾「自动进本/退本」也可以：在 ②/⑤ 的路径里用「＋ 进本 / ＋ 退本」"
+            "把这两步插到任意位置。弹窗/进度条区域不框也能跑（会自动盲点 + 按已进本"
+            "处理），框了更稳。"
+        ), 6, 0, 1, 8)
+        return box
+
     def _build_boss(self) -> QWidget:
-        box = QGroupBox("③ 图1 的 BOSS（点位 / 身形 / 血量）")
+        box = QGroupBox("④ 图1 的 BOSS（点位 / 身形 / 血量）")
         g = QGridLayout(box)
         self.lbl_boss_pt = QLabel("未设置")
         self.lbl_boss_pt.setObjectName("muted")
@@ -285,7 +374,7 @@ class CrossTab(QWidget):
         return box
 
     def _build_params(self) -> QWidget:
-        box = QGroupBox("⑤ 参数（疲劳 / 喝药 / 打怪）")
+        box = QGroupBox("⑥ 参数（疲劳 / 喝药 / 打怪）")
         g = QGridLayout(box)
         g.addWidget(QLabel("疲劳下限"), 0, 0)
         self.spin_low = QSpinBox()
@@ -466,6 +555,19 @@ class CrossTab(QWidget):
             self.lbl_boss_hp.setText(
                 f"已设置（{hp.get('mode', 'ocr')}）" if hp.get("roi") else "未设置（不框就按时间停）"
             )
+            # 副本（进本/退本）
+            enter = p.get("enter") or {}
+            exit_cfg = p.get("exit") or {}
+            crop = p.get("cross") or {}
+            self.chk_auto_enter.setChecked(bool(crop.get("auto_enter", True)))
+            self.chk_auto_exit.setChecked(bool(crop.get("auto_exit", True)))
+            self.spin_entry_wait.setValue(float(enter.get("travel_wait", 40.0) or 40.0))
+            self.spin_dialog_timeout.setValue(
+                float(enter.get("dialog_timeout", 24.0) or 24.0))
+            self.spin_load_wait.setValue(float(enter.get("load_wait", 15.0) or 15.0))
+            self.spin_exit_settle.setValue(float(exit_cfg.get("settle", 10.0) or 10.0))
+            self._refresh_dungeon_labels()
+
             self.spin_boss_travel.setValue(float(farm.get("travel_wait", 25.0) or 25.0))
             self.spin_boss_seconds.setValue(float(loop.get("boss_seconds", 120.0) or 120.0))
             count = int(loop.get("boss_count", 1) or 1)
@@ -496,6 +598,35 @@ class CrossTab(QWidget):
             self.spin_gap.setValue(float((p.get("retry") or {}).get("gap", 5.0) or 5.0))
         finally:
             self._loading = False
+
+    def _refresh_dungeon_labels(self) -> None:
+        p = self.profile
+        enter = p.get("enter") or {}
+        exit_cfg = p.get("exit") or {}
+        for key, holder, field in (
+                ("enter.dungeon_pt", enter, "dungeon_pt"),
+                ("enter.confirm_pt", enter, "confirm_pt"),
+                ("exit.exit_pt", exit_cfg, "exit_pt"),
+                ("exit.confirm_pt", exit_cfg, "confirm_pt")):
+            pt = holder.get(field)
+            label = self.lbl_pt[key]
+            if pt:
+                label.setText(f"已设置 ({pt[0]:.3f}, {pt[1]:.3f})")
+                label.setStyleSheet("color: #15803d; font-weight: 600;")
+            else:
+                label.setText("未设置")
+                label.setStyleSheet("color: #444444;")
+        for kind, spec in (
+                ("enter_dialog", enter.get("dialog") or {}),
+                ("progress", enter.get("progress") or {}),
+                ("exit_dialog", exit_cfg.get("dialog") or {})):
+            label = self.lbl_region[kind]
+            if (spec or {}).get("roi"):
+                label.setText("已设置 ✓")
+                label.setStyleSheet("color: #15803d; font-weight: 600;")
+            else:
+                label.setText("未设置（可选）")
+                label.setStyleSheet("color: #444444;")
 
     # ------------------------------------------------------------------
     # 打怪点
@@ -614,7 +745,12 @@ class CrossTab(QWidget):
     @staticmethod
     def _step_text(index: int, st: dict) -> str:
         wait = float(st.get("wait", 0.0) or 0.0)
-        if str(st.get("type")) == "click":
+        typ = str(st.get("type"))
+        if typ == "enter":
+            return f"{index}. 进入副本（点副本入口 → 进本弹窗 → 进度条）"
+        if typ == "exit":
+            return f"{index}. 退出副本（退出副本 → 确认 → 等加载）"
+        if typ == "click":
             pt = st.get("pt") or [0.0, 0.0]
             extra = "" if st.get("open_map", True) else "（不开图）"
             return (f"{index}. 点地图点 ({float(pt[0]):.3f}, {float(pt[1]):.3f})"
@@ -703,6 +839,12 @@ class CrossTab(QWidget):
         self._refresh_steps(key)
         self.step_widgets[key].setCurrentRow(len(self._steps(key)) - 1)
 
+    def _add_special_step(self, key: str, typ: str) -> None:
+        self._steps(key).append({"type": typ, "wait": 0.0})
+        self._save()
+        self._refresh_steps(key)
+        self.step_widgets[key].setCurrentRow(len(self._steps(key)) - 1)
+
     def _move_step(self, key: str, delta: int) -> None:
         lst = self.step_widgets[key]
         steps = self._steps(key)
@@ -751,6 +893,42 @@ class CrossTab(QWidget):
         self._load_ui()
         self._log(f"已标定图1 BOSS 点：({pt[0]:.3f}, {pt[1]:.3f})")
 
+    def _pick_dungeon_point(self, key: str) -> None:
+        hwnd = self._hwnd()
+        if not hwnd:
+            QMessageBox.warning(self, "没有窗口", "请先到「单开挂机」页绑定游戏窗口。")
+            return
+        enter = self.profile.setdefault("enter", {})
+        exit_cfg = self.profile.setdefault("exit", {})
+        which, field = key.split(".", 1)
+        holder = enter if which == "enter" else exit_cfg
+        titles = {
+            "enter.dungeon_pt": (
+                "点「图1 副本入口」",
+                "这里是图1 的地图：点副本入口/传送门的位置。"),
+            "enter.confirm_pt": (
+                "点「进入游戏」按钮",
+                "先让进本弹窗弹出来，再点弹窗里的「进入游戏」。"),
+            "exit.exit_pt": (
+                "点「退出副本」按钮",
+                "先把「退出副本」按钮露出来（在副本里），再点它。"),
+            "exit.confirm_pt": (
+                "点「确认」按钮",
+                "先让退出确认弹窗弹出来，再点「确认」。"),
+        }
+        title, info = titles.get(key, ("点一个位置", ""))
+        pt = dui.pick_point(
+            self, hwnd, title, info,
+            self._map_key() if key == "enter.dungeon_pt" else None,
+            holder.get(field),
+        )
+        if not pt:
+            return
+        holder[field] = [round(float(pt[0]), 6), round(float(pt[1]), 6)]
+        self._save()
+        self._load_ui()
+        self._log(f"已设置：{title}")
+
     def _pick_spec(self, kind: str) -> None:
         """框一个区域：present=图1 BOSS 身形，boss_hp=图1 BOSS 血量，player_hp=玩家血量。"""
         hwnd = self._hwnd()
@@ -758,7 +936,21 @@ class CrossTab(QWidget):
             QMessageBox.warning(self, "没有窗口", "请先到「单开挂机」页绑定游戏窗口。")
             return
         farm = self.profile.setdefault("farm", {})
-        if kind == "present":
+        enter = self.profile.setdefault("enter", {})
+        exit_cfg = self.profile.setdefault("exit", {})
+        if kind == "enter_dialog":
+            spec = enter.get("dialog") or {}
+            title = "框住「进入游戏」弹窗"
+            info = "先让进本弹窗弹出来再截图，框住弹窗里固定不变的部分"
+        elif kind == "progress":
+            spec = enter.get("progress") or {}
+            title = "框住加载进度条"
+            info = "进本读条：框住整条进度条（左边起点到右边终点）"
+        elif kind == "exit_dialog":
+            spec = exit_cfg.get("dialog") or {}
+            title = "框住「退出确认」弹窗"
+            info = "先让退出确认弹窗弹出来再截图，框住固定不变的部分"
+        elif kind == "present":
             spec = farm.get("boss_present") or {}
             title = "框住图1 的 BOSS 身形"
             info = ("框住 BOSS 本体（别框会动的特效）；"
@@ -774,7 +966,18 @@ class CrossTab(QWidget):
         roi_norm = self._pick_region(hwnd, spec.get("roi"), title, info)
         if roi_norm is None:
             return
-        if kind == "present":
+        if kind in ("enter_dialog", "exit_dialog"):
+            sig = df.signature(df.crop_norm(self._last_pick_frame, roi_norm), 12)
+            holder = enter if kind == "enter_dialog" else exit_cfg
+            holder["dialog"] = {
+                "roi": roi_norm, "grid": 12, "sig": sig, "sim": 0.90,
+            }
+        elif kind == "progress":
+            enter["progress"] = {
+                "roi": roi_norm, "min_fill": 0.90, "samples": 3,
+                "interval": 0.25,
+            }
+        elif kind == "present":
             sig = df.signature(df.crop_norm(self._last_pick_frame, roi_norm), 12)
             farm["boss_present"] = {
                 "roi": roi_norm, "grid": 12, "sig": sig, "sigs": [sig],
@@ -896,6 +1099,14 @@ class CrossTab(QWidget):
         farm["use_skills"] = bool(self.chk_skills.isChecked())
         farm["pickup_on_a"] = bool(self.chk_pickup_a.isChecked())
         p.setdefault("retry", {})["gap"] = float(self.spin_gap.value())
+        enter = p.setdefault("enter", {})
+        enter["travel_wait"] = float(self.spin_entry_wait.value())
+        enter["dialog_timeout"] = float(self.spin_dialog_timeout.value())
+        enter["load_wait"] = float(self.spin_load_wait.value())
+        p.setdefault("exit", {})["settle"] = float(self.spin_exit_settle.value())
+        cross = p.setdefault("cross", {})
+        cross["auto_enter"] = bool(self.chk_auto_enter.isChecked())
+        cross["auto_exit"] = bool(self.chk_auto_exit.isChecked())
         self._save()
 
     def _start(self, dry: bool = False) -> None:

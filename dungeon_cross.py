@@ -47,6 +47,8 @@ def default_profile() -> dict:
         # 图1 → 图2 的路径（按顺序执行，跑完自动点选中的打怪点）
         "back_steps": [],
         "back_to_farm": True,
+        "auto_enter": True,            # 到图1 后自动「进入副本」
+        "auto_exit": True,             # 打完 BOSS 自动「退出副本」
         "map_key": "m",                # 开图键（和副本流程一致）
     }
     return p
@@ -77,6 +79,8 @@ def _norm_steps(steps) -> list:
             if not name:
                 continue
             out.append({"type": "key", "key": name, "wait": wait})
+        elif typ in ("enter", "exit"):
+            out.append({"type": typ, "wait": wait})
     return out
 
 
@@ -118,6 +122,8 @@ def normalize(profile: dict) -> dict:
     crop["go_steps"] = _norm_steps(crop.get("go_steps"))
     crop["back_steps"] = _norm_steps(crop.get("back_steps"))
     crop["back_to_farm"] = bool(crop.get("back_to_farm", True))
+    crop["auto_enter"] = bool(crop.get("auto_enter", True))
+    crop["auto_exit"] = bool(crop.get("auto_exit", True))
     crop["map_key"] = str(crop.get("map_key") or "m").strip() or "m"
     return df._normalize_profile(p)
 
@@ -158,9 +164,24 @@ def missing_items(profile: dict) -> list[str]:
     if not crop.get("go_steps"):
         miss.append("② 去程路径（图2 → 图1）")
     if not farm.get("boss_pt"):
-        miss.append("③ 图1 的 BOSS 点")
+        miss.append("④ 图1 的 BOSS 点")
+    steps = list(crop.get("go_steps") or []) + list(crop.get("back_steps") or [])
+    need_enter = bool(crop.get("auto_enter", True)) or         any(s.get("type") == "enter" for s in steps)
+    need_exit = bool(crop.get("auto_exit", True)) or         any(s.get("type") == "exit" for s in steps)
+    enter = p.get("enter") or {}
+    exit_cfg = p.get("exit") or {}
+    if need_enter:
+        if not enter.get("dungeon_pt"):
+            miss.append("③ 图1 副本入口点")
+        if not enter.get("confirm_pt"):
+            miss.append("③ 进本弹窗「进入游戏」按钮")
+    if need_exit:
+        if not exit_cfg.get("exit_pt"):
+            miss.append("③「退出副本」按钮")
+        if not exit_cfg.get("confirm_pt"):
+            miss.append("③「确认」按钮")
     if not crop.get("back_steps"):
-        miss.append("④ 回程路径（图1 → 图2）")
+        miss.append("⑤ 回程路径（图1 → 图2）")
     return miss
 
 
@@ -240,6 +261,16 @@ class CrossRunner(df.DungeonRunner):
                     continue
                 self.log(f"{desc} 第 {i}/{total} 步：按「{key}」→ 等 {wait:.1f}s")
                 self.game.tap(key)
+            elif typ == "enter":
+                self.log(f"{desc} 第 {i}/{total} 步：进入副本")
+                if not self.enter_dungeon():
+                    self.log(f"{desc} 第 {i} 步：进入副本失败")
+                    return False
+            elif typ == "exit":
+                self.log(f"{desc} 第 {i}/{total} 步：退出副本")
+                if not self.exit_dungeon():
+                    self.log(f"{desc} 第 {i} 步：退出副本失败")
+                    return False
             else:
                 continue
             if wait > 0:
@@ -284,15 +315,29 @@ class CrossRunner(df.DungeonRunner):
         crop = self.cross()
         loop = self.p.get("loop") or {}
         kills = max(1, min(9, int(loop.get("boss_count", 1) or 1)))
+        go_steps = list(crop.get("go_steps") or [])
+        back_steps = list(crop.get("back_steps") or [])
+        has_enter = any(str(s.get("type")) == "enter"
+                        for s in go_steps + back_steps)
+        has_exit = any(str(s.get("type")) == "exit"
+                       for s in go_steps + back_steps)
         self.log("=== 图2 → 图1：走「去程路径」===")
-        if not self.run_steps(crop.get("go_steps"), "去程"):
+        if not self.run_steps(go_steps, "去程"):
             return self._failed("去程路径失败")
-        self.log("=== 到图1：去打 BOSS ===")
+        if bool(crop.get("auto_enter", True)) and not has_enter:
+            self.log("=== 到图1：自动进入副本 ===")
+            if not self.enter_dungeon():
+                return self._failed("进入副本失败")
+        self.log("=== 进本后：去打 BOSS ===")
         if not self._fight_clones(kills):
             return self._failed("图1 打BOSS失败")
         self.loot_before_exit()
+        if bool(crop.get("auto_exit", True)) and not has_exit:
+            self.log("=== 打完：自动退出副本 ===")
+            if not self.exit_dungeon():
+                return self._failed("退出副本失败")
         self.log("=== 图1 → 图2：走「回程路径」===")
-        if not self.run_steps(crop.get("back_steps"), "回程"):
+        if not self.run_steps(back_steps, "回程"):
             return self._failed("回程路径失败")
         if bool(crop.get("back_to_farm", True)):
             point = self.current_farm_point()
