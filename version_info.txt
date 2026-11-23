@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(3, 26, 3, 0),
-    prodvers=(3, 26, 3, 0),
+    filevers=(3, 26, 4, 0),
+    prodvers=(3, 26, 4, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -13,12 +13,12 @@ VSVersionInfo(
     StringFileInfo([
       StringTable('080404B0', [
         StringStruct('CompanyName', 'CreatureCurios'),
-        StringStruct('FileDescription', 'CreatureCurios 后台按键器 v3.26.3（跨图：去/回程改用鼠标宏真实鼠标 + 骑乘沿用副本流程标定）'),
-        StringStruct('FileVersion', '3.26.3.0'),
+        StringStruct('FileDescription', 'CreatureCurios 后台按键器 v3.26.4（修地图点走偏：点击/宏录制统一用整窗坐标系）'),
+        StringStruct('FileVersion', '3.26.4.0'),
         StringStruct('InternalName', 'CreatureCuriosKeyer'),
         StringStruct('OriginalFilename', 'CreatureCuriosKeyer.exe'),
         StringStruct('ProductName', 'CreatureCurios 后台按键器'),
-        StringStruct('ProductVersion', '3.26.3.0')
+        StringStruct('ProductVersion', '3.26.4.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])

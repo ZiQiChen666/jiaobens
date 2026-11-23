@@ -1343,6 +1343,64 @@ check("OCR 慢 0.3s 也不拖累挂机（3 秒挂机 < 1.5 秒真实耗时）",
 check("挂机中途照样在按 A",
       any(a == ("tap", "a") for a in g_slow.actions))
 
+# ---- 点击坐标：标定截图是「整窗」，点击也必须按整窗换算 --------------
+# 实测：window 1296x759 里，客户区从 (8,31) 开始、尺寸 1280x720。
+# 以前按客户区换算 → 每次点击往上偏 31px、往左偏 8px（地图上就乱走）。
+_rec = []
+_orig_post = df.app.post_click_client
+_orig_rect = df.win32gui.GetWindowRect
+_orig_c2s = df.win32gui.ClientToScreen
+df.win32gui.GetWindowRect = lambda hwnd: (100, 200, 1396, 959)   # 1296x759
+df.win32gui.ClientToScreen = lambda hwnd, pt: (108, 231)         # 客户区原点
+df.app.post_click_client = lambda hwnd, x, y: _rec.append((x, y)) or True
+try:
+    g_c = df.WinGame(12345, {"allow_grab": False, "input_mode": "background",
+                             "prime_activate": False}, log=lambda _s: None)
+    ok_c = g_c.click_norm((0.5, 0.5))
+finally:
+    df.app.post_click_client = _orig_post
+    df.win32gui.GetWindowRect = _orig_rect
+    df.win32gui.ClientToScreen = _orig_c2s
+check("后台点击：0.5/0.5 → 整窗(748,580) → 客户区(640,349)",
+      ok_c is True and _rec == [(640, 349)], str(_rec))
+
+# 真实鼠标：直接点「整窗换算出来的屏幕坐标」
+_rec2 = []
+_orig_set = df.win32api.SetCursorPos
+_orig_mouse = df.win32api.mouse_event
+_orig_fg = df.win32gui.GetForegroundWindow
+df.win32gui.GetWindowRect = lambda hwnd: (100, 200, 1396, 959)
+df.win32gui.ClientToScreen = lambda hwnd, pt: (108, 231)
+df.win32gui.GetForegroundWindow = lambda: 12345
+df.win32api.SetCursorPos = lambda pt: _rec2.append((int(pt[0]), int(pt[1]))) or True
+df.win32api.mouse_event = lambda *a: None
+try:
+    g_c2 = df.WinGame(12345, {"allow_grab": True, "input_mode": "hybrid",
+                              "prime_activate": False, "block_input": False},
+                      log=lambda _s: None)
+    ok_c2 = g_c2.click_norm((0.25, 0.25))
+finally:
+    df.win32api.SetCursorPos = _orig_set
+    df.win32api.mouse_event = _orig_mouse
+    df.win32gui.GetForegroundWindow = _orig_fg
+    df.win32gui.GetWindowRect = _orig_rect
+    df.win32gui.ClientToScreen = _orig_c2s
+check("真实鼠标：0.25/0.25 → 屏幕(424,390)", ok_c2 is True and _rec2[0] == (424, 390),
+      str(_rec2[:2]))
+
+# 鼠标宏录制的坐标也要按「整窗」归一化，否则回放会偏一个标题栏
+_orig_gwr2 = df.app.win32gui.GetWindowRect
+df.app.win32gui.GetWindowRect = lambda hwnd: (100, 200, 1396, 959)
+try:
+    _rec_macro = df.app.MacroRecorder(12345)
+    _pt_macro = _rec_macro._norm_point(100 + 648, 200 + 380)   # 窗口正中心
+finally:
+    df.app.win32gui.GetWindowRect = _orig_gwr2
+check("鼠标宏录制坐标按整窗归一化（中心 → 0.5/0.5）",
+      _pt_macro is not None
+      and abs(_pt_macro[0] - 0.5) < 0.01 and abs(_pt_macro[1] - 0.5) < 0.01,
+      str(_pt_macro))
+
 # ---- 多开不互相卡节奏：OCR 抢不到锁就跳过，不挡攻击 ----
 check("能识别「多开的兄弟窗口」标题",
       df.is_game_title("CreatureCurios - 冰牙鲨鱼") is True

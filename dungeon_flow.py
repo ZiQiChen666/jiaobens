@@ -892,35 +892,49 @@ class WinGame:
             return False
 
     def click_norm(self, point, keep_cursor: bool = False) -> bool:
+        """按「整个窗口」的归一化坐标点击（和标定截图用的坐标系一致）。
+
+        坑：capture_client_bgra 虽然叫 client，其实截的是**整窗**（含标题栏/左边框），
+        标定出来的点是「整窗归一化」；以前这里却用 GetClientRect（客户区）换算，
+        于是每次点击都往上偏一个标题栏（约 31px / 4%）、往左偏 8px，
+        地图上就落到别的坐标 → 人物乱走。
+        """
         if not point:
             return False
         try:
-            _l, _t, cw, ch = win32gui.GetClientRect(self.hwnd)
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
         except Exception as exc:
-            self.last_error = f"取客户区失败：{exc}"
+            self.last_error = f"取窗口矩形失败：{exc}"
             return False
-        cw, ch = int(cw), int(ch)
-        if cw <= 0 or ch <= 0:
+        win_w, win_h = int(right - left), int(bottom - top)
+        if win_w <= 0 or win_h <= 0:
             return False
-        x = max(1, min(cw - 2, int(round(float(point[0]) * cw))))
-        y = max(1, min(ch - 2, int(round(float(point[1]) * ch))))
+        sx = int(left + round(float(point[0]) * win_w))
+        sy = int(top + round(float(point[1]) * win_h))
+        sx = max(int(left) + 1, min(int(right) - 2, sx))
+        sy = max(int(top) + 1, min(int(bottom) - 2, sy))
+        try:
+            cl, ct = win32gui.ClientToScreen(self.hwnd, (0, 0))
+            cx, cy = int(sx - cl), int(sy - ct)
+        except Exception:
+            cx, cy = 0, 0
         if self.dry:
-            self.log(f"[DRY] click ({x},{y})")
+            self.log(f"[DRY] click window({sx},{sy}) client({cx},{cy})")
             return True
         if self.force_grab or (self.foreground_mode() and self.allow_grab()):
-            return self._grab_click(x, y, keep_cursor=keep_cursor)
+            return self._grab_click(sx, sy, keep_cursor=keep_cursor)
         if self.profile.get("prime_activate", True):
             app.prime_background_input(self.hwnd, activate=True)
-        ok = app.post_click_client(self.hwnd, x, y)
+        ok = app.post_click_client(self.hwnd, cx, cy)
         if not ok:
             self.last_error = "后台点击发送失败"
         return ok
 
     def _grab_click(self, x: int, y: int, keep_cursor: bool = False) -> bool:
-        """真实鼠标点击：整段拿全局输入锁，点完光标/前台都还原。
+        """真实鼠标点击。x/y 是**屏幕坐标**（click_norm 已按整窗换算好）。
 
-        多开时 4 个窗口共用 _INPUT_LOCK，所以不会出现 A 窗口把光标移到
-        地图上、B 窗口又把光标还原到半路的情况。
+        整段拿全局输入锁，点完光标/前台都还原；多开时 4 个窗口共用
+        _INPUT_LOCK，不会出现 A 窗口把光标移到地图上、B 窗口又还回去的情况。
         """
         hybrid = self.hybrid_mode()
         with _INPUT_LOCK:
@@ -950,9 +964,8 @@ class WinGame:
                 if not self.activate():
                     self.last_error = "游戏窗口不在前台，已跳过这次点击"
                     return False
-                sx, sy = self._client_to_screen(x, y)
                 try:
-                    win32api.SetCursorPos((sx, sy))
+                    win32api.SetCursorPos((int(x), int(y)))
                     self.sleep(0.05)
                     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
                     self.sleep(0.04)

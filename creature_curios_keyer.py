@@ -1695,9 +1695,9 @@ class MacroRecorder:
         except Exception:
             self._screen_size = (0, 0)
         try:
-            cl, ct = win32gui.ClientToScreen(self.game_hwnd, (0, 0))
-            _l, _t, cw, ch = win32gui.GetClientRect(self.game_hwnd)
-            cw, ch = int(cw), int(ch)
+            gl, gt, gr, gb = win32gui.GetWindowRect(self.game_hwnd)
+            cl, ct = int(gl), int(gt)
+            cw, ch = int(gr - gl), int(gb - gt)
             self._client_rect = [int(cl), int(ct), int(cl + cw), int(ct + ch)]
             self._client_size = [cw, ch]
             try:
@@ -1841,11 +1841,14 @@ class MacroRecorder:
         }
 
     def _norm_point(self, x: int, y: int) -> Optional[tuple[float, float]]:
-        """把屏幕坐标换算成当前客户区归一化坐标 (0~1)。"""
+        """把屏幕坐标换算成**整个窗口**的归一化坐标 (0~1)。
+
+        必须和 click_norm / 标定截图用同一个坐标系：截图截的是整窗（含标题栏），
+        click_norm 也按整窗换算；这里如果按客户区算，回放就会偏一个标题栏。
+        """
         try:
-            left, top = win32gui.ClientToScreen(self.game_hwnd, (0, 0))
-            _l, _t, w, h = win32gui.GetClientRect(self.game_hwnd)
-            w, h = int(w), int(h)
+            left, top, right, bottom = win32gui.GetWindowRect(self.game_hwnd)
+            w, h = int(right - left), int(bottom - top)
             if w <= 0 or h <= 0:
                 return None
             nx = (float(x) - float(left)) / float(w)
